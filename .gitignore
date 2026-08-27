@@ -1,0 +1,28 @@
+# ---- frontend ----
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env*.local
+
+# ---- backend ----
+backend/__pycache__/
+**/__pycache__/
+*.pyc
+backend/.venv/
+backend/venv/
+
+# 运行时上传资产（录音/板书）
+backend/app/static/audio/
+backend/app/static/boards/
+!backend/app/static/boards/*.svg
+
+# ---- 环境与密钥 ----
+.env
+.env.local
+*.pem
+*.key
+
+# ---- 系统 ----
+.DS_Store
+*.log
+nohup.out

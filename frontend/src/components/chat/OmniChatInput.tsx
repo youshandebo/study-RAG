@@ -1,0 +1,225 @@
+'use client';
+
+/** 全能输入框：文本 / 拍照上传 / 拖拽 / 粘贴图片 / 指令前缀 / 停止生成 */
+import { useCallback, useRef, useState } from 'react';
+import { useSessionStore } from '@/stores/useSessionStore';
+import { streamChat } from '@/lib/api';
+import type { PolymorphicMessage } from '@/types/message';
+
+const QUICK_CMDS = [
+  { label: '📸 拍照解题', text: '', action: 'upload' as const },
+  { label: '💡 教我', text: '教我', intent: 'socratic' as const },
+  { label: '⚡ 考我', text: '考我', intent: 'quiz' as const },
+  { label: '🔀 对比', text: '对比一下不同模型的解法', intent: 'compare' as const },
+];
+
+export default function OmniChatInput() {
+  const [text, setText] = useState('');
+  const [image, setImage] = useState<{ dataUrl: string; b64: string } | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const { activeSessionId, appendMessage, setStreamingId, streamingMessageId } = useSessionStore();
+  const busy = streamingMessageId !== null;
+
+  const readImage = useCallback((file: File) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result);
+      setImage({ dataUrl, b64: dataUrl.split(',')[1] ?? '' });
+    };
+    reader.readAsDataURL(file);
+  }, []);
+
+  const onPaste = (e: React.ClipboardEvent) => {
+    const item = Array.from(e.clipboardData.items).find((i) => i.type.startsWith('image/'));
+    if (item) {
+      const file = item.getAsFile();
+      if (file) readImage(file);
+      e.preventDefault();
+    }
+  };
+
+  const send = () => {
+    if (busy || (!text.trim() && !image)) return;
+    const userMsg: PolymorphicMessage = {
+      id: crypto.randomUUID(),
+      sessionId: activeSessionId,
+      role: 'user',
+      type: 'general_text',
+      createdAt: Date.now(),
+      content: image ? `[上传题目照片${text.trim() ? `：${text.trim()}` : ''}]` : text.trim(),
+    };
+    appendMessage(userMsg);
+
+    const pendingId = crypto.randomUUID();
+    appendMessage({
+      id: pendingId,
+      sessionId: activeSessionId,
+      role: 'assistant',
+      type: 'general_text',
+      createdAt: Date.now() + 1,
+      content: '',
+    });
+    setStreamingId(pendingId);
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    void streamChat(
+      {
+        sessionId: activeSessionId,
+        text: text.trim(),
+        imageB64: image?.b64,
+      },
+      {
+        onMeta: (meta) => useSessionStore.setState((s) => ({
+          messagesBySession: {
+            ...s.messagesBySession,
+            [activeSessionId]: (s.messagesBySession[activeSessionId] ?? []).map((m) =>
+              m.id === pendingId ? { ...m, id: meta.messageId } : m,
+            ),
+          },
+          streamingMessageId: meta.messageId,
+        })),
+        onDelta: (piece) => useSessionStore.getState().appendDelta(activeSessionId, pendingId, piece),
+        onTrackDelta: (index, _name, piece) =>
+          useSessionStore.getState().appendTrackDelta(activeSessionId, pendingId, index, piece),
+        onTrackDone: (index) => useSessionStore.getState().finishTrack(activeSessionId, pendingId, index),
+        onCard: (card) => {
+          const store = useSessionStore.getState();
+          // 用最终卡片替换占位（若 id 已因 meta 改名则按位置兜底）
+          const list = store.messagesBySession[activeSessionId] ?? [];
+          const targetId = list.some((m) => m.id === card.id) ? card.id : pendingId;
+          store.patchMessage(activeSessionId, targetId, {
+            type: card.type,
+            content: card.content,
+            solvePayload: card.solvePayload,
+            socraticPayload: card.socraticPayload,
+            quizPayload: card.quizPayload,
+            comparePayload: card.comparePayload,
+            intent: card.intent,
+          });
+        },
+        onDone: () => setStreamingId(null),
+        onError: () => {
+          useSessionStore.getState().patchMessage(activeSessionId, pendingId, {
+            content: '⚠️ 连接助教失败，请确认后端服务已启动（默认 http://localhost:8000）。',
+          });
+          setStreamingId(null);
+        },
+      },
+      controller.signal,
+    );
+
+    setText('');
+    setImage(null);
+  };
+
+  const stop = () => {
+    abortRef.current?.abort();
+    setStreamingId(null);
+  };
+
+  return (
+    <div className="border-t border-rule bg-paper px-6 py-4">
+      <div className="mx-auto max-w-3xl">
+        {/* 快捷指令 */}
+        <div className="mb-2 flex flex-wrap gap-1.5">
+          {QUICK_CMDS.map((cmd) =>
+            cmd.action === 'upload' ? (
+              <button
+                key={cmd.label}
+                onClick={() => fileRef.current?.click()}
+                className="rounded-full border border-rule bg-[#fdfaf2] px-3 py-1 text-[12px] text-ink-soft transition hover:border-chalk hover:text-chalk"
+              >
+                {cmd.label}
+              </button>
+            ) : (
+              <button
+                key={cmd.label}
+                disabled={busy}
+                onClick={() => setText(cmd.text)}
+                className="rounded-full border border-rule bg-[#fdfaf2] px-3 py-1 text-[12px] text-ink-soft transition hover:border-chalk hover:text-chalk disabled:opacity-40"
+              >
+                {cmd.label}
+              </button>
+            ),
+          )}
+        </div>
+
+        {/* 图片预览 */}
+        {image && (
+          <div className="mb-2 flex items-center gap-2 rounded-lg border border-rule bg-[#fdfaf2] p-2">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={image.dataUrl} alt="待识别的题目图片" className="h-14 w-14 rounded object-cover" />
+            <span className="flex-1 text-[12.5px] text-ink-soft">题目图片已就绪，将自动提取公式并匹配课堂解法</span>
+            <button onClick={() => setImage(null)} className="px-2 text-ink-faint hover:text-cinnabar" aria-label="移除图片">
+              ✕
+            </button>
+          </div>
+        )}
+
+        {/* 输入区 */}
+        <div
+          className={`input-scroll flex items-end gap-2 rounded-xl px-4 py-3 ${dragOver ? 'border-chalk ring-2 ring-chalk/20' : ''}`}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragOver(true);
+          }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragOver(false);
+            const file = Array.from(e.dataTransfer.files)[0];
+            if (file?.type.startsWith('image/')) readImage(file);
+          }}
+        >
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onPaste={onPaste}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                send();
+              }
+            }}
+            rows={1}
+            placeholder="输入题目 / 疑问，或拖拽 · 粘贴题目照片…（Enter 发送，Shift+Enter 换行）"
+            className="max-h-36 min-h-[28px] flex-1 resize-none bg-transparent text-[14px] leading-relaxed outline-none"
+          />
+          {busy ? (
+            <button
+              onClick={stop}
+              className="rounded-lg bg-cinnabar px-4 py-2 text-[13px] font-semibold text-white transition hover:opacity-90"
+            >
+              ■ 停止
+            </button>
+          ) : (
+            <button
+              onClick={send}
+              disabled={!text.trim() && !image}
+              className="rounded-lg bg-chalk px-4 py-2 text-[13px] font-semibold text-white transition hover:opacity-90 disabled:opacity-40"
+            >
+              发送
+            </button>
+          )}
+        </div>
+
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/*"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) readImage(f);
+            e.target.value = '';
+          }}
+        />
+      </div>
+    </div>
+  );
+}

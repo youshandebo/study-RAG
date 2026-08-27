@@ -1,0 +1,77 @@
+/** 多态消息定义（Solve / Socratic / Quiz / Compare / General）——与后端 domain.py 一一对应 */
+
+export type MessageType =
+  | 'solve_card'
+  | 'socratic_card'
+  | 'quiz_card'
+  | 'parallel_compare'
+  | 'general_text';
+
+export type Intent = 'solve' | 'socratic' | 'quiz' | 'compare' | 'general';
+
+export interface BaseMessage {
+  id: string;
+  sessionId: string;
+  role: 'user' | 'assistant' | 'system';
+  createdAt: number;
+}
+
+export interface EvidenceRef {
+  audioId: string;
+  timestampRange: [string, string];
+  audioSnippetUrl: string;
+  boardImageUrl: string;
+  transcriptSnippet: string;
+  boardCaption: string;
+}
+
+/** 聚合消息协议：通过 type 驱动 UI 渲染具体卡片 */
+export interface PolymorphicMessage extends BaseMessage {
+  type: MessageType;
+  content: string;
+  intent?: Intent;
+
+  /** 1. 拍照解题与教学洞察载荷 */
+  solvePayload?: {
+    examPoint: string;
+    difficulty: 1 | 2 | 3 | 4 | 5;
+    pitfalls: string[];
+    steps: string[];
+    evidenceList: EvidenceRef[];
+  };
+
+  /** 2. 苏格拉底伴学载荷 */
+  socraticPayload?: {
+    currentStepIndex: number;
+    totalSteps: number;
+    guidingQuestion: string;
+    hints: string[];
+  };
+
+  /** 3. 针对易错点的自测题载荷 */
+  quizPayload?: {
+    questionText: string;
+    options?: string[];
+    targetPitfall: string;
+    explanation: string;
+  };
+
+  /** 4. 多模型分屏并行比对载荷 */
+  comparePayload?: {
+    tracks: {
+      modelName: string;
+      content: string;
+      status: 'streaming' | 'done';
+    }[];
+  };
+}
+
+/** SSE 流式事件（后端 chat_stream 协议） */
+export type StreamEvent =
+  | { event: 'meta'; data: { message_id: string; intent: Intent } }
+  | { event: 'delta'; data: { text: string } }
+  | { event: 'evidence'; data: { list: EvidenceRef[] } }
+  | { event: 'track_delta'; data: { index: number; model_name: string; text: string } }
+  | { event: 'track_done'; data: { index: number; model_name: string } }
+  | { event: 'card'; data: PolymorphicMessage }
+  | { event: 'done'; data: Record<string, never> };

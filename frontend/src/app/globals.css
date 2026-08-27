@@ -1,0 +1,185 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --paper: #f7f2e6;
+  --paper-deep: #efe7d2;
+  --paper-edge: #e3d8bc;
+  --ink: #26241f;
+  --ink-soft: #5c5648;
+  --ink-faint: #8a8371;
+  --cinnabar: #b5432f;
+  --cinnabar-soft: #f6e3dd;
+  --chalk-green: #1f5c50;
+  --chalk-green-soft: #e2ece8;
+  --board: #22382f;
+  --amber-warn: #9a6b1f;
+  --amber-warn-soft: #f7ecd4;
+  --rule: #d8cdb4;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  /* 纸张纤维噪点 */
+  background-image: radial-gradient(rgba(140, 120, 80, 0.05) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+.font-display {
+  font-family: 'Songti SC', 'Noto Serif SC', 'STSong', 'SimSun', serif;
+}
+
+/* ---------- 讲义卡片 ---------- */
+.paper-card {
+  background: #fdfaf2;
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  box-shadow:
+    0 1px 2px rgba(60, 50, 30, 0.06),
+    0 6px 18px -8px rgba(60, 50, 30, 0.12);
+}
+
+/* 左侧红线条——课堂讲义的装订线意象 */
+.margin-rule {
+  position: relative;
+}
+.margin-rule::before {
+  content: '';
+  position: absolute;
+  left: -14px;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  background: linear-gradient(to bottom, var(--cinnabar) 0%, rgba(181, 67, 47, 0.25) 100%);
+  border-radius: 2px;
+}
+
+/* ---------- 徽章 ---------- */
+.badge-point {
+  background: var(--chalk-green-soft);
+  color: var(--chalk-green);
+  border: 1px solid rgba(31, 92, 80, 0.35);
+}
+.badge-diff {
+  color: var(--amber-warn);
+  letter-spacing: 1px;
+}
+
+/* ---------- 易错警示卡 ---------- */
+.pitfall-card {
+  background: var(--amber-warn-soft);
+  border: 1px dashed rgba(154, 107, 31, 0.55);
+  border-left: 4px solid var(--amber-warn);
+  border-radius: 8px;
+}
+
+/* ---------- 输入区 ---------- */
+.input-scroll {
+  background: #fdfaf2;
+  border: 1px solid var(--rule);
+}
+.input-scroll:focus-within {
+  border-color: var(--chalk-green);
+  box-shadow: 0 0 0 3px rgba(31, 92, 80, 0.12);
+}
+
+/* ---------- 滚动条 ---------- */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #cfc3a5;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---------- KaTeX ---------- */
+.katex-display {
+  margin: 0.6em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 0;
+}
+.katex {
+  font-size: 1.02em;
+}
+.katex-error {
+  color: var(--cinnabar);
+  background: var(--cinnabar-soft);
+  padding: 0 4px;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+/* ---------- 流式光标 ---------- */
+.stream-cursor::after {
+  content: '▍';
+  color: var(--chalk-green);
+  animation: blink 1s step-start infinite;
+}
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* ---------- 消息入场 ---------- */
+@keyframes riseIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.msg-enter {
+  animation: riseIn 0.28s ease-out both;
+}
+
+/* ---------- 证据波形 ---------- */
+.waveform-bar {
+  background: var(--chalk-green);
+  opacity: 0.45;
+  transition: opacity 0.15s, transform 0.15s;
+  border-radius: 2px;
+}
+.waveform-bar.played {
+  opacity: 1;
+  transform: scaleY(1.15);
+}
+
+/* ---------- 骨架屏 ---------- */
+@keyframes shimmer {
+  0% {
+    background-position: -200px 0;
+  }
+  100% {
+    background-position: 200px 0;
+  }
+}
+.skeleton {
+  background: linear-gradient(90deg, #efe7d2 25%, #f7f2e6 50%, #efe7d2 75%);
+  background-size: 400px 100%;
+  animation: shimmer 1.4s infinite linear;
+  border-radius: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg-enter,
+  .stream-cursor::after {
+    animation: none;
+  }
+}
