@@ -44,7 +44,23 @@ class HybridRetriever:
         query: str,
         top_k: int = 3,
         exam_point: str | None = None,
+        min_score: float | None = None,
     ) -> list[Chunk]:
+        if min_score is None:
+            return [c for _, c in await self.retrieve_scored(query, top_k, exam_point)]
+        return [
+            c
+            for s, c in await self.retrieve_scored(query, top_k * 3, exam_point)
+            if s >= min_score
+        ][:top_k]
+
+    async def retrieve_scored(
+        self,
+        query: str,
+        top_k: int = 3,
+        exam_point: str | None = None,
+    ) -> list[tuple[float, Chunk]]:
+        """返回 (融合得分, 切片)，供调用方按相关性阈值过滤。"""
         await self._ensure_seeded()
         qvec = await embedder.embed(query)
         qtokens = set(embedder._tokenize(query))
@@ -59,9 +75,7 @@ class HybridRetriever:
             scored.append((0.62 * sim + 0.28 * lex + meta_bonus, chunk))
 
         scored.sort(key=lambda pair: pair[0], reverse=True)
-
-        # 二阶段精排：向量召回在前，重排融合词面信号已完成
-        return [chunk for _, chunk in scored[:top_k]]
+        return scored[:top_k]
 
     async def register_chunks(self, new_chunks: list[Chunk]) -> int:
         """入库流水线回写入口：向量化 + 入库 + 更新进程内索引。返回新增数量。"""

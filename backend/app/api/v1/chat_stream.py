@@ -54,9 +54,9 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-async def _retrieve_evidence(query: str, top_k: int = 3) -> tuple[list[EvidenceRef], list]:
+async def _retrieve_evidence(query: str, top_k: int = 3, min_score: float | None = None) -> tuple[list[EvidenceRef], list]:
     retriever = await get_retriever()
-    chunks = await retriever.retrieve(query, top_k=top_k)
+    chunks = await retriever.retrieve(query, top_k=top_k, min_score=min_score)
     refs = [
         EvidenceRef(
             audio_id=c.audio_id,
@@ -69,6 +69,21 @@ async def _retrieve_evidence(query: str, top_k: int = 3) -> tuple[list[EvidenceR
         for c in chunks
     ]
     return refs, chunks
+
+
+# 普通对话注入知识库上下文的最低融合相关性分（检索得分 = 0.62向量 + 0.28词面 + 元数据加成）
+GENERAL_RELEVANCE_FLOOR = 0.42
+
+
+def _is_relevant(query: str, chunk) -> bool:
+    """轻量二次判定：查询词与切片文本存在实词交叠即视为相关。"""
+    import app.services.rag.embedder as emb
+
+    qtokens = {t for t in emb._tokenize(query) if len(t) >= 2}
+    if not qtokens:
+        return False
+    hay = set(emb._tokenize(chunk.text)) | set(emb._tokenize(chunk.exam_point or ""))
+    return bool(qtokens & hay)
 
 
 def _user_query(req: ChatRequest, ocr_text: str | None) -> str:
@@ -162,10 +177,25 @@ async def _stream(req: ChatRequest):
 
     # --------------------------------------------------------- general ---
     elif intent == Intent.general:
+        # 普通提问同样自动检索知识库：相关性达标的课堂切片注入上下文并暴露证据链
+        refs, chunks = await _retrieve_evidence(query, top_k=3, min_score=GENERAL_RELEVANCE_FLOOR)
+        relevant = [c for c in chunks if _is_relevant(query, c)] or chunks
+        if relevant:
+            yield _sse("evidence", {"list": [r.model_dump(mode="json") for r in refs[: len(relevant)]]})
+
         provider = get_provider()
         full = ""
+        user_content = req.text or "你好"
+        if relevant:
+            context = "\n---\n".join(
+                f"[{c.board_caption or '课堂切片'}·{c.start}-{c.end}] {c.text}" for c in relevant
+            )
+            user_content = (
+                f"{user_content}\n\n【知识库命中的课堂资料，请优先依据这些内容回答；"
+                f"不相关时再按通识作答】\n{context}"
+            )
         try:
-            async for piece in provider.stream_chat([{"role": "user", "content": req.text or "你好"}]):
+            async for piece in provider.stream_chat([{"role": "user", "content": user_content}]):
                 full += piece
                 yield _sse("delta", {"text": piece})
         except Exception:

@@ -4,6 +4,8 @@ import type { EvidenceRef, Intent, PolymorphicMessage } from '@/types/message';
 import type { EvidenceBundle, IngestAsset } from '@/types/evidence';
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000/api/v1';
+/** 后端源（剥离 /api/v1）：静态板书等资源直连后端 */
+export const API_ORIGIN = API_BASE.replace(/\/api\/v1\/?$/, '');
 
 export interface StreamHandlers {
   onMeta?: (meta: { messageId: string; intent: Intent }) => void;
@@ -55,6 +57,68 @@ async function consumeSSE(resp: Response, handlers: StreamHandlers): Promise<voi
   handlers.onDone?.();
 }
 
+/** 后端 pydantic 序列化为 snake_case，前端协议为 camelCase —— 在分发层统一转换 */
+function normalizeEvidence(e: Record<string, unknown>): EvidenceRef {
+  return {
+    audioId: String(e.audio_id ?? ''),
+    timestampRange: (e.timestamp_range as [string, string]) ?? ['00:00', '00:00'],
+    audioSnippetUrl: String(e.audio_snippet_url ?? ''),
+    boardImageUrl: String(e.board_image_url ?? ''),
+    transcriptSnippet: String(e.transcript_snippet ?? ''),
+    boardCaption: String(e.board_caption ?? ''),
+  };
+}
+
+export function normalizeCard(raw: Record<string, unknown>): PolymorphicMessage {
+  const msg: Record<string, unknown> = { ...raw };
+  msg.sessionId = raw.session_id ?? '';
+  msg.createdAt = raw.created_at ?? Date.now();
+
+  const sp = raw.solve_payload as Record<string, unknown> | undefined | null;
+  if (sp) {
+    msg.solvePayload = {
+      examPoint: String(sp.exam_point ?? ''),
+      difficulty: Number(sp.difficulty ?? 3) as 1 | 2 | 3 | 4 | 5,
+      pitfalls: (sp.pitfalls as string[]) ?? [],
+      steps: (sp.steps as string[]) ?? [],
+      evidenceList: ((sp.evidence_list as Record<string, unknown>[]) ?? []).map(normalizeEvidence),
+    };
+  }
+  const so = raw.socratic_payload as Record<string, unknown> | undefined | null;
+  if (so) {
+    msg.socraticPayload = {
+      currentStepIndex: Number(so.current_step_index ?? 0),
+      totalSteps: Number(so.total_steps ?? 4),
+      guidingQuestion: String(so.guiding_question ?? ''),
+      hints: (so.hints as string[]) ?? [],
+    };
+  }
+  const qz = raw.quiz_payload as Record<string, unknown> | undefined | null;
+  if (qz) {
+    msg.quizPayload = {
+      questionText: String(qz.question_text ?? ''),
+      options: (qz.options as string[]) ?? undefined,
+      targetPitfall: String(qz.target_pitfall ?? ''),
+      explanation: String(qz.explanation ?? ''),
+    };
+  }
+  const cp = raw.compare_payload as Record<string, unknown> | undefined | null;
+  if (cp) {
+    const tracks = (cp.tracks as Record<string, unknown>[]) ?? [];
+    msg.comparePayload = {
+      tracks: tracks.map((tr) => ({
+        modelName: String(tr.model_name ?? ''),
+        content: String(tr.content ?? ''),
+        status: (tr.status === 'done' ? 'done' : 'streaming') as 'streaming' | 'done',
+      })),
+    };
+  }
+  for (const k of ['session_id', 'created_at', 'solve_payload', 'socratic_payload', 'quiz_payload', 'compare_payload']) {
+    delete msg[k];
+  }
+  return msg as unknown as PolymorphicMessage;
+}
+
 function dispatch(event: string, payload: unknown, h: StreamHandlers): void {
   const p = payload as Record<string, unknown>;
   switch (event) {
@@ -65,7 +129,7 @@ function dispatch(event: string, payload: unknown, h: StreamHandlers): void {
       h.onDelta?.(p.text as string);
       break;
     case 'evidence':
-      h.onEvidence?.(p.list as EvidenceRef[]);
+      h.onEvidence?.(((p.list as Record<string, unknown>[]) ?? []).map(normalizeEvidence));
       break;
     case 'track_delta':
       h.onTrackDelta?.(p.index as number, p.model_name as string, p.text as string);
@@ -74,7 +138,7 @@ function dispatch(event: string, payload: unknown, h: StreamHandlers): void {
       h.onTrackDone?.(p.index as number, p.model_name as string);
       break;
     case 'card':
-      h.onCard?.(payload as unknown as PolymorphicMessage);
+      h.onCard?.(normalizeCard(payload as Record<string, unknown>));
       break;
     case 'done':
       h.onDone?.();
@@ -146,10 +210,12 @@ export async function gradeQuiz(optionIndex: number) {
   return resp.json() as Promise<{ correct: boolean; chosen: string; attribution: string; suggestion: string }>;
 }
 
-// -------------------------------------------------------------- evidence ---
+// ----------------------------------------------------------------- evidence ---
 export async function fetchEvidence(chunkUrl: string): Promise<EvidenceBundle | null> {
+  // chunkUrl 形如 /api/v1/evidence/audio/{id}，本身含版本前缀；剥掉 API_BASE 的前缀避免拼接成双份
+  const origin = API_BASE.replace(/\/api\/v1\/?$/, '');
   try {
-    const resp = await fetch(`${API_BASE}${chunkUrl.replace(API_BASE, '')}`);
+    const resp = await fetch(`${origin}${chunkUrl}`);
     if (!resp.ok) return null;
     const d = await resp.json();
     return {
@@ -170,26 +236,147 @@ export async function fetchEvidence(chunkUrl: string): Promise<EvidenceBundle | 
 }
 
 // ----------------------------------------------------------------- ingest --
+export type IngestMediaType = 'audio' | 'board' | 'text';
+
 export async function uploadAsset(
   sessionId: string,
-  mediaType: 'audio' | 'board',
+  mediaType: IngestMediaType,
   file: File,
+  textContent = '',
 ): Promise<IngestAsset> {
   const form = new FormData();
   form.append('session_id', sessionId);
   form.append('media_type', mediaType);
-  form.append('file', file);
+  if (file) form.append('file', file);
+  if (textContent) form.append('text_content', textContent);
   const resp = await fetch(`${API_BASE}/ingest`, { method: 'POST', body: form });
-  if (!resp.ok) throw new Error(`入库失败 ${resp.status}`);
+  if (!resp.ok) {
+    let detail = `${resp.status}`;
+    try {
+      const err = await resp.json();
+      if (err?.detail) detail = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
+    } catch { /* ignore */ }
+    throw new Error(`入库失败 ${detail}`);
+  }
   const d = await resp.json();
   return {
     id: d.asset.id,
     kind: mediaType,
     uri: d.asset.uri,
-    filename: d.asset.filename || file.name,
+    filename: d.asset.filename || file?.name || '',
     lectureDate: d.asset.lecture_date || '',
     chunkCount: d.chunks_added,
     pitfalls: d.pitfalls_extracted ?? [],
     createdAt: Date.now(),
   };
+}
+
+/** 纯文字素材入库：粘贴的课堂笔记/讲义经切片与向量化进入检索库 */
+export async function uploadTextAsset(sessionId: string, text: string, title = '文字笔记'): Promise<IngestAsset> {
+  return uploadAsset(sessionId, 'text', new File([new Blob([text], { type: 'text/plain' })], `${title}.txt`), text);
+}
+
+// ------------------------------------------------------------------ admin --
+const ADMIN_TOKEN_KEY = 'admin_token';
+
+export function getAdminToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return window.localStorage.getItem(ADMIN_TOKEN_KEY);
+}
+
+export function setAdminToken(token: string | null): void {
+  if (typeof window === 'undefined') return;
+  if (token) window.localStorage.setItem(ADMIN_TOKEN_KEY, token);
+  else window.localStorage.removeItem(ADMIN_TOKEN_KEY);
+}
+
+function adminHeaders(): Record<string, string> {
+  const token = getAdminToken();
+  return token ? { 'X-Admin-Token': token } : {};
+}
+
+export interface ModelSectionConfig {
+  provider?: string;
+  base_url: string;
+  api_key: string;
+  model: string;
+  configured?: boolean;
+}
+
+export interface AdminConfigView {
+  admin_password_set: boolean;
+  llm: ModelSectionConfig;
+  embedding: ModelSectionConfig;
+  asr: ModelSectionConfig;
+  vlm: ModelSectionConfig;
+  model_tracks: Array<{ key: string; name: string }>;
+}
+
+export interface AdminStats {
+  sessions: number;
+  assets: number;
+  chunks: number;
+  seed_chunks: number;
+  uploaded_chunks: number;
+  mock_mode: boolean;
+  tracks: Array<{ key: string; name: string }>;
+  custom_sections: Record<string, boolean>;
+  runtime_overridden: boolean;
+}
+
+export async function adminLogin(password: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}/admin/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.detail ?? `登录失败 ${resp.status}`);
+  setAdminToken(data.token);
+}
+
+export async function adminLogout(): Promise<void> {
+  try {
+    await fetch(`${API_BASE}/admin/logout`, { method: 'POST', headers: adminHeaders() });
+  } catch { /* ignore */ }
+  setAdminToken(null);
+}
+
+async function adminFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const resp = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: { ...(init?.headers ?? {}), ...adminHeaders() },
+  });
+  if (resp.status === 401) throw new Error('UNAUTHORIZED');
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.detail ?? `请求失败 ${resp.status}`);
+  return data as T;
+}
+
+export async function fetchAdminConfig(): Promise<AdminConfigView> {
+  return adminFetch('/admin/config');
+}
+
+export async function saveAdminConfig(patch: Partial<Record<'llm' | 'embedding' | 'asr' | 'vlm', Partial<ModelSectionConfig>>>): Promise<AdminConfigView> {
+  return adminFetch('/admin/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+}
+
+export async function resetAdminSection(kind: 'llm' | 'embedding' | 'asr' | 'vlm'): Promise<AdminConfigView> {
+  return adminFetch('/admin/config/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind }) });
+}
+
+export async function testAdminModel(kind: 'llm' | 'embedding' | 'asr' | 'vlm'): Promise<{ ok: boolean; mode: string; message: string }> {
+  return adminFetch(`/admin/config/test?kind=${kind}`, { method: 'POST' });
+}
+
+export async function changeAdminPassword(oldPassword: string, newPassword: string): Promise<void> {
+  await adminFetch('/admin/password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
+  });
+}
+
+export async function fetchAdminStats(): Promise<AdminStats> {
+  return adminFetch('/admin/stats');
 }

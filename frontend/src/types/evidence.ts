@@ -23,7 +23,7 @@ export interface EvidenceBundle {
 
 export interface IngestAsset {
   id: string;
-  kind: 'audio' | 'board';
+  kind: 'audio' | 'board' | 'text';
   uri: string;
   filename: string;
   lectureDate: string;

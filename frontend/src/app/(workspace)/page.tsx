@@ -56,18 +56,24 @@ export default function WorkspacePage() {
 
       <main className="flex min-w-0 flex-1 flex-col">
         {/* 顶部工具栏 */}
-        <header className="flex items-center justify-between border-b border-rule bg-paper/80 px-6 py-3 backdrop-blur">
+        <header className="flex items-center justify-between border-b border-rule bg-[#fdfaf2]/85 px-6 py-3 backdrop-blur-md">
           <div className="min-w-0">
-            <h1 className="font-display truncate text-[15px] font-bold text-ink">
+            <h1 className="font-display flex items-center gap-2 truncate text-[15px] font-bold text-ink">
+              <span
+                aria-hidden
+                className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-chalk/30 bg-chalk-soft text-[12px]"
+              >
+                📖
+              </span>
               {sessions.find((s) => s.id === activeSessionId)?.title ?? '统一工作台'}
             </h1>
-            <p className="text-[11.5px] text-ink-faint">
+            <p className="mt-0.5 text-[11.5px] text-ink-faint">
               拍照解题 · 老师原法 RAG · 音画溯源 · 苏格拉底伴学 · 多模型比对
             </p>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2.5">
             <span
-              className={`rounded-full px-2.5 py-1 text-[11.5px] ${
+              className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11.5px] font-medium ${
                 backendOk === null
                   ? 'bg-paper-deep text-ink-faint'
                   : backendOk
@@ -76,11 +82,26 @@ export default function WorkspacePage() {
               }`}
               title={backendOk ? '后端已连接（无 API Key 时自动运行内置演示引擎）' : '后端未连接：npm run dev 之外请先启动 uvicorn'}
             >
-              {backendOk === null ? '检查后端…' : backendOk ? '● 助教引擎在线' : '● 后端未连接'}
+              {backendOk ? (
+                <span className="relative flex h-1.5 w-1.5">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-chalk opacity-75" />
+                  <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-chalk" />
+                </span>
+              ) : (
+                <span className={`h-1.5 w-1.5 rounded-full ${backendOk === null ? 'bg-ink-faint' : 'bg-cinnabar'}`} />
+              )}
+              {backendOk === null ? '检查后端…' : backendOk ? '助教引擎在线' : '后端未连接'}
             </span>
+            <a
+              href="/admin"
+              className="rounded-lg border border-rule bg-white/70 px-3 py-1.5 text-[12.5px] text-ink-soft shadow-sm transition hover:-translate-y-px hover:border-chalk hover:text-chalk"
+              title="模型配置 · 知识库统计 · 管理员密码"
+            >
+              ⚙️ 管理后台
+            </a>
             <button
               onClick={() => openDrawer()}
-              className="rounded-md border border-rule bg-[#fdfaf2] px-3 py-1.5 text-[12.5px] text-ink-soft transition hover:border-chalk hover:text-chalk"
+              className="rounded-lg border border-rule bg-white/70 px-3 py-1.5 text-[12.5px] text-ink-soft shadow-sm transition hover:-translate-y-px hover:border-chalk hover:text-chalk"
             >
               {drawerOpen ? '隐藏抽屉' : '协作抽屉'} ⟩
             </button>

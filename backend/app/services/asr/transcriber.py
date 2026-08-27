@@ -1,10 +1,13 @@
-"""语音识别服务：Whisper / SenseVoice 封装 + 离线演示转录兜底。
+"""语音识别服务：远程 OpenAI 兼容 /audio/transcriptions（管理员面板可配）→ 本地 Whisper → 离线演示兜底。
 
-真实引擎通过懒加载引入；未安装推理栈时使用内置课堂剧本生成带毫秒时间戳的
+真实引擎通过懒加载引入；未配置任何引擎时使用内置课堂剧本生成带毫秒时间戳的
 模拟转录切片，保证 ingest 流水线端到端可演示。
 """
 from __future__ import annotations
 
+import math
+
+from app.core import runtime_config
 from app.services.rag.chunker import TranscriptSegment
 
 # 模拟课堂剧本：（起止毫秒，台词）——与 corpus 种子切片同源
@@ -20,10 +23,40 @@ _DEMO_TIMELINE: list[tuple[int, int, str]] = [
 
 
 class Transcriber:
-    """统一入口：优先本地 Whisper；失败或未安装时回落演示转录。"""
+    """统一入口：面板配置的远程 ASR > 本地 faster-whisper > 演示转录，任一环节失败自动降级。"""
 
     def __init__(self) -> None:
         self._model = None
+
+    async def transcribe(self, audio_bytes: bytes, filename: str = "") -> list[TranscriptSegment]:
+        cfg = runtime_config.effective("asr")
+        if audio_bytes and cfg["api_key"] and cfg["base_url"] and cfg["model"]:
+            try:
+                return await self._transcribe_remote(audio_bytes, filename, cfg)
+            except Exception:
+                pass
+        model = self._load_whisper()
+        if model and audio_bytes:
+            try:
+                return await self._transcribe_real(audio_bytes)
+            except Exception:
+                pass
+        return self._transcribe_demo()
+
+    async def _transcribe_remote(self, audio_bytes: bytes, filename: str, cfg: dict) -> list[TranscriptSegment]:  # pragma: no cover
+        """OpenAI 兼容转录端点返回整段文本；按标点切句并按字数比例合成毫秒时间戳。"""
+        import httpx
+
+        async with httpx.AsyncClient(timeout=180) as client:
+            resp = await client.post(
+                f"{cfg['base_url'].rstrip('/')}/audio/transcriptions",
+                headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                files={"file": (filename or "audio.wav", audio_bytes)},
+                data={"model": cfg["model"]},
+            )
+            resp.raise_for_status()
+            text = str(resp.json().get("text", "")).strip()
+        return _segments_from_plain_text(text)
 
     def _load_whisper(self):  # pragma: no cover - 重型依赖懒加载
         if self._model is not None:
@@ -35,12 +68,6 @@ class Transcriber:
         except Exception:
             self._model = False
         return self._model
-
-    async def transcribe(self, audio_bytes: bytes, filename: str = "") -> list[TranscriptSegment]:
-        model = self._load_whisper()
-        if model and audio_bytes:
-            return await self._transcribe_real(audio_bytes)
-        return self._transcribe_demo()
 
     async def _transcribe_real(self, audio_bytes: bytes) -> list[TranscriptSegment]:  # pragma: no cover
         import tempfile
@@ -64,3 +91,39 @@ class Transcriber:
     @staticmethod
     def _transcribe_demo() -> list[TranscriptSegment]:
         return [TranscriptSegment(start_ms=s, end_ms=e, text=t) for s, e, t in _DEMO_TIMELINE]
+
+
+_SENTENCE_BREAKS = "。！？!?；;\n"
+
+
+def _segments_from_plain_text(text: str, pace_ms_per_char: float = 220.0) -> list[TranscriptSegment]:
+    """把无时间戳的整段转录切成句级切片，时长按字数线性推进（展示用途足够）。"""
+    sentences: list[str] = []
+    buf = ""
+    for ch in text:
+        buf += ch
+        if ch in _SENTENCE_BREAKS:
+            if buf.strip():
+                sentences.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        sentences.append(buf.strip())
+    if not sentences:
+        return []
+
+    out: list[TranscriptSegment] = []
+    cursor = 0
+    avg_len = sum(len(s) for s in sentences) / len(sentences)
+    base_pace = max(60.0, min(400.0, 9000.0 / max(avg_len, 10)))  # 均匀铺满约 9 秒/句附近的节奏感
+    for s in sentences:
+        dur = max(800.0, len(s) * base_pace)
+        start = int(cursor)
+        end = int(cursor + dur)
+        cursor += dur + 120.0
+        out.append(TranscriptSegment(start_ms=start, end_ms=end, text=s))
+    return out
+
+
+def estimate_duration_ms(text: str) -> int:
+    """粗略估算文本朗读时长，用于填充无真实音频时间戳的场景。"""
+    return int(len(text) * math.ceil(220))

@@ -3,6 +3,8 @@
 /** 音画证据同步器：录音波形高亮播放 + 板书原图定位 + 原文转录 */
 import { useEffect, useRef, useState } from 'react';
 import { useEvidenceStore } from '@/stores/useEvidenceStore';
+import { API_ORIGIN } from '@/lib/api';
+import Markdown from '@/components/chat/Markdown';
 
 /** 演示音频合成：以 WebAudio 生成轻柔提示音占位原声（真实部署替换为切片音频流） */
 function useTonePlayer() {
@@ -109,7 +111,7 @@ export default function EvidenceViewer() {
       <div>
         <div className="mb-1.5 font-display text-[12.5px] font-bold text-ink">🎙️ 原声转录</div>
         <div className="rounded-lg border border-rule bg-paper-deep/40 px-4 py-3 text-[13px] leading-relaxed text-ink-soft">
-          {audio.transcript}
+          <Markdown text={audio.transcript} />
         </div>
       </div>
 
@@ -118,7 +120,12 @@ export default function EvidenceViewer() {
         <div className="mb-1.5 font-display text-[12.5px] font-bold text-ink">🖼️ 板书定位</div>
         <figure className="overflow-hidden rounded-lg border border-rule bg-board">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src={board.url} alt={board.caption} className="w-full" />
+          <img
+            src={board.url.startsWith('http') ? board.url : `${API_ORIGIN}${board.url}`}
+            alt={board.caption}
+            className="w-full"
+            loading="lazy"
+          />
           <figcaption className="bg-board px-3 py-2 text-[12px] text-paper/85">{board.caption}</figcaption>
         </figure>
       </div>

@@ -117,6 +117,19 @@ class AnthropicProvider(BaseLLMProvider):
 
 def _build_from_settings(settings: Settings) -> dict[str, BaseLLMProvider]:
     providers: dict[str, BaseLLMProvider] = {}
+
+    # 管理员面板配置的主模型优先（base_url/model 支持热更新）
+    from app.core import runtime_config
+
+    main = runtime_config.effective("llm")
+    if main["api_key"] and main["base_url"] and main["model"]:
+        if main.get("provider") == "anthropic":
+            providers["main"] = AnthropicProvider(main["api_key"], main["base_url"], main["model"])
+        else:
+            providers["main"] = OpenAICompatibleProvider(
+                "openai-main", main["api_key"], main["base_url"], main["model"]
+            )
+
     if settings.openai_api_key:
         providers["gpt"] = OpenAICompatibleProvider(
             "openai", settings.openai_api_key, settings.openai_base_url, settings.openai_model
@@ -139,17 +152,26 @@ def _build_from_settings(settings: Settings) -> dict[str, BaseLLMProvider]:
 _PROVIDER_CACHE: dict[str, BaseLLMProvider] = {}
 
 
+def invalidate_provider_cache() -> None:
+    """管理员修改模型配置后调用，强制下次请求重建 Provider。"""
+    _PROVIDER_CACHE.clear()
+
+
 def available_model_keys(settings: Settings | None = None) -> list[str]:
     settings = settings or get_settings()
     return list(_build_from_settings(settings).keys())
 
 
 def get_provider(model_key: str | None = None) -> BaseLLMProvider:
-    """按 key 取真实 Provider；缺失或未配置时一律回落 Mock 演示引擎。"""
+    """按 key 取真实 Provider；未指定时优先主模型(面板配置>环境变量)，缺失回落 Mock 演示引擎。"""
     settings = get_settings()
     real = _build_from_settings(settings)
+    for k in list(_PROVIDER_CACHE):
+        if k not in real or type(_PROVIDER_CACHE[k]) is not type(real[k]):
+            _PROVIDER_CACHE.clear()
+            break
     if not _PROVIDER_CACHE:
         _PROVIDER_CACHE.update(real)
     if model_key and model_key in real:
         return real[model_key]
-    return MockProvider()
+    return _PROVIDER_CACHE.get("main") or MockProvider()

@@ -1,4 +1,4 @@
-"""视觉与手写公式识别：Qwen2.5-VL 封装 + 离线演示 OCR 兜底。
+"""视觉与手写公式识别：OpenAI 兼容视觉模型封装（管理员面板可配置端点/模型）+ 离线演示 OCR 兜底。
 
 输出统一为 {latex, problem_text, figure_hints} 结构，供解题流水线消费。
 """
@@ -6,44 +6,70 @@ from __future__ import annotations
 
 import base64
 
-from app.core.config import get_settings
+from app.core import runtime_config
 
 
 class OCREngine:
     async def recognize(self, image_b64: str) -> dict:
-        settings = get_settings()
-        if settings.dashscope_api_key:
+        cfg = runtime_config.effective("vlm")
+        if cfg["api_key"] and cfg["base_url"] and cfg["model"]:
             try:
-                return await self._recognize_qwen_vl(image_b64)
+                return await self._recognize_vision(image_b64, cfg)
             except Exception:
                 pass
         return self._demo_recognize()
 
-    async def _recognize_qwen_vl(self, image_b64: str) -> dict:  # pragma: no cover - 外部 API
+    PROMPT = "识别图片中的数学题，将公式转为 LaTeX，原样输出题面。"
+
+    async def _recognize_vision(self, image_b64: str, cfg: dict) -> dict:  # pragma: no cover - 外部 API
+        """通吃 Qwen-VL / GPT-4o / GLM-4V 等 OpenAI 兼容多模态端点；Anthropic 协议单独分支。"""
         import httpx
 
-        settings = get_settings()
-        resp = await httpx.AsyncClient(timeout=90).post(
-            f"{settings.dashscope_base_url.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {settings.dashscope_api_key}"},
-            json={
-                "model": "qwen-vl-max",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
-                            {
-                                "type": "text",
-                                "text": "识别图片中的数学题，将公式转为 LaTeX，原样输出题面。",
-                            },
-                        ],
-                    }
-                ],
-            },
-        )
+        content = [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+            {"type": "text", "text": self.PROMPT},
+        ]
+        if cfg.get("provider") == "anthropic":
+            resp = await httpx.AsyncClient(timeout=120).post(
+                f"{cfg['base_url'].rstrip('/')}/v1/messages",
+                headers={"x-api-key": cfg["api_key"], "anthropic-version": "2023-06-01"},
+                json={
+                    "model": cfg["model"],
+                    "max_tokens": 2048,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": image_b64,
+                                    },
+                                },
+                                {"type": "text", "text": self.PROMPT},
+                            ],
+                        }
+                    ],
+                },
+            )
+        else:
+            resp = await httpx.AsyncClient(timeout=120).post(
+                f"{cfg['base_url'].rstrip('/')}/chat/completions",
+                headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                json={
+                    "model": cfg["model"],
+                    "messages": [{"role": "user", "content": content}],
+                },
+            )
         resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"]
+        data = resp.json()
+        if "choices" in data:
+            text = data["choices"][0]["message"]["content"]
+        else:
+            blocks = data.get("content") or []
+            text = "".join(b.get("text", "") for b in blocks)
         return {"latex": text, "problem_text": text, "figure_hints": []}
 
     @staticmethod

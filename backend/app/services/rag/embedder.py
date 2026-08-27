@@ -1,9 +1,10 @@
-"""向量化封装：优先 OpenAI Embeddings；无 Key 时回落确定性哈希词袋向量（零依赖离线可用）。"""
+"""向量化封装：优先 OpenAI 兼容 Embeddings API（管理员面板可配置）；无配置时回落确定性哈希词袋向量（零依赖离线可用）。"""
 from __future__ import annotations
 
 import hashlib
 import math
 
+from app.core import runtime_config
 from app.core.config import get_settings
 
 _DIM = 256
@@ -42,16 +43,16 @@ def _tokenize(text: str) -> list[str]:
 
 
 async def embed(text: str) -> list[float]:
-    settings = get_settings()
-    if settings.embedding_backend == "openai" and settings.openai_api_key:
+    cfg = runtime_config.effective("embedding")
+    if cfg["api_key"] and cfg["base_url"] and cfg["model"]:
         try:
             import httpx
 
             async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(
-                    f"{settings.openai_base_url.rstrip('/')}/embeddings",
-                    headers={"Authorization": f"Bearer {settings.openai_api_key}"},
-                    json={"model": "text-embedding-3-small", "input": text},
+                    f"{cfg['base_url'].rstrip('/')}/embeddings",
+                    headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                    json={"model": cfg["model"], "input": text},
                 )
                 resp.raise_for_status()
                 return resp.json()["data"][0]["embedding"]

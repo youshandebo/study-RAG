@@ -22,7 +22,7 @@ interface SessionState {
   renameSession: (id: string, title: string) => Promise<void>;
 
   appendMessage: (msg: PolymorphicMessage) => void;
-  patchMessage: (sessionId: string, id: string, patch: Partial<PolymorphicMessage>) => void;
+  patchMessage: (sessionId: string, id: string, patch: Partial<PolymorphicMessage>, legacyId?: string) => void;
   appendDelta: (sessionId: string, id: string, text: string) => void;
   appendTrackDelta: (sessionId: string, id: string, index: number, text: string) => void;
   finishTrack: (sessionId: string, id: string, index: number) => void;
@@ -96,13 +96,23 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     void db.messages.put(msg);
   },
 
-  patchMessage(sessionId, id, patch) {
+  patchMessage(sessionId, id, patch, legacyId) {
     set((s) => ({
       messagesBySession: {
         ...s.messagesBySession,
-        [sessionId]: (s.messagesBySession[sessionId] ?? []).map((m) => (m.id === id ? { ...m, ...patch } : m)),
+        [sessionId]: (s.messagesBySession[sessionId] ?? []).map((m) =>
+          m.id === id || m.id === legacyId ? { ...m, ...patch } : m,
+        ),
       },
     }));
+    // 持久化最终态：SSE meta 事件可能已把内存 id 从占位键改名，IndexedDB 中的旧行要一并清理
+    const finalMsg = get().messagesBySession[sessionId]?.find((m) => m.id === id);
+    if (!finalMsg) return;
+    const persist = async () => {
+      if (legacyId && legacyId !== id) await db.messages.delete(legacyId);
+      await db.messages.put(finalMsg);
+    };
+    void persist();
   },
 
   appendDelta(sessionId, id, text) {

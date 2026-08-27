@@ -89,18 +89,23 @@ export default function OmniChatInput() {
         onTrackDone: (index) => useSessionStore.getState().finishTrack(activeSessionId, pendingId, index),
         onCard: (card) => {
           const store = useSessionStore.getState();
-          // 用最终卡片替换占位（若 id 已因 meta 改名则按位置兜底）
+          // 用最终卡片替换占位（若 id 已因 meta 改名则按位置兜底）；legacyId 同步清理 IndexedDB 旧占位行
           const list = store.messagesBySession[activeSessionId] ?? [];
           const targetId = list.some((m) => m.id === card.id) ? card.id : pendingId;
-          store.patchMessage(activeSessionId, targetId, {
-            type: card.type,
-            content: card.content,
-            solvePayload: card.solvePayload,
-            socraticPayload: card.socraticPayload,
-            quizPayload: card.quizPayload,
-            comparePayload: card.comparePayload,
-            intent: card.intent,
-          });
+          store.patchMessage(
+            activeSessionId,
+            targetId,
+            {
+              type: card.type,
+              content: card.content,
+              solvePayload: card.solvePayload,
+              socraticPayload: card.socraticPayload,
+              quizPayload: card.quizPayload,
+              comparePayload: card.comparePayload,
+              intent: card.intent,
+            },
+            pendingId,
+          );
         },
         onDone: () => setStreamingId(null),
         onError: () => {
@@ -125,45 +130,10 @@ export default function OmniChatInput() {
   return (
     <div className="border-t border-rule bg-paper px-6 py-4">
       <div className="mx-auto max-w-3xl">
-        {/* 快捷指令 */}
-        <div className="mb-2 flex flex-wrap gap-1.5">
-          {QUICK_CMDS.map((cmd) =>
-            cmd.action === 'upload' ? (
-              <button
-                key={cmd.label}
-                onClick={() => fileRef.current?.click()}
-                className="rounded-full border border-rule bg-[#fdfaf2] px-3 py-1 text-[12px] text-ink-soft transition hover:border-chalk hover:text-chalk"
-              >
-                {cmd.label}
-              </button>
-            ) : (
-              <button
-                key={cmd.label}
-                disabled={busy}
-                onClick={() => setText(cmd.text)}
-                className="rounded-full border border-rule bg-[#fdfaf2] px-3 py-1 text-[12px] text-ink-soft transition hover:border-chalk hover:text-chalk disabled:opacity-40"
-              >
-                {cmd.label}
-              </button>
-            ),
-          )}
-        </div>
-
-        {/* 图片预览 */}
-        {image && (
-          <div className="mb-2 flex items-center gap-2 rounded-lg border border-rule bg-[#fdfaf2] p-2">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src={image.dataUrl} alt="待识别的题目图片" className="h-14 w-14 rounded object-cover" />
-            <span className="flex-1 text-[12.5px] text-ink-soft">题目图片已就绪，将自动提取公式并匹配课堂解法</span>
-            <button onClick={() => setImage(null)} className="px-2 text-ink-faint hover:text-cinnabar" aria-label="移除图片">
-              ✕
-            </button>
-          </div>
-        )}
-
-        {/* 输入区 */}
         <div
-          className={`input-scroll flex items-end gap-2 rounded-xl px-4 py-3 ${dragOver ? 'border-chalk ring-2 ring-chalk/20' : ''}`}
+          className={`rounded-2xl border bg-[#fdfaf2] px-4 pb-3 pt-3 shadow-[0_10px_34px_-16px_rgba(60,50,30,0.28)] transition ${
+            dragOver ? 'border-chalk ring-2 ring-chalk/20' : 'border-rule focus-within:border-chalk/70 focus-within:ring-2 focus-within:ring-chalk/15'
+          }`}
           onDragOver={(e) => {
             e.preventDefault();
             setDragOver(true);
@@ -176,36 +146,77 @@ export default function OmniChatInput() {
             if (file?.type.startsWith('image/')) readImage(file);
           }}
         >
-          <textarea
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            onPaste={onPaste}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-                e.preventDefault();
-                send();
-              }
-            }}
-            rows={1}
-            placeholder="输入题目 / 疑问，或拖拽 · 粘贴题目照片…（Enter 发送，Shift+Enter 换行）"
-            className="max-h-36 min-h-[28px] flex-1 resize-none bg-transparent text-[14px] leading-relaxed outline-none"
-          />
-          {busy ? (
-            <button
-              onClick={stop}
-              className="rounded-lg bg-cinnabar px-4 py-2 text-[13px] font-semibold text-white transition hover:opacity-90"
-            >
-              ■ 停止
-            </button>
-          ) : (
-            <button
-              onClick={send}
-              disabled={!text.trim() && !image}
-              className="rounded-lg bg-chalk px-4 py-2 text-[13px] font-semibold text-white transition hover:opacity-90 disabled:opacity-40"
-            >
-              发送
-            </button>
+          {/* 图片预览 */}
+          {image && (
+            <div className="mb-2.5 flex items-center gap-2 rounded-lg border border-rule bg-white/70 p-2">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={image.dataUrl} alt="待识别的题目图片" className="h-14 w-14 rounded object-cover" />
+              <span className="flex-1 text-[12.5px] text-ink-soft">题目图片已就绪，将自动提取公式并匹配课堂解法</span>
+              <button onClick={() => setImage(null)} className="px-2 text-ink-faint hover:text-cinnabar" aria-label="移除图片">
+                ✕
+              </button>
+            </div>
           )}
+
+          {/* 输入区 */}
+          <div className="input-scroll flex items-end gap-2 px-1 py-1">
+            <textarea
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              onPaste={onPaste}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  send();
+                }
+              }}
+              rows={1}
+              placeholder="输入题目 / 疑问，或拖拽 · 粘贴题目照片…"
+              className="max-h-36 min-h-[28px] flex-1 resize-none bg-transparent text-[14px] leading-relaxed outline-none placeholder:text-ink-faint/80"
+            />
+            {busy ? (
+              <button
+                onClick={stop}
+                className="shrink-0 rounded-lg bg-cinnabar px-4 py-2 text-[13px] font-semibold text-white transition hover:opacity-90 active:scale-[0.98]"
+              >
+                ■ 停止
+              </button>
+            ) : (
+              <button
+                onClick={send}
+                disabled={!text.trim() && !image}
+                title="Enter 发送，Shift+Enter 换行"
+                className="shrink-0 rounded-lg bg-chalk px-4 py-2 text-[13px] font-semibold text-white transition hover:bg-[#173f37] active:scale-[0.98] disabled:opacity-40"
+              >
+                发送 ➤
+              </button>
+            )}
+          </div>
+
+          {/* 快捷指令 */}
+          <div className="mt-2 flex flex-wrap items-center gap-1.5 border-t border-dashed border-rule/70 pt-2.5">
+            {QUICK_CMDS.map((cmd) =>
+              cmd.action === 'upload' ? (
+                <button
+                  key={cmd.label}
+                  onClick={() => fileRef.current?.click()}
+                  className="rounded-full border border-rule bg-white/70 px-3 py-1 text-[12px] text-ink-soft transition hover:border-chalk hover:text-chalk active:scale-95"
+                >
+                  {cmd.label}
+                </button>
+              ) : (
+                <button
+                  key={cmd.label}
+                  disabled={busy}
+                  onClick={() => setText(cmd.text)}
+                  className="rounded-full border border-rule bg-white/70 px-3 py-1 text-[12px] text-ink-soft transition hover:border-chalk hover:text-chalk active:scale-95 disabled:opacity-40"
+                >
+                  {cmd.label}
+                </button>
+              ),
+            )}
+            <span className="ml-auto hidden text-[10.5px] text-ink-faint sm:block">Enter 发送 · Shift+Enter 换行</span>
+          </div>
         </div>
 
         <input

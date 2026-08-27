@@ -36,5 +36,16 @@ export const db = new TutorDB();
 
 export async function hydrateMessages(sessionId: string): Promise<PolymorphicMessage[]> {
   const rows = await db.messages.where('sessionId').equals(sessionId).toArray();
-  return rows.sort((a, b) => a.createdAt - b.createdAt);
+  return rows
+    .sort((a, b) => a.createdAt - b.createdAt)
+    // 兜底清理历史遗留的空占位行（流式中断/旧版 bug 产生的无内容助教消息）
+    .filter(
+      (m) =>
+        m.role === 'user' ||
+        m.content.trim() !== '' ||
+        !!m.solvePayload ||
+        !!m.socraticPayload ||
+        !!m.quizPayload ||
+        !!m.comparePayload,
+    );
 }

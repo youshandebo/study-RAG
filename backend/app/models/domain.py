@@ -95,6 +95,6 @@ class ChatRequest(BaseModel):
 class IngestRequest(BaseModel):
     session_id: str
     filename: str
-    media_type: Literal["audio", "board"]
+    media_type: Literal["audio", "board", "text"]
     content_b64: str = ""
     lecture_date: str = ""

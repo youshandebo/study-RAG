@@ -1,17 +1,20 @@
 'use client';
 
-/** 对话内快速上传录音/板书资产：悬浮进度 + 完成后更新考点库 */
+/** 对话内快速上传录音/板书/文字素材：悬浮进度 + 完成后更新考点库 */
 import { useRef, useState } from 'react';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useEvidenceStore } from '@/stores/useEvidenceStore';
-import { uploadAsset } from '@/lib/api';
+import { uploadAsset, uploadTextAsset } from '@/lib/api';
 
-const STAGES = ['上传素材…', 'ASR 转录 / VLM 识别…', '时空对齐切片…', '教学洞察提炼…', '向量入库…'];
+const STAGES = ['上传素材…', 'ASR 转录 / VLM 识别 / 切片…', '时空对齐…', '教学洞察提炼…', '向量入库…'];
 
 export default function QuickIngestPanel() {
   const audioRef = useRef<HTMLInputElement>(null);
   const boardRef = useRef<HTMLInputElement>(null);
   const [error, setError] = useState('');
+  const [showTextBox, setShowTextBox] = useState(false);
+  const [noteTitle, setNoteTitle] = useState('');
+  const [noteText, setNoteText] = useState('');
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const { assets, ingestProgress, setIngestProgress, registerAsset, setTab } = useEvidenceStore();
 
@@ -38,32 +41,89 @@ export default function QuickIngestPanel() {
     }
   };
 
+  const handleTextSubmit = async () => {
+    if (!noteText.trim()) return;
+    setError('');
+    setIngestProgress({ filename: noteTitle || '文字笔记', percent: 35, stage: '切片与向量化…' });
+    try {
+      const asset = await uploadTextAsset(activeSessionId, noteText.trim(), noteTitle.trim() || undefined);
+      registerAsset(asset);
+      setNoteText('');
+      setNoteTitle('');
+      setShowTextBox(false);
+      setIngestProgress({ filename: asset.filename, percent: 100, stage: `完成 · 新增 ${asset.chunkCount} 个知识切片` });
+      window.setTimeout(() => setIngestProgress(null), 2600);
+    } catch (e) {
+      setError(`文字入库失败：${(e as Error).message}`);
+      setIngestProgress(null);
+    }
+  };
+
   return (
     <div className="space-y-4 px-5 py-4">
       <div className="text-[12.5px] leading-relaxed text-ink-faint">
-        直接拖入或选择课堂录音 / 板书照片，系统将自动完成 ASR 转录、VLM 手写公式识别、
-        时空对齐切片与考点提炼，完成后即可在本对话中检索引用。
+        直接拖入或选择课堂录音 / 板书照片 / 粘贴文字讲义，系统将自动完成 ASR 转录、VLM 手写公式识别、
+        切片与考点提炼并向量入库，完成后即可在本对话中检索引用。
       </div>
 
       {/* 上传按钮组 */}
-      <div className="grid grid-cols-2 gap-2">
+      <div className="grid grid-cols-3 gap-2">
         <button
           onClick={() => audioRef.current?.click()}
-          className="rounded-lg border border-dashed border-chalk/50 bg-chalk-soft/50 px-4 py-6 text-center transition hover:bg-chalk-soft"
+          className="rounded-lg border border-dashed border-chalk/50 bg-chalk-soft/50 px-2 py-5 text-center transition hover:bg-chalk-soft"
         >
           <div className="text-xl" aria-hidden>🎙️</div>
-          <div className="mt-1 text-[13px] font-semibold text-chalk">上传课堂录音</div>
-          <div className="mt-0.5 text-[11px] text-ink-faint">wav / mp3 / m4a</div>
+          <div className="mt-1 text-[13px] font-semibold text-chalk">课堂录音</div>
+          <div className="mt-0.5 text-[11px] text-ink-faint">wav / mp3</div>
         </button>
         <button
           onClick={() => boardRef.current?.click()}
-          className="rounded-lg border border-dashed border-warn/50 bg-warn-soft/50 px-4 py-6 text-center transition hover:bg-warn-soft"
+          className="rounded-lg border border-dashed border-warn/50 bg-warn-soft/50 px-2 py-5 text-center transition hover:bg-warn-soft"
         >
           <div className="text-xl" aria-hidden>🖼️</div>
-          <div className="mt-1 text-[13px] font-semibold text-warn">上传板书照片</div>
-          <div className="mt-0.5 text-[11px] text-ink-faint">png / jpg / heic</div>
+          <div className="mt-1 text-[13px] font-semibold text-warn">板书照片</div>
+          <div className="mt-0.5 text-[11px] text-ink-faint">png / jpg</div>
+        </button>
+        <button
+          onClick={() => setShowTextBox((v) => !v)}
+          className={`rounded-lg border border-dashed px-2 py-5 text-center transition ${
+            showTextBox ? 'border-cinnabar/60 bg-cinnabar-soft' : 'border-rule bg-paper-deep/40 hover:bg-paper-deep'
+          }`}
+        >
+          <div className="text-xl" aria-hidden>📝</div>
+          <div className="mt-1 text-[13px] font-semibold text-ink">粘贴文字</div>
+          <div className="mt-0.5 text-[11px] text-ink-faint">笔记 / 讲义</div>
         </button>
       </div>
+
+      {/* 文字入库表单 */}
+      {showTextBox && (
+        <div className="space-y-2 rounded-lg border border-rule bg-white/60 px-4 py-3">
+          <input
+            value={noteTitle}
+            onChange={(e) => setNoteTitle(e.target.value)}
+            placeholder="笔记标题（可选，如「10月17日 · 级数敛散性」）"
+            className="w-full rounded-md border border-rule bg-white/80 px-2.5 py-1.5 text-[12.5px] outline-none focus:border-chalk"
+          />
+          <textarea
+            value={noteText}
+            onChange={(e) => setNoteText(e.target.value)}
+            rows={6}
+            placeholder="粘贴课堂笔记、讲义或题目解析…支持空行分段，系统按语义自动切片入库。"
+            className="w-full resize-y rounded-md border border-rule bg-white/80 px-2.5 py-2 text-[12.5px] leading-relaxed outline-none focus:border-chalk"
+          />
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] text-ink-faint">{noteText.length} 字 · 建议单次 ≤ 8000 字</span>
+            <button
+              onClick={() => void handleTextSubmit()}
+              disabled={!noteText.trim() || !!ingestProgress}
+              className="rounded-md bg-chalk px-3.5 py-1.5 text-[12px] font-semibold text-white transition hover:bg-[#173f37] disabled:opacity-50"
+            >
+              入库
+            </button>
+          </div>
+        </div>
+      )}
 
       <input
         ref={audioRef}
@@ -125,7 +185,7 @@ export default function QuickIngestPanel() {
                 <div className="flex items-center justify-between text-[12.5px]">
                   <span className="font-medium text-ink">{a.filename}</span>
                   <span className="rounded bg-chalk-soft px-1.5 py-0.5 text-[11px] text-chalk">
-                    {a.kind === 'audio' ? '🎙️ 录音' : '🖼️ 板书'}
+                    {a.kind === 'audio' ? '🎙️ 录音' : a.kind === 'text' ? '📝 笔记' : '🖼️ 板书'}
                   </span>
                 </div>
                 <div className="mt-1 text-[11.5px] text-ink-faint">

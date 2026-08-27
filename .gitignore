@@ -11,9 +11,12 @@ backend/__pycache__/
 backend/.venv/
 backend/venv/
 
-# 运行时上传资产（录音/板书）
-backend/app/static/audio/
-backend/app/static/boards/
+# 管理面板运行时配置（含打码前的模型 Key 与口令哈希）
+backend/data/
+
+# 运行时上传资产（录音/板书）——保留内置板书 SVG
+backend/app/static/audio/*
+backend/app/static/boards/*
 !backend/app/static/boards/*.svg
 
 # ---- 环境与密钥 ----
