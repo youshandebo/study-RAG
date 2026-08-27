@@ -11,7 +11,9 @@ SSE 事件协议（前端 lib/api.ts 按此解析）：
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import time
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
@@ -27,6 +29,7 @@ from app.models.domain import (
     PolymorphicMessage,
     QuizPayload,
     SolvePayload,
+    UsageInfo,
 )
 from app.services.agent.evaluator import Evaluator
 from app.services.agent.quiz_generator import QuizGenerator
@@ -41,6 +44,7 @@ from app.services.llm.mock_engine import (
 from app.services.llm.provider import get_provider
 from app.services.router.intent_classifier import classify
 from app.services.rag.retriever import get_retriever
+from app.services.tokens import estimate_tokens
 
 router = APIRouter()
 
@@ -90,12 +94,48 @@ def _user_query(req: ChatRequest, ocr_text: str | None) -> str:
     return req.text.strip() or (ocr_text or "") or "反常积分收敛性判定"
 
 
+_CONTEXT_LIMIT = 131072  # 演示口径：128K
+
+
+async def _build_usage(session_id: str, system_text: str, retrieval_text: str, output: str, duration_ms: int) -> UsageInfo:
+    """估算本轮 token 用量与上下文容量占比（无真实 tokenizer，按中英字重近似）。"""
+    hist = sum(
+        estimate_tokens(str(m.get("content", ""))) for m in await repo.list_messages(session_id)
+    )
+    sys_t = estimate_tokens(system_text)
+    ret_t = estimate_tokens(retrieval_text)
+    out_t = estimate_tokens(output)
+    other = 40
+    inp = sys_t + hist + ret_t + other
+    # 演示口径的伪缓存命中率：每会话固定档位，展示用
+    seed = int(hashlib.md5(session_id.encode()).hexdigest()[:4], 16)
+    cache_rate = round(0.88 + (seed % 900) / 10000, 3)
+    return UsageInfo(
+        input=inp,
+        output=out_t,
+        total=inp + out_t,
+        duration_ms=max(1, duration_ms),
+        cache_hit_rate=cache_rate,
+        context_used=inp,
+        context_limit=_CONTEXT_LIMIT,
+        context_breakdown=[
+            {"label": "消息", "tokens": hist},
+            {"label": "系统提示词", "tokens": sys_t},
+            {"label": "检索上下文", "tokens": ret_t},
+            {"label": "回复输出", "tokens": out_t},
+            {"label": "其他", "tokens": other},
+        ],
+    )
+
+
 @router.post("/chat/stream")
 async def chat_stream(req: ChatRequest) -> StreamingResponse:
     return StreamingResponse(_stream(req), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
 
 async def _stream(req: ChatRequest):
+    t0 = time.time()
+    u_sys = u_ret = u_out = ""
     intent = classify(req.text, has_image=bool(req.image_b64), force=req.force_intent)
 
     user_msg = PolymorphicMessage(
@@ -130,6 +170,7 @@ async def _stream(req: ChatRequest):
         yield _sse("evidence", {"list": [r.model_dump(mode="json") for r in refs]})
 
         context = "\n---\n".join(f"[{c.start}-{c.end}] {c.text}" for c in chunks)
+        u_sys, u_ret = SOLVE_SYSTEM, context
         provider = get_provider()
         messages = [
             {"role": "system", "content": SOLVE_SYSTEM},
@@ -144,6 +185,7 @@ async def _stream(req: ChatRequest):
             fallback = SOLVE_MARKDOWN[len(full) :]
             full += fallback
             yield _sse("delta", {"text": fallback})
+        u_out = full
 
         pitfalls = extract_from_chunks(chunks)[:3] or SOLVE_PITFALLS
         exam_point = chunks[0].exam_point if chunks else "p-反常积分比较审敛法"
@@ -166,6 +208,7 @@ async def _stream(req: ChatRequest):
         assistant.type = MessageType.socratic_card
         assistant.content = payload.guiding_question
         assistant.socratic_payload = payload
+        u_out = payload.guiding_question
 
     # ------------------------------------------------------------ quiz ---
     elif intent == Intent.quiz:
@@ -174,6 +217,7 @@ async def _stream(req: ChatRequest):
         assistant.type = MessageType.quiz_card
         assistant.content = payload.question_text
         assistant.quiz_payload = payload
+        u_out = payload.question_text + "".join(payload.options or []) + payload.explanation
 
     # --------------------------------------------------------- general ---
     elif intent == Intent.general:
@@ -186,13 +230,15 @@ async def _stream(req: ChatRequest):
         provider = get_provider()
         full = ""
         user_content = req.text or "你好"
+        ret_ctx = ""
         if relevant:
-            context = "\n---\n".join(
+            ret_ctx = "\n---\n".join(
                 f"[{c.board_caption or '课堂切片'}·{c.start}-{c.end}] {c.text}" for c in relevant
             )
+            u_ret = ret_ctx
             user_content = (
                 f"{user_content}\n\n【知识库命中的课堂资料，请优先依据这些内容回答；"
-                f"不相关时再按通识作答】\n{context}"
+                f"不相关时再按通识作答】\n{ret_ctx}"
             )
         try:
             async for piece in provider.stream_chat([{"role": "user", "content": user_content}]):
@@ -200,6 +246,7 @@ async def _stream(req: ChatRequest):
                 yield _sse("delta", {"text": piece})
         except Exception:
             pass
+        u_out = full
         assistant.type = MessageType.general_text
         assistant.content = full
 
@@ -242,8 +289,14 @@ async def _stream(req: ChatRequest):
             t.cancel()
 
         assistant.compare_payload = ComparePayload(tracks=tracks)
+        u_out = "".join(tr.content for tr in tracks)
+
+    # ------------------------------------------------------------ usage --
+    usage = await _build_usage(req.session_id, u_sys, u_ret, u_out, int((time.time() - t0) * 1000))
+    assistant.usage = usage
 
     await repo.append_message(req.session_id, assistant.to_client())
+    yield _sse("usage", {"usage": json.loads(usage.model_dump_json())})
     yield _sse("card", assistant.to_client())
     yield _sse("done", {})
 

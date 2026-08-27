@@ -25,6 +25,18 @@ export interface EvidenceRef {
   boardCaption: string;
 }
 
+/** 单轮 Token 用量（后端估算口径，键名与后端一致） */
+export interface UsageInfo {
+  input: number;
+  output: number;
+  total: number;
+  duration_ms: number;
+  cache_hit_rate: number;
+  context_used: number;
+  context_limit: number;
+  context_breakdown: Array<{ label: string; tokens: number }>;
+}
+
 /** 聚合消息协议：通过 type 驱动 UI 渲染具体卡片 */
 export interface PolymorphicMessage extends BaseMessage {
   type: MessageType;
@@ -64,6 +76,9 @@ export interface PolymorphicMessage extends BaseMessage {
       status: 'streaming' | 'done';
     }[];
   };
+
+  /** 本轮 Token 用量（完成后由 usage 事件 / 最终卡片携带） */
+  usage?: UsageInfo;
 }
 
 /** SSE 流式事件（后端 chat_stream 协议） */

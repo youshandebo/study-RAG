@@ -1,6 +1,6 @@
 /** Fetch / SSE 流式通信客户端封装 */
 
-import type { EvidenceRef, Intent, PolymorphicMessage } from '@/types/message';
+import type { EvidenceRef, Intent, PolymorphicMessage, UsageInfo } from '@/types/message';
 import type { EvidenceBundle, IngestAsset } from '@/types/evidence';
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000/api/v1';
@@ -11,6 +11,7 @@ export interface StreamHandlers {
   onMeta?: (meta: { messageId: string; intent: Intent }) => void;
   onDelta?: (text: string) => void;
   onEvidence?: (list: EvidenceRef[]) => void;
+  onUsage?: (usage: UsageInfo) => void;
   onTrackDelta?: (index: number, modelName: string, text: string) => void;
   onTrackDone?: (index: number, modelName: string) => void;
   onCard?: (card: PolymorphicMessage) => void;
@@ -73,6 +74,7 @@ export function normalizeCard(raw: Record<string, unknown>): PolymorphicMessage 
   const msg: Record<string, unknown> = { ...raw };
   msg.sessionId = raw.session_id ?? '';
   msg.createdAt = raw.created_at ?? Date.now();
+  if (raw.usage && typeof raw.usage === 'object') msg.usage = raw.usage; // 键名前后端一致，原样透传
 
   const sp = raw.solve_payload as Record<string, unknown> | undefined | null;
   if (sp) {
@@ -130,6 +132,9 @@ function dispatch(event: string, payload: unknown, h: StreamHandlers): void {
       break;
     case 'evidence':
       h.onEvidence?.(((p.list as Record<string, unknown>[]) ?? []).map(normalizeEvidence));
+      break;
+    case 'usage':
+      h.onUsage?.(p.usage as UsageInfo);
       break;
     case 'track_delta':
       h.onTrackDelta?.(p.index as number, p.model_name as string, p.text as string);

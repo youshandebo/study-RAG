@@ -4,7 +4,8 @@
 import { useCallback, useRef, useState } from 'react';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { streamChat } from '@/lib/api';
-import type { PolymorphicMessage } from '@/types/message';
+import type { PolymorphicMessage, UsageInfo } from '@/types/message';
+import ContextMeter from './ContextMeter';
 
 const QUICK_CMDS = [
   { label: '📸 拍照解题', text: '', action: 'upload' as const },
@@ -22,6 +23,11 @@ export default function OmniChatInput() {
 
   const { activeSessionId, appendMessage, setStreamingId, streamingMessageId } = useSessionStore();
   const busy = streamingMessageId !== null;
+  // 当前会话每轮用量（供右下角上下文容量面板聚合展示）
+  const messagesMap = useSessionStore((s) => s.messagesBySession);
+  const sessionUsages = (messagesMap[activeSessionId] ?? [])
+    .map((m) => m.usage)
+    .filter((u): u is UsageInfo => !!u);
 
   const readImage = useCallback((file: File) => {
     const reader = new FileReader();
@@ -103,6 +109,7 @@ export default function OmniChatInput() {
               quizPayload: card.quizPayload,
               comparePayload: card.comparePayload,
               intent: card.intent,
+              usage: card.usage,
             },
             pendingId,
           );
@@ -216,6 +223,7 @@ export default function OmniChatInput() {
               ),
             )}
             <span className="ml-auto hidden text-[10.5px] text-ink-faint sm:block">Enter 发送 · Shift+Enter 换行</span>
+            <ContextMeter usages={sessionUsages} />
           </div>
         </div>
 

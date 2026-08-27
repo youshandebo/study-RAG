@@ -66,6 +66,19 @@ class ComparePayload(BaseModel):
     tracks: list[CompareTrack]
 
 
+class UsageInfo(BaseModel):
+    """单轮 Token 用量（估算口径，供 Cherry Studio 式展示与上下文容量条）。"""
+    input: int = 0
+    output: int = 0
+    total: int = 0
+    duration_ms: int = 0
+    cache_hit_rate: float = 0.0
+    context_used: int = 0
+    context_limit: int = 131072
+    # [{label: 消息|系统提示词|检索上下文|回复输出|其他, tokens: int}]
+    context_breakdown: list[dict[str, Any]] = []
+
+
 class PolymorphicMessage(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     session_id: str
@@ -79,6 +92,7 @@ class PolymorphicMessage(BaseModel):
     socratic_payload: Optional[SocraticPayload] = None
     quiz_payload: Optional[QuizPayload] = None
     compare_payload: Optional[ComparePayload] = None
+    usage: Optional[UsageInfo] = None
 
     def to_client(self) -> dict[str, Any]:
         data = self.model_dump(mode="json")

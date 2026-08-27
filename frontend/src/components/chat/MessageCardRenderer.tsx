@@ -32,7 +32,7 @@ export default function MessageCardRenderer({
     );
   }
 
-  // 助教消息：左侧 🎓 头像 + 多态卡片本体
+  // 助教消息：左侧 🎓 头像 + 多态卡片本体 + 用量小字
   return (
     <div className="msg-enter flex items-start gap-2.5">
       <div
@@ -42,7 +42,36 @@ export default function MessageCardRenderer({
       >
         🎓
       </div>
-      <div className="min-w-0 flex-1">{renderAssistantCard(message, streaming)}</div>
+      <div className="min-w-0 flex-1">
+        {renderAssistantCard(message, streaming)}
+        <UsageFootnote usage={message.usage} />
+      </div>
+    </div>
+  );
+}
+
+/** Cherry Studio 式每轮用量小字：完成后显示在回复末尾 */
+function UsageFootnote({ usage }: { usage?: PolymorphicMessage['usage'] }) {
+  if (!usage || !Number.isFinite(usage.total) || usage.total <= 0) return null;
+  const secs = (usage.duration_ms / 1000).toFixed(1);
+  const pct = Math.min(100, (usage.context_used / usage.context_limit) * 100);
+  return (
+    <div
+      className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 pl-1 text-[11px] text-ink-faint"
+      title={`估算口径 · 上下文已用 ${usage.context_used}/${usage.context_limit} tokens`}
+    >
+      <span className="inline-flex items-center gap-1">
+        ⚡ 本轮
+        <b className="font-mono font-semibold text-ink-soft">↑{usage.input}</b>
+        <b className="font-mono font-semibold text-ink-soft">↓{usage.output}</b>
+        <span className="font-mono">合计 {usage.total} tokens</span>
+      </span>
+      <span className="inline-flex items-center gap-1">
+        🕐 {secs}s
+      </span>
+      <span className="hidden items-center gap-1.5 sm:inline-flex">
+        📊 上下文 {pct.toFixed(1)}%
+      </span>
     </div>
   );
 }
