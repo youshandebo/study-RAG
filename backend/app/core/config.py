@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """全局配置：环境变量驱动，所有外部依赖均可选，缺失时自动降级 Mock 模式。"""
 from __future__ import annotations
 

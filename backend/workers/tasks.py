@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """异步入库任务：上传 -> ASR -> VLM -> 洞察提炼 -> 向量入库。
 
 Celery 可用时走分布式队列；否则同步执行（单机演示模式）。

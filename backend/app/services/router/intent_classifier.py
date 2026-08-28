@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """意图动态路由器：识别用户输入属于 解题 / 启发伴学 / 靶向自测 / 模型比对 / 通用对话。"""
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 /** Dexie.js 本地离线数据库：缓存会话、消息、图片与 API Keys */
 import Dexie, { type Table } from 'dexie';
 import type { PolymorphicMessage } from '@/types/message';

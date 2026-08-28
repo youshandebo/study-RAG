@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """音画证据切片调取与回放数据接口。"""
 from __future__ import annotations
 

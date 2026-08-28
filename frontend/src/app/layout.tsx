@@ -1,4 +1,6 @@
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 import type { Metadata } from 'next';
+import LicenseBanner from './LicenseBanner';
 import 'katex/dist/katex.min.css';
 import './globals.css';
 
@@ -10,7 +12,10 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="zh-CN">
-      <body>{children}</body>
+      <body>
+        <LicenseBanner />
+        {children}
+      </body>
     </html>
   );
 }

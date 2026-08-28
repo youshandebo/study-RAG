@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 音画证据同步器：录音波形高亮播放 + 板书原图定位 + 原文转录 */
 import { useCallback, useEffect, useRef, useState } from 'react';

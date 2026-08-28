@@ -1,3 +1,4 @@
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 /** 证据抽屉联动状态：当前激活的音画证据引用 + 抽屉开合 + 入库进度 */
 import { create } from 'zustand';
 import type { EvidenceBundle, IngestAsset } from '@/types/evidence';

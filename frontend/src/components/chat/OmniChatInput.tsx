@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 全能输入框：文本 / 拍照上传 / 拖拽 / 粘贴图片 / 指令前缀 / 停止生成 */
 import { useCallback, useRef, useState } from 'react';

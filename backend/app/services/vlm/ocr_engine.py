@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """视觉与手写公式识别：OpenAI 兼容视觉模型封装（管理员面板可配置端点/模型）+ 离线演示 OCR 兜底。
 
 输出统一为 {latex, problem_text, figure_hints} 结构，供解题流水线消费。

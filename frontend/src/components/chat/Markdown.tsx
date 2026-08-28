@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** Markdown + KaTeX 统一渲染器（所有卡片共用）。
  * 安全：rehype-sanitize 在 KaTeX 之前过滤原始 HTML（script/iframe/事件属性），

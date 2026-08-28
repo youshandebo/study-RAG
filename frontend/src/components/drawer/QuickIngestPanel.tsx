@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 对话内快速上传录音/板书/文字素材：悬浮进度 + 完成后更新考点库 */
 import { useRef, useState } from 'react';

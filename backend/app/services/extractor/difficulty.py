@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """难度打标 (1~5 星)：综合公式复杂度、推理链长度与课堂强调强度的启发式评分。"""
 from __future__ import annotations
 

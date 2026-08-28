@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 课程大纲树与考点掌握度分布（基于内置 10月15日 课堂考点 + 伴学掌握度） */
 import { useSessionStore } from '@/stores/useSessionStore';

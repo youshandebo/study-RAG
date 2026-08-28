@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """苏格拉底式启发伴学代理：以有限状态机推进分步设问，支持学生作答评估与渐进提示。"""
 from __future__ import annotations
 

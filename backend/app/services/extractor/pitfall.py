@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """易错陷阱与概念混淆挖掘：从切片文本中定位「老师强调的扣分点」。"""
 from __future__ import annotations
 

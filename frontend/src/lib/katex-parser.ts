@@ -1,3 +1,4 @@
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 /** LaTeX 公式与 Markdown 语法修复与清洗工具 */
 
 /** 将模型输出中常见的坏 LaTeX 修复为 KaTeX 可渲染形式 */

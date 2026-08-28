@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """Celery 异步任务队列配置（可选依赖：无 Redis 时由 workers.tasks 内的同步兜底执行）。"""
 from __future__ import annotations
 

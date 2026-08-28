@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """混合检索器：向量相似度 + BM25 倒排 + 词面重合 + 考点元数据过滤。
 
 优先写入/查询 Qdrant；未配置 Qdrant 时自动使用进程内向量索引（零依赖兜底）。

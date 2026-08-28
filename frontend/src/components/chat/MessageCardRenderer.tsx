@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 多态消息渲染分发器：按 type 派发到具体卡片组件；统一携带会话双方头像标识 */
 import { Bot, Clock, Gauge, Zap } from 'lucide-react';

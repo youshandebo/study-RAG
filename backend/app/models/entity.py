@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """SQLAlchemy ORM 映射（可选依赖：无 Postgres 时业务层自动跳过持久化）。"""
 from __future__ import annotations
 

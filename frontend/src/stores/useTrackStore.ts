@@ -1,3 +1,4 @@
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 /** 多模型分屏流状态：维护每次比对会话中各模型的 SSE 缓冲轨道 */
 import { create } from 'zustand';
 

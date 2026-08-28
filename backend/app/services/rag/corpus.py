@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """内置演示课堂语料：「10月15日 · 高等数学 · 反常积分」一节课的多模态切片。
 
 真实场景由 ingest 流水线从录音/板书自动生成；此处为开箱即用的种子数据，

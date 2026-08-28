@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """关系存储仓库层：配置了 POSTGRES_DSN 时走 SQLAlchemy 异步引擎；
 否则自动回落进程内仓储（教学演示 / 单机部署零依赖可用）。接口完全一致。"""
 from __future__ import annotations

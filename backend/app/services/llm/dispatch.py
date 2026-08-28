@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """分轨调度器：为多模型比对提供统一的流式轨道抽象。
 
 有真实 Key 的模型走真实 API；缺失的模型自动以对应风格的内置剧本兜底，

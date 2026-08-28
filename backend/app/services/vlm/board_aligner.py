@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """板书分栏与结构化对齐：将 VLM 抽取的板书要素归位到逻辑栏区（左推导 / 右结论）。"""
 from __future__ import annotations
 

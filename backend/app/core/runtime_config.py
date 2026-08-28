@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """运行时模型配置：管理员面板驱动的持久化配置层。
 
 - 配置落盘 JSON（backend/data/runtime_config.json），修改即时生效、重启保留。

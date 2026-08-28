@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 苏格拉底交互卡片：引导问答、渐进提示、作答框、进度轨道 */
 import { useEffect, useState } from 'react';

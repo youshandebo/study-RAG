@@ -1,3 +1,4 @@
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 /** 会话隔离状态：管理 activeSessionId、各会话消息队列（Cherry Studio 式严格隔离） */
 import { create } from 'zustand';
 import type { PolymorphicMessage } from '@/types/message';

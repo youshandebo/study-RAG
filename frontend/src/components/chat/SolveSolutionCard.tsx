@@ -1,6 +1,10 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 拍照解题卡片：考点徽章 + 难度星级 + 老师原法推导 + 易错预警 + 证据链 + 操作条 */
+import { useState } from 'react';
+import { ChevronDown, ImageIcon, Mic, Tag } from 'lucide-react';
 import Markdown from './Markdown';
 import PitfallAlertCard from './PitfallAlertCard';
 import ActionBar from './ActionBar';
@@ -14,7 +18,7 @@ function EvidenceChip({
   onClick,
 }: {
   label: string;
-  icon: string;
+  icon: React.ReactNode;
   onClick: () => void;
 }) {
   return (
@@ -37,6 +41,8 @@ export default function SolveSolutionCard({
 }) {
   const payload = message.solvePayload;
   const activateEvidence = useEvidenceStore((s) => s.activateEvidence);
+  // 证据链默认收起为紧凑胶囊栏，点击展开完整切片列表
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
 
   const openEvidence = async (snippetUrl: string) => {
     const bundle = await fetchEvidence(snippetUrl);
@@ -48,8 +54,9 @@ export default function SolveSolutionCard({
       {/* 头部徽章行 */}
       {payload && (
         <div className="mb-3 flex flex-wrap items-center gap-2">
-          <span className="badge-point rounded-md px-2.5 py-1 font-display text-[12.5px] font-bold">
-            🏷️ 核心考点 · {payload.examPoint}
+          <span className="badge-point inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[12.5px] font-semibold">
+            <Tag size={12} strokeWidth={1.5} aria-hidden />
+            核心考点 · {payload.examPoint}
           </span>
           <span className="badge-diff text-[13px]" aria-label={`难度 ${payload.difficulty} 星`}>
             {'⭐'.repeat(payload.difficulty)}
@@ -59,7 +66,7 @@ export default function SolveSolutionCard({
       )}
 
       {/* 老师原法推导正文 */}
-      <div className="mb-1 font-display text-[13.5px] font-bold text-ink">📝 老师原法推导</div>
+      <div className="mb-1 text-[13.5px] font-semibold text-ink">老师原法推导</div>
       <Markdown text={message.content} className={streaming ? 'stream-cursor' : ''} />
 
       {/* 步骤概览 */}
@@ -87,22 +94,57 @@ export default function SolveSolutionCard({
       {/* 证据链条 */}
       {payload?.evidenceList?.length ? (
         <div className="mt-3">
-          <div className="mb-1.5 font-display text-[12.5px] font-bold text-chalk">🔍 课堂证据链条</div>
-          <div className="flex flex-wrap gap-2">
-            {payload.evidenceList.map((ev, i) => (
-              <span key={i} className="inline-flex gap-1.5">
-                <EvidenceChip
-                  icon="🔊"
-                  label={`录音 ${ev.timestampRange[0]} 原声`}
-                  onClick={() => openEvidence(ev.audioSnippetUrl)}
-                />
-                <EvidenceChip
-                  icon="🖼️"
-                  label={ev.boardCaption || '板书原图'}
-                  onClick={() => openEvidence(ev.audioSnippetUrl)}
-                />
-              </span>
-            ))}
+          <button
+            onClick={() => setEvidenceOpen((v) => !v)}
+            aria-expanded={evidenceOpen}
+            className="inline-flex max-w-full items-center gap-2 rounded-full border border-chalk/25 bg-chalk-soft/60 px-3 py-1.5 text-[12px] text-chalk transition hover:border-chalk/50"
+          >
+            <Tag size={12} strokeWidth={1.5} className="shrink-0" aria-hidden />
+            <span className="font-semibold">课堂证据链条</span>
+            <span className="rounded-full bg-chalk px-1.5 text-[10.5px] font-bold text-white">
+              {payload.evidenceList.length}
+            </span>
+            <span className="hidden gap-1 sm:flex">
+              {payload.evidenceList.slice(0, 3).map((ev, i) => (
+                <span key={i} className="rounded bg-white/70 px-1.5 py-0.5 font-mono text-[10px]">
+                  {ev.timestampRange[0]}
+                </span>
+              ))}
+              {payload.evidenceList.length > 3 && (
+                <span className="rounded bg-white/70 px-1.5 py-0.5 text-[10px]">…</span>
+              )}
+            </span>
+            <ChevronDown
+              size={13}
+              strokeWidth={1.5}
+              className={`ml-auto shrink-0 transition-transform duration-200 ${evidenceOpen ? 'rotate-180' : ''}`}
+              aria-hidden
+            />
+          </button>
+
+          <div
+            className={`grid transition-[grid-template-rows] duration-300 ease-out ${
+              evidenceOpen ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'
+            }`}
+          >
+            <div className="overflow-hidden">
+              <div className="flex flex-wrap gap-2 pt-2.5">
+                {payload.evidenceList.map((ev, i) => (
+                  <span key={i} className="inline-flex gap-1.5">
+                    <EvidenceChip
+                      icon={<Mic size={12} strokeWidth={1.5} />}
+                      label={`录音 ${ev.timestampRange[0]} 原声`}
+                      onClick={() => openEvidence(ev.audioSnippetUrl)}
+                    />
+                    <EvidenceChip
+                      icon={<ImageIcon size={12} strokeWidth={1.5} />}
+                      label={ev.boardCaption || '板书原图'}
+                      onClick={() => openEvidence(ev.audioSnippetUrl)}
+                    />
+                  </span>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
       ) : null}

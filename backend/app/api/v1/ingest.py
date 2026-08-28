@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """多模态资产入库流水线接口：录音/板书/文字上传 → 异步 ASR/VLM/切片/向量化。
 
 上传安全：魔数嗅探（拒绝伪装扩展名的文件）、单文件大小上限、UUID 重命名落盘。
@@ -122,20 +123,31 @@ async def ingest(
     raw = await file.read() if file is not None else b""
     if file is not None:
         _validate_upload(raw, media_type, file.filename or "")
+
+    # ---- 双轨压缩时序 ----
+    # 上传期(前置标准化)：图片→高质量 WebP（识别输入）；音频→16kHz 单声道 PCM（无损送 ASR）
+    # 归档期(识别后深压)：图片→Q75~80 WebP；音频→24~32kbps Opus 后再入对象存储
+    from app.services.media import compressor
+
+    archive_raw = raw
+    recognize_b64 = base64.b64encode(raw).decode() if raw else ""
     compress_meta: dict | None = None
     if file is not None and raw:
-        # 智能压缩：图片统一 WebP（限边/锐化/抹 EXIF）；录音单声道 Opus（ffmpeg 缺失自动降级）
-        from app.services.media import compressor
-
         try:
             if media_type == "board":
-                raw, compress_meta = compressor.compress_image(raw)
+                normalized, up_meta = compressor.compress_image(raw)  # 上传期标准化（高质量）
+                archive_raw, ar_meta = compressor.archive_image(normalized)  # 归档期深压 Q75~80
+                recognize_b64 = base64.b64encode(normalized).decode()  # VLM 用标准化版识别
+                compress_meta = {"upload": up_meta, "archive": ar_meta}
             elif media_type == "audio":
                 suffix = pathlib.Path(file.filename or "a.wav").suffix or ".wav"
-                raw, compress_meta = compressor.compress_audio(raw, suffix)
+                pcm, up_meta = compressor.normalize_audio_for_asr(raw, suffix)  # 16k 单声道 PCM 送 ASR
+                archive_raw, ar_meta = compressor.compress_audio(raw, suffix)  # 归档期 Opus 深压
+                raw = pcm  # ASR 输入 = 无损 PCM
+                compress_meta = {"upload": up_meta, "archive": ar_meta}
         except Exception:
             compress_meta = {"skipped": "压缩异常，保留原始文件"}  # 压缩失败不影响入库主链路
-    content_b64 = base64.b64encode(raw).decode()
+            archive_raw = raw
 
     if media_type == "text":
         note_text = (text_content or "").strip()
@@ -181,10 +193,15 @@ async def ingest(
             ],
         }
 
-    url = await put_object(media_type, file.filename or "upload", content_b64) if file is not None else ""
+    # 归档：识别后深压版本入对象存储
+    url = (
+        await put_object(media_type, file.filename or "upload", base64.b64encode(archive_raw).decode())
+        if file is not None
+        else ""
+    )
 
     if media_type == "audio":
-        segments = await Transcriber().transcribe(raw, file.filename or "")
+        segments = await Transcriber().transcribe(raw, file.filename or "")  # raw=16k PCM
         for seg in segments:
             seg.text = correct(seg.text)
         audio_id = f"ing-{abs(hash(file.filename or 'audio')) % 10_000}"
@@ -195,7 +212,7 @@ async def ingest(
             c.pitfalls = []
         pitfalls = extract_from_chunks(chunks)
     else:
-        ocr = await OCREngine().recognize(content_b64)
+        ocr = await OCREngine().recognize(recognize_b64)
         text = ocr.get("problem_text") or ocr.get("latex", "")
         audio_id = "board-only"
         chunks = [

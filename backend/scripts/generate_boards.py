@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """生成 9 张「课堂板书」SVG：黑板底 + 粉笔字 + 手绘框线箭头。
 
 排版核心为单 <text> + <tspan> 流式布局（宽度由渲染器精确计算），

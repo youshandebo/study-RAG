@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """对象存储客户端：MinIO / S3 存放录音原件与板书大图。
 未配置 MinIO 时，素材以本地静态目录承载（开发模式），对外仍暴露统一 HTTP URL。"""
 from __future__ import annotations

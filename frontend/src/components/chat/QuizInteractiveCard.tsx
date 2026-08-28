@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 靶向测验卡片：选项作答 + 即时诊断反馈 */
 import { useState } from 'react';

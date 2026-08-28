@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """基于易错点规则的靶向自测出题器。"""
 from __future__ import annotations
 

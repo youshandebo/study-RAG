@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """管理员面板接口：JWT 登录认证 + 四类模型(LLM/嵌入/ASR/VLM)运行时配置 + 连通性测试 + 用量统计。
 
 - 认证：POST /admin/login 换取 HS256 签名 JWT（24h 有效，无状态可校验），

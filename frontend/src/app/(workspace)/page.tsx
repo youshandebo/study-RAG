@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 统一主工作台：左会话栏 + 中全能对话画布 + 右证据抽屉 */
 import { useEffect, useRef, useState } from 'react';

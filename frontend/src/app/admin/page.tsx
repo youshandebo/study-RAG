@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 管理员控制台：左侧导航（概览 / 四类模型 / 安全）+ 概览仪表盘 + 配置热生效 */
 import { useCallback, useEffect, useState } from 'react';

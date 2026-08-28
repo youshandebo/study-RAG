@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """FastAPI 应用入口：统一挂载 v1 路由与静态资源。"""
 from __future__ import annotations
 
@@ -12,6 +13,17 @@ from app.db.minio_client import BOARDS_DIR, ensure_static_dirs
 settings = get_settings()
 
 app = FastAPI(title=settings.app_name, version="1.0.0")
+
+
+@app.middleware("http")
+async def license_fingerprint_headers(request, call_next):
+    """全局版权指纹响应头：所有 API 与 SSE 响应均携带许可声明，供审计/溯源。"""
+    response = await call_next(request)
+    response.headers["X-Powered-By"] = "AI-Classroom-Tutor"
+    response.headers["X-License-Type"] = "AGPL-3.0-or-Commercial"
+    response.headers["X-Commercial-License-Contact"] = "fennengxiong@qq.com"
+    return response
+
 
 app.add_middleware(
     CORSMiddleware,

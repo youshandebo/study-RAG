@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """多态消息协议定义 —— 与前端 types/message.ts 严格一一对应。"""
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """会话管理接口：严格 sessionId 隔离，独立保存历史与配置。"""
 from __future__ import annotations
 

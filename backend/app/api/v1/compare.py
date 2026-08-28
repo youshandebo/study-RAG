@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """多模型并发派发与聚合接口：单 SSE 连接内并行推送多条模型轨道。"""
 from __future__ import annotations
 

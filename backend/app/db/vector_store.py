@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """向量库连接层：Qdrant 客户端封装 + 进程内向量索引兜底。"""
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """语音识别服务：远程 OpenAI 兼容 /audio/transcriptions（管理员面板可配）→ 本地 Whisper → 离线演示兜底。
 
 真实引擎通过懒加载引入；未配置任何引擎时使用内置课堂剧本生成带毫秒时间戳的

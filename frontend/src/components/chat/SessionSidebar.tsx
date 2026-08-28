@@ -1,15 +1,28 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 
-/** 会话隔离列表：新建 / 切换 / 重命名 / 删除（Cherry Studio 式严格 sessionId 隔离） */
-import { useState } from 'react';
-import { FileText, Plus } from 'lucide-react';
+/** 会话隔离列表：新建 / 切换 / 重命名 / 删除 / 搜索（严格 sessionId 隔离） */
+import { useMemo, useState } from 'react';
+import { FileText, Plus, Search, X } from 'lucide-react';
 import { useSessionStore } from '@/stores/useSessionStore';
+import AboutDialog from './AboutDialog';
 
 export default function SessionSidebar() {
   const { sessions, activeSessionId, createSession, switchSession, removeSession, renameSession } =
     useSessionStore();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState('');
+  const [query, setQuery] = useState('');
+
+  // 标题/学科/考点关键词模糊过滤：空格分词，词间 AND
+  const filtered = useMemo(() => {
+    const tokens = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return sessions;
+    return sessions.filter((s) => {
+      const hay = s.title.toLowerCase();
+      return tokens.every((tk) => hay.includes(tk));
+    });
+  }, [sessions, query]);
 
   const commitRename = async (id: string) => {
     if (draftTitle.trim()) await renameSession(id, draftTitle.trim());
@@ -39,9 +52,29 @@ export default function SessionSidebar() {
         <Plus size={14} strokeWidth={1.5} /> 新建对话
       </button>
 
+      {/* 搜索框：按标题/学科/考点关键词即时过滤 */}
+      <div className="relative mx-4 mt-3">
+        <Search size={13} strokeWidth={1.5} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-paper/35" aria-hidden />
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="搜索会话 / 学科 / 考点…"
+          className="w-full rounded-lg border border-white/10 bg-white/[0.04] py-1.5 pl-8 pr-7 text-[12.5px] text-paper/90 placeholder-white/30 outline-none transition focus:border-blue-500/60"
+        />
+        {query && (
+          <button
+            onClick={() => setQuery('')}
+            aria-label="清空搜索"
+            className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-paper/40 hover:text-paper/80"
+          >
+            <X size={12} strokeWidth={1.5} />
+          </button>
+        )}
+      </div>
+
       {/* 会话列表 */}
       <nav className="mt-3 flex-1 space-y-1 overflow-y-auto px-3 pb-4" aria-label="会话列表">
-        {sessions.map((s) => {
+        {filtered.map((s) => {
           const active = s.id === activeSessionId;
           return (
             <div
@@ -87,10 +120,19 @@ export default function SessionSidebar() {
             </div>
           );
         })}
+        {filtered.length === 0 && (
+          <div className="px-3 py-6 text-center text-[11.5px] text-paper/35">
+            {sessions.length === 0 ? '暂无会话' : `没有匹配「${query}」的会话`}
+          </div>
+        )}
       </nav>
 
-      <div className="border-t border-white/10 px-5 py-3 text-[11px] leading-relaxed text-paper/35">
-        各会话知识库挂载与上下文严格隔离
+      {/* 底部署名徽标（AGPL 部署要求保留；商业授权可移除） */}
+      <div className="border-t border-white/10 px-4 py-2.5">
+        <AboutDialog />
+        <div className="mt-1 text-center text-[10px] leading-relaxed text-paper/30">
+          各会话知识库与上下文严格隔离
+        </div>
       </div>
     </aside>
   );

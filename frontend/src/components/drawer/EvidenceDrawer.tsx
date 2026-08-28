@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 右侧协作抽屉容器：证据 / 大纲 / 入库三页签，滑出式面板 */
 import { ListTree, Search, Upload } from 'lucide-react';

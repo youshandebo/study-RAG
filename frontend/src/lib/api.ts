@@ -1,3 +1,4 @@
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 /** Fetch / SSE 流式通信客户端封装 */
 
 import type { EvidenceRef, Intent, PolymorphicMessage, UsageInfo } from '@/types/message';

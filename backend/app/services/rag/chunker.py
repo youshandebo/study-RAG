@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """语义级多模态切片切分：把带时间戳的 ASR 转录按句群聚合为教学切片 Chunk。"""
 from __future__ import annotations
 

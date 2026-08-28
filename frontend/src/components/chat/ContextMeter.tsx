@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 上下文容量面板：仿 Cherry Studio「上下文容量」弹层，数据取最近一轮 usage 事件 */
 import { useEffect, useMemo, useRef, useState } from 'react';

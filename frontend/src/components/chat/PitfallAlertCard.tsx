@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** ⚠️ 易错陷阱预警组件（嵌入解题步骤） */
 import Markdown from './Markdown';

@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """核心考点自动提炼：规则信号 + LLM 双通道，演示模式直接映射课堂语料标注。"""
 from __future__ import annotations
 

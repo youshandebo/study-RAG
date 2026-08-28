@@ -1,3 +1,4 @@
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 import { NextResponse } from 'next/server';
 
 /** 服务端轻量 API 代理：处理跨域与 Key 转发（按需启用） */

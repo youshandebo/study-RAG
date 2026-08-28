@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 单个模型分区的配置卡片：预设一键填充 + 字段编辑 + 连通性测试 */
 import { Brain, Eye, Image as ImageIcon, Mic } from 'lucide-react';

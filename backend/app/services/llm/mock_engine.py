@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """内置演示引擎 (Mock Engine)。
 
 无任何外部 API Key 时提供高质量的开箱即用体验：

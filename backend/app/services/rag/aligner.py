@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """音画时空切片对齐器：将 ASR 句级时间戳与板书序列在统一课堂时间轴上配对。"""
 from __future__ import annotations
 

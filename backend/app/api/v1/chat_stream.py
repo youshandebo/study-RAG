@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """统一对话接口：意图识别 + SSE 统一分发输出。
 
 SSE 事件协议（前端 lib/api.ts 按此解析）：

@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """轻量 Token 估算器：无外部依赖，按中英文字符加权近似。
 
 真实模型可用时也可换成tiktoken等精确实现；当前统计口径为「估算值」，

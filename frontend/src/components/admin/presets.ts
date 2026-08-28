@@ -1,3 +1,4 @@
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 /** 常用模型服务商一键填充模板（base_url + 默认模型名） */
 export type SectionKey = 'llm' | 'embedding' | 'asr' | 'vlm';
 export type AnySectionKey = SectionKey | 'media';

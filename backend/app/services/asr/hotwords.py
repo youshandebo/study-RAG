@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """专业学科词表热词增强纠偏：对 ASR 输出做术语级替换修复。"""
 from __future__ import annotations
 

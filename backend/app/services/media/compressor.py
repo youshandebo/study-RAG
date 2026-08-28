@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """智能媒体压缩管道：图片 WebP 化（缩边/锐化/抹 EXIF）+ 音频单声道 Opus 压缩。
 
 - 图片：Pillow 实现，纯 wheel 依赖即可用。
@@ -89,6 +90,63 @@ def __unsharp():
 
     # 非锐化滤镜：增强手写公式与板书文字边缘（radius/percent/threshold 保守取值）
     return ImageFilter.UnsharpMask(radius=1.8, percent=90, threshold=3)
+
+
+def normalize_audio_for_asr(data: bytes, src_suffix: str = ".wav") -> tuple[bytes, dict]:
+    """上传阶段前置标准化：转 16kHz 单声道 16bit PCM(WAV)——无损，直接送 ASR，
+    杜绝有损高压破坏口语识别精度。ffmpeg 缺失时原样返回并标注。"""
+    if not ffmpeg_available():
+        return data, {"skipped": "ffmpeg 未安装，跳过 ASR 前置标准化", "original_bytes": len(data)}
+
+    with temp_media_file(data, src_suffix or ".wav") as src:
+        dst = src.with_suffix(".asr.wav")
+        try:
+            proc = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", str(src),
+                    "-ac", "1",            # 单声道
+                    "-ar", "16000",        # 16kHz（ASR 引擎常规采样率）
+                    "-c:a", "pcm_s16le",   # 无损 PCM
+                    str(dst),
+                ],
+                capture_output=True, timeout=600,
+            )
+            if proc.returncode != 0:
+                return data, {"skipped": f"ffmpeg 失败: {proc.stderr[-120:].decode(errors='ignore')}"}
+            normalized = dst.read_bytes()
+        finally:
+            with contextlib.suppress(OSError):
+                dst.unlink(missing_ok=True)
+
+    return normalized, {
+        "codec": "pcm_s16le",
+        "channels": 1,
+        "sample_rate": 16000,
+        "stage": "asr-normalize",
+        "original_bytes": len(data),
+        "normalized_bytes": len(normalized),
+    }
+
+
+def archive_image(data: bytes, quality: int | None = None) -> tuple[bytes, dict]:
+    """归档阶段深度压缩：AI 识别完成后，以 Quality 75~80 的 WebP 存入对象存储。"""
+    from io import BytesIO
+
+    from PIL import Image
+
+    cfg = media_settings()
+    q = max(75, min(80, quality or min(80, cfg["image_quality"])))
+    img = Image.open(BytesIO(data))
+    out = BytesIO()
+    try:
+        img.save(out, "WEBP", quality=q, method=4)
+        return out.getvalue(), {
+            "format": "webp", "archive_quality": q,
+            "original_bytes": len(data), "compressed_bytes": out.tell(),
+        }
+    except Exception:
+        return data, {"skipped": "归档压缩失败，保留上传版本", "original_bytes": len(data)}
 
 
 def compress_audio(data: bytes, src_suffix: str = ".wav") -> tuple[bytes, dict]:

@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 对话内嵌入式交互操作条：苏格拉底 / 靶向自测 / 分屏比对 */
 import { useSessionStore } from '@/stores/useSessionStore';

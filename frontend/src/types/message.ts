@@ -1,3 +1,4 @@
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 /** 多态消息定义（Solve / Socratic / Quiz / Compare / General）——与后端 domain.py 一一对应 */
 
 export type MessageType =

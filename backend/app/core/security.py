@@ -1,3 +1,4 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """安全基础设施：SSRF 防护 / 滑动窗口限流 / 指数退避重试 / 极简 HS256 JWT。
 
 全部基于标准库实现，零新增依赖。

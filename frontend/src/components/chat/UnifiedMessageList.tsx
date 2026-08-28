@@ -1,4 +1,6 @@
 'use client';
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+
 
 /** 消息流容器：虚拟长列表优化（窗口化渲染）+ 自动滚动 + 空状态 */
 import { useEffect, useRef } from 'react';

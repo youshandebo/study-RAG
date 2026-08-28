@@ -1,3 +1,4 @@
+// Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 /** 伴学状态机：记录当前教学步数、引导轮次与掌握度 */
 import { create } from 'zustand';
 
