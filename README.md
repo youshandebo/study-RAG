@@ -53,6 +53,33 @@ docker compose --profile full up -d  # 全量版（含向量库/关系库/对象
 | `DEEPSEEK_API_KEY` | DeepSeek |
 | `ADMIN_PASSWORD` | 管理员初始口令（默认 admin123） |
 
+## 🖼️ 界面预览
+
+**统一工作台**——左会话栏（搜索/隔离）+ 中全能对话 + 右证据抽屉：
+
+![统一工作台](docs/screenshots/01-workspace.png)
+
+**解题卡与音画证据链**——折叠胶囊时间戳徽章，点开即看波形回放、KaTeX 转录与板书定位：
+
+![证据抽屉](docs/screenshots/02-evidence-drawer.png)
+
+**板书 Pan & Zoom**——滚轮缩放（右上角实时倍率）、拖拽平移，细小角标看得清：
+
+![板书缩放](docs/screenshots/03-board-zoom.png)
+
+**管理员控制台**——黑板报登录 + 概览仪表盘（引擎模式/知识库统计/模型接入状态）：
+
+<p align="center">
+  <img src="docs/screenshots/04-admin-login.png" width="49%" alt="管理员登录">
+  <img src="docs/screenshots/05-admin-console.png" width="49%" alt="管理员控制台">
+</p>
+
+**媒体压缩配置**——图片质量/最大分辨率/音频码率/体积上限，滑杆即调即生效：
+
+![媒体压缩配置](docs/screenshots/06-admin-media.png)
+
+---
+
 ## 功能矩阵
 
 | 功能 | 触发方式 | 表现 |
