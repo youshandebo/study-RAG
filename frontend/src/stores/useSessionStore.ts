@@ -14,6 +14,10 @@ interface SessionState {
   activeSessionId: string;
   messagesBySession: Record<string, PolymorphicMessage[]>;
   streamingMessageId: string | null;
+  /** 当前流式请求控制器：切换会话 / 停止生成时统一中断，防竞态 */
+  activeAbort: AbortController | null;
+  registerAbort: (controller: AbortController | null) => void;
+  abortActive: () => void;
 
   init: () => Promise<void>;
   createSession: (title?: string) => Promise<string>;
@@ -34,6 +38,19 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   activeSessionId: '',
   messagesBySession: {},
   streamingMessageId: null,
+  activeAbort: null,
+
+  registerAbort(controller) {
+    set({ activeAbort: controller });
+  },
+
+  abortActive() {
+    const controller = get().activeAbort;
+    if (controller) {
+      controller.abort();
+      set({ activeAbort: null, streamingMessageId: null });
+    }
+  },
 
   async init() {
     let sessions = await db.sessions.toArray();
@@ -64,10 +81,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   switchSession(id) {
+    if (id !== get().activeSessionId) get().abortActive(); // 离开会话即中断该会话流
     set({ activeSessionId: id });
   },
 
   async removeSession(id) {
+    get().abortActive();
     await db.sessions.delete(id);
     await db.messages.where('sessionId').equals(id).delete();
     const rest = get().sessions.filter((s) => s.id !== id);

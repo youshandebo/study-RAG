@@ -240,3 +240,28 @@ aside::-webkit-scrollbar-thumb {
 ::selection {
   background: rgba(31, 92, 80, 0.18);
 }
+
+/* ---------- LaTeX 溢出防护 ---------- */
+.prose-tutor .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 4px 0;
+  scrollbar-width: thin;
+}
+.prose-tutor .katex {
+  max-width: 100%;
+}
+
+/* ---------- 音频平滑律动进度条 ---------- */
+.smooth-progress {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--paper-deep);
+  overflow: hidden;
+}
+.smooth-progress > .bar {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--chalk-green);
+  transition: width 120ms linear; /* 平滑律动：播放推进无跳帧 */
+}

@@ -33,7 +33,12 @@ def _blank() -> dict:
         "embedding": {"base_url": "", "api_key": "", "model": ""},
         "asr": {"base_url": "", "api_key": "", "model": ""},
         "vlm": {"base_url": "", "api_key": "", "model": ""},
+        # 媒体压缩参数（数值以字符串形式存储，effective() 负责转型）
+        "media": {"image_quality": "", "image_max_edge": "", "audio_bitrate": "", "audio_max_mb": ""},
     }
+
+
+_MEDIA_KEYS = ("image_quality", "image_max_edge", "audio_bitrate", "audio_max_mb")
 
 
 def _normalize(raw: dict | None) -> dict:
@@ -49,6 +54,12 @@ def _normalize(raw: dict | None) -> dict:
                 val = src.get(key)
                 if isinstance(val, str):
                     cfg[section][key] = val.strip()
+    media_src = raw.get("media")
+    if isinstance(media_src, dict):
+        for key in _MEDIA_KEYS:
+            val = media_src.get(key)
+            if val is not None and str(val).strip() != "":
+                cfg["media"][key] = str(int(val))
     return cfg
 
 
@@ -76,18 +87,29 @@ def get_runtime_config() -> dict:
 
 
 def save_runtime_config(patch: dict) -> dict:
-    """按字段合并写入：patch 中出现的字符串键才覆盖（含空串，空=回落环境变量默认）。"""
+    """按字段合并写入：patch 中出现的键才覆盖（含空串，空=回落默认）。
+
+    媒体分区的数值字段做 int 校验（1-100 质量、256-8192 边长、16-64 码率、1-500 体积）。
+    """
     global _cache, _cache_mtime
     current = _load_from_disk()
     patch = patch if isinstance(patch, dict) else {}
-    for section in ("llm", "embedding", "asr", "vlm"):
+    for section in ("llm", "embedding", "asr", "vlm", "media"):
         src = patch.get(section)
         if not isinstance(src, dict):
             continue
         target = current.setdefault(section, {})
         for key in list(target):
-            val = src.get(key)
-            if isinstance(val, str):
+            if key not in src:
+                continue
+            val = src[key]
+            if section == "media":
+                try:
+                    int(val)
+                except (TypeError, ValueError):
+                    continue  # 非法数值直接忽略，保持现值
+                target[key] = str(int(val))
+            elif isinstance(val, str):
                 target[key] = val.strip()
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = _CONFIG_PATH.with_suffix(".tmp")
@@ -146,10 +168,28 @@ def _env_default_llm() -> dict:
     return {"provider": "", "base_url": "", "api_key": "", "model": ""}
 
 
-def effective(kind: str) -> dict:
-    """解析某类模型的最终生效配置：面板显式配置 > .env 推导 > 空（走兜底演示）。"""
+def effective(kind: str):
+    """解析某类配置的最终生效值：面板显式配置 > 内置默认 / .env 推导。"""
     rc = get_runtime_config()
     settings = get_settings()
+
+    if kind == "media":
+        # 媒体压缩参数：面板值 > 内置默认（compressor.DEFAULTS 再兜底）
+        defaults = {"image_quality": 82, "image_max_edge": 2560, "audio_bitrate": 24, "audio_max_mb": 200}
+        section = rc.get("media", {})
+        out = {}
+        for key, dft in defaults.items():
+            try:
+                out[key] = int(section.get(key) or dft)
+            except (TypeError, ValueError):
+                out[key] = dft
+        # 业务上限约束
+        out["image_quality"] = min(100, max(1, out["image_quality"]))
+        out["image_max_edge"] = min(8192, max(256, out["image_max_edge"]))
+        out["audio_bitrate"] = min(64, max(16, out["audio_bitrate"]))
+        out["audio_max_mb"] = min(500, max(1, out["audio_max_mb"]))
+        return out
+
     section = dict(rc.get(kind, {}))
 
     if kind == "llm":
@@ -193,9 +233,12 @@ def mask_key(value: str) -> str:
 
 
 def masked_view() -> dict:
-    """对外只输出掩码 Key 的完整视图 + 管理密码是否已设置。"""
+    """对外输出：模型 Key 打码 + 媒体压缩参数（数值原样）+ 管理密码是否已设置。"""
     rc = get_runtime_config()
-    view: dict = {"admin_password_set": bool(rc.get("admin_password_hash") or os.getenv("ADMIN_PASSWORD", "").strip())}
+    view: dict = {
+        "admin_password_set": bool(rc.get("admin_password_hash") or os.getenv("ADMIN_PASSWORD", "").strip()),
+        "media": effective("media"),
+    }
     for kind in ("llm", "embedding", "asr", "vlm"):
         eff = effective(kind)
         eff["api_key"] = mask_key(eff["api_key"])

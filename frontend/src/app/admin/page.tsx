@@ -11,10 +11,12 @@ import {
   KeyRound,
   LayoutDashboard,
   Mic,
+  SlidersHorizontal,
 } from 'lucide-react';
 import {
   AdminConfigView,
   AdminStats,
+  MediaSettings,
   ModelSectionConfig,
   adminLogin,
   adminLogout,
@@ -31,7 +33,7 @@ import ModelSectionCard, { TestState } from '@/components/admin/ModelSectionCard
 import ToastStack, { ToastItem } from '@/components/admin/Toast';
 import { SECTION_META, SectionKey } from '@/components/admin/presets';
 
-type TabKey = 'overview' | SectionKey | 'security';
+type TabKey = 'overview' | SectionKey | 'media' | 'security';
 type Drafts = Record<SectionKey, ModelSectionConfig>;
 
 const NAV: Array<{ key: TabKey; label: string; icon: typeof Gauge }> = [
@@ -40,6 +42,7 @@ const NAV: Array<{ key: TabKey; label: string; icon: typeof Gauge }> = [
   { key: 'embedding', label: '嵌入模型', icon: Eye },
   { key: 'asr', label: '语音转文字', icon: Mic },
   { key: 'vlm', label: '多模态识图', icon: ImageIcon },
+  { key: 'media', label: '媒体压缩', icon: SlidersHorizontal },
   { key: 'security', label: '密码与安全', icon: KeyRound },
 ];
 
@@ -51,6 +54,7 @@ export default function AdminPage() {
 
   const [config, setConfig] = useState<AdminConfigView | null>(null);
   const [drafts, setDrafts] = useState<Drafts | null>(null);
+  const [mediaDraft, setMediaDraft] = useState<MediaSettings | null>(null);
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [tests, setTests] = useState<Record<SectionKey, TestState>>({
     llm: { running: false, result: null },
@@ -69,6 +73,7 @@ export default function AdminPage() {
     try {
       const [cfg, st] = await Promise.all([fetchAdminConfig(), fetchAdminStats()]);
       setConfig(cfg);
+      if (cfg.media) setMediaDraft({ ...cfg.media });
       setDrafts({
         llm: { ...cfg.llm },
         embedding: { ...cfg.embedding },
@@ -135,6 +140,19 @@ export default function AdminPage() {
   const handleSave = async (kind: SectionKey) => {
     if (!drafts) return;
     setSavingKey(kind);
+    if (kind === ('media' as SectionKey) && mediaDraft) {
+      try {
+        const view = await saveAdminConfig({ media: mediaDraft });
+        setConfig(view);
+        if (view.media) setMediaDraft({ ...view.media });
+        toast('ok', '媒体压缩参数已保存，即时生效');
+      } catch (e) {
+        toast('err', `保存失败：${(e as Error).message}`);
+      } finally {
+        setSavingKey(null);
+      }
+      return;
+    }
     const d = drafts[kind];
     try {
       const view = await saveAdminConfig({
@@ -317,6 +335,8 @@ export default function AdminPage() {
             ) : null,
           )}
 
+          {tab === 'media' && mediaDraft && <MediaSection draft={mediaDraft} setDraft={setMediaDraft} saving={savingKey === ('media' as SectionKey)} onSave={() => void handleSave('media' as SectionKey)} />}
+
           {tab === 'security' && <SecuritySection onToast={toast} />}
         </main>
       </div>
@@ -491,5 +511,66 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <span className="mb-1 block text-[11.5px] font-semibold text-ink-soft">{label}</span>
       {children}
     </label>
+  );
+}
+
+
+// ------------------------------------------------------------------ 媒体 ----
+function MediaSection({
+  draft,
+  setDraft,
+  saving,
+  onSave,
+}: {
+  draft: MediaSettings;
+  setDraft: (m: MediaSettings) => void;
+  saving: boolean;
+  onSave: () => void;
+}) {
+  const items: Array<{ key: keyof MediaSettings; label: string; hint: string; min: number; max: number; unit: string }> = [
+    { key: 'image_quality', label: '图片质量', hint: 'WebP 质量 1-100，越高越清晰体积越大', min: 1, max: 100, unit: '' },
+    { key: 'image_max_edge', label: '最大分辨率', hint: '长边上限像素，超出自动等比缩小', min: 256, max: 8192, unit: 'px' },
+    { key: 'audio_bitrate', label: '音频码率', hint: 'Opus 目标码率 16-64（自动钳制 24-32 区间）', min: 16, max: 64, unit: 'kbps' },
+    { key: 'audio_max_mb', label: '音频体积上限', hint: '上传录音大小上限', min: 1, max: 500, unit: 'MB' },
+  ];
+  return (
+    <section className="paper-card animate-rise px-6 py-5">
+      <h2 className="flex items-center gap-1.5 text-[14.5px] font-semibold text-ink">
+        <SlidersHorizontal size={15} strokeWidth={1.5} aria-hidden />
+        媒体压缩
+      </h2>
+      <p className="mt-1 text-[12px] text-ink-faint">
+        图片统一转 WebP（限边长 + 锐化笔迹 + 抹 EXIF）；课堂录音转单声道 24kHz Opus（需服务器安装 ffmpeg）。
+      </p>
+      <div className="mt-4 grid gap-3.5 sm:grid-cols-2">
+        {items.map((it) => (
+          <label key={it.key} className="block">
+            <span className="mb-1 flex items-baseline justify-between">
+              <span className="text-[11.5px] font-semibold text-ink-soft">
+                {it.label}
+                {it.unit && <span className="ml-1 text-[10px] font-normal text-ink-faint">({it.unit})</span>}
+              </span>
+              <span className="font-mono text-[11px] text-ink">{draft[it.key]}</span>
+            </span>
+            <input
+              type="range"
+              min={it.min}
+              max={it.max}
+              value={draft[it.key]}
+              onChange={(e) => setDraft({ ...draft, [it.key]: Number(e.target.value) })}
+              className="w-full accent-blue-600"
+            />
+            <span className="mt-0.5 block text-[10px] text-ink-faint">{it.hint}</span>
+          </label>
+        ))}
+      </div>
+      <button
+        onClick={onSave}
+        disabled={saving}
+        className="mt-5 rounded-lg bg-chalk px-5 py-2 text-[12.5px] font-semibold text-white transition hover:bg-blue-700 disabled:opacity-50"
+      >
+        {saving ? '保存中…' : '保存并生效'}
+      </button>
+    </section>
   );
 }

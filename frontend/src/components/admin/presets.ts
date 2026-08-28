@@ -1,5 +1,6 @@
 /** 常用模型服务商一键填充模板（base_url + 默认模型名） */
 export type SectionKey = 'llm' | 'embedding' | 'asr' | 'vlm';
+export type AnySectionKey = SectionKey | 'media';
 
 export interface Preset {
   name: string;

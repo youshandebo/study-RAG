@@ -73,15 +73,50 @@ def is_official_llm_host(url: str) -> bool:
 # ---------------------------------------------------------- rate limiting --
 
 class SlidingWindowLimiter:
-    """进程内滑动窗口限流器（按 key 维度）。多副本部署应换 Redis 实现。"""
+    """滑动窗口限流器：配置 REDIS_URL 时走 Redis ZSET（多副本共享真滑动窗口）；
+    未配置或 Redis 不可用时自动回落进程内 deque 实现。"""
 
-    def __init__(self, max_events: int, window_seconds: float) -> None:
+    def __init__(self, max_events: int, window_seconds: float, *, redis_scope: str = "rl") -> None:
         self.max_events = max_events
         self.window = window_seconds
+        self.redis_scope = redis_scope
         self._hits: dict[str, deque[float]] = defaultdict(deque)
+        self._redis = self._init_redis()
+
+    def _init_redis(self):
+        import os as _os
+
+        url = _os.getenv("REDIS_URL", "").strip()
+        if not url:
+            return None
+        try:
+            import redis
+
+            client = redis.Redis.from_url(url, decode_responses=True, socket_timeout=0.5)
+            client.ping()
+            return client
+        except Exception:
+            return None
+
+    def _redis_check(self, key: str) -> bool:
+        now = time.time()
+        member = f"{now:.6f}:{secrets.token_hex(4)}"
+        zkey = f"{self.redis_scope}:{key}"
+        pipe = self._redis.pipeline()
+        pipe.zremrangebyscore(zkey, 0, now - self.window)   # 清窗口外
+        pipe.zcard(zkey)                                     # 当前窗口计数
+        pipe.zadd(zkey, {member: now})
+        pipe.expire(zkey, int(self.window) + 1)
+        _, count, _, _ = pipe.execute()
+        return count < self.max_events
 
     def check(self, key: str) -> bool:
         """放行返回 True 并记账；超限返回 False。"""
+        if self._redis is not None:
+            try:
+                return self._redis_check(key)
+            except Exception:
+                pass  # Redis 抖动时降级进程内限流
         now = time.time()
         dq = self._hits[key]
         while dq and now - dq[0] > self.window:
@@ -94,7 +129,7 @@ class SlidingWindowLimiter:
     def retry_after(self, key: str) -> int:
         dq = self._hits.get(key)
         if not dq:
-            return 0
+            return 1
         return max(1, int(self.window - (time.time() - dq[0])) + 1)
 
 

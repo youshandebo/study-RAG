@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import base64
+import pathlib
 import re
 import uuid
 
@@ -121,6 +122,19 @@ async def ingest(
     raw = await file.read() if file is not None else b""
     if file is not None:
         _validate_upload(raw, media_type, file.filename or "")
+    compress_meta: dict | None = None
+    if file is not None and raw:
+        # 智能压缩：图片统一 WebP（限边/锐化/抹 EXIF）；录音单声道 Opus（ffmpeg 缺失自动降级）
+        from app.services.media import compressor
+
+        try:
+            if media_type == "board":
+                raw, compress_meta = compressor.compress_image(raw)
+            elif media_type == "audio":
+                suffix = pathlib.Path(file.filename or "a.wav").suffix or ".wav"
+                raw, compress_meta = compressor.compress_audio(raw, suffix)
+        except Exception:
+            compress_meta = {"skipped": "压缩异常，保留原始文件"}  # 压缩失败不影响入库主链路
     content_b64 = base64.b64encode(raw).decode()
 
     if media_type == "text":

@@ -17,13 +17,22 @@ export default function EvidenceDrawer() {
   const { open, tab, setTab, closeDrawer } = useEvidenceStore();
 
   return (
-    <aside
-      className={`relative h-full w-[380px] shrink-0 border-l border-rule bg-paper transition-all duration-300 ${
-        open ? 'ml-0' : '-mr-[380px] opacity-0'
-      }`}
-      aria-hidden={!open}
-      aria-label="证据与协作抽屉"
-    >
+    <>
+      {/* <1280px：抽屉转浮层，背后遮罩点击关闭，避免挤压中间分屏 */}
+      {open && (
+        <div
+          className="fixed inset-0 z-40 bg-zinc-950/30 xl:hidden"
+          onClick={closeDrawer}
+          aria-hidden
+        />
+      )}
+      <aside
+        className={`relative h-full w-[380px] shrink-0 border-l border-rule bg-paper transition-all duration-300 max-xl:fixed max-xl:inset-y-0 max-xl:right-0 max-xl:z-50 max-xl:shadow-2xl ${
+          open ? 'ml-0' : '-mr-[380px] opacity-0 max-xl:pointer-events-none'
+        }`}
+        aria-hidden={!open}
+        aria-label="证据与协作抽屉"
+      >
       {/* 顶部页签 */}
       <div className="flex items-center justify-between border-b border-rule px-4 py-3">
         <div className="flex gap-1" role="tablist">
@@ -47,11 +56,12 @@ export default function EvidenceDrawer() {
         </button>
       </div>
 
-      <div className="h-[calc(100%-53px)] overflow-y-auto">
-        {tab === 'evidence' && <EvidenceViewer />}
-        {tab === 'outline' && <CourseOutlineTree />}
-        {tab === 'ingest' && <QuickIngestPanel />}
-      </div>
-    </aside>
+        <div className="h-[calc(100%-53px)] overflow-y-auto">
+          {tab === 'evidence' && <EvidenceViewer />}
+          {tab === 'outline' && <CourseOutlineTree />}
+          {tab === 'ingest' && <QuickIngestPanel />}
+        </div>
+      </aside>
+    </>
   );
 }

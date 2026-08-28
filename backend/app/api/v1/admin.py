@@ -123,6 +123,10 @@ async def put_admin_config(payload: dict, _: str = Depends(require_admin)):
                     raise HTTPException(status_code=400, detail=f"{kind} base_url 不安全：{exc}") from None
             out[key] = v
         patch[kind] = out
+    # 媒体压缩参数：数值校验在 save_runtime_config 内完成
+    media = payload.get("media")
+    if isinstance(media, dict):
+        patch["media"] = {k: str(v) for k, v in media.items() if str(v or "").strip() != ""}
     runtime_config.save_runtime_config(patch)
     return runtime_config.masked_view()
 

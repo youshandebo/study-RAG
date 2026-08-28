@@ -308,12 +308,20 @@ export interface ModelSectionConfig {
   configured?: boolean;
 }
 
+export interface MediaSettings {
+  image_quality: number;
+  image_max_edge: number;
+  audio_bitrate: number;
+  audio_max_mb: number;
+}
+
 export interface AdminConfigView {
   admin_password_set: boolean;
   llm: ModelSectionConfig;
   embedding: ModelSectionConfig;
   asr: ModelSectionConfig;
   vlm: ModelSectionConfig;
+  media?: MediaSettings;
   model_tracks: Array<{ key: string; name: string }>;
 }
 
@@ -362,7 +370,11 @@ export async function fetchAdminConfig(): Promise<AdminConfigView> {
   return adminFetch('/admin/config');
 }
 
-export async function saveAdminConfig(patch: Partial<Record<'llm' | 'embedding' | 'asr' | 'vlm', Partial<ModelSectionConfig>>>): Promise<AdminConfigView> {
+export async function saveAdminConfig(
+  patch: Partial<Record<'llm' | 'embedding' | 'asr' | 'vlm', Partial<ModelSectionConfig>>> & {
+    media?: Partial<MediaSettings>;
+  },
+): Promise<AdminConfigView> {
   return adminFetch('/admin/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
 }
 

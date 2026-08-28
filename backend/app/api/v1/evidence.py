@@ -1,9 +1,13 @@
 """音画证据切片调取与回放数据接口。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse
+import hashlib
+import pathlib
 
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from app.db.minio_client import AUDIO_DIR
 from app.services.rag.retriever import get_retriever
 
 router = APIRouter()
@@ -48,10 +52,71 @@ async def evidence_list():
     ]
 
 
+@router.get("/evidence/audio/{chunk_id}/slice")
+async def evidence_audio_slice(chunk_id: str, start_ms: int = 0, end_ms: int = 0):
+    """毫秒级按需切片：ffmpeg -ss/-to -c copy 无损快速切分，StreamingResponse 流式返回短片段。
+
+    - src 参数必须是 /static/audio/ 下的本地文件 URL（MinIO 部署请走对象存储直链）
+    - 切片长度限制 [0.2s, 120s]，防止借接口整段拉取
+    - 演示模式的预置切片（lec-*）没有真实音频文件，返回 404 语义化提示
+    """
+    from app.services.media import compressor
+
+    duration_s = (end_ms - start_ms) / 1000
+    if start_ms < 0 or end_ms <= start_ms or duration_s > 120:
+        raise HTTPException(status_code=400, detail="切片区间非法（需 0 ≤ start < end，且长度 ≤ 120 秒）")
+    if not compressor.ffmpeg_available():
+        raise HTTPException(status_code=503, detail="服务器未安装 ffmpeg，无法按需切片；请安装后重试")
+
+    # 定位该切片所属的真实音频文件
+    retriever = await get_retriever()
+    audio_id = ""
+    for chunk in await retriever.all_chunks():
+        if chunk.id == chunk_id:
+            audio_id = chunk.audio_id
+            break
+    if not audio_id or audio_id.startswith(("lec-", "board-only")):
+        raise HTTPException(status_code=404, detail="演示切片无真实音频文件，请先上传课堂录音后重试")
+
+    # 在已入库资产里按 audio_id 反查文件（audio_id 与上传资产一一对应由 ingest 生成）
+    import app.db.relational as repo
+
+    src_path: pathlib.Path | None = None
+    for assets in repo._memory_assets.values():
+        for asset in assets:
+            if asset.get("kind") == "audio" and str(asset.get("uri", "")).startswith("/static/audio/"):
+                candidate = AUDIO_DIR / pathlib.Path(asset["uri"]).name
+                if candidate.exists():
+                    src_path = candidate  # 同一音频组的任一载体文件都含完整时间轴
+    if src_path is None:
+        raise HTTPException(status_code=404, detail="音频文件不存在或已被清理")
+
+    proc = compressor.slice_audio(src_path, start_ms, end_ms)
+    if proc is None or proc.stdout is None:
+        raise HTTPException(status_code=503, detail="ffmpeg 启动失败")
+
+    async def stream():
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        try:
+            while True:
+                chunk = await loop.run_in_executor(None, proc.stdout.read, 64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            proc.kill()
+
+    return StreamingResponse(
+        stream(),
+        media_type="audio/ogg",
+        headers={"Cache-Control": "no-cache", "X-Slice-Range": f"{start_ms}-{end_ms}"},
+    )
+
+
 def _synth_waveform(text: str) -> list[int]:
     """演示用合成波形能量包络（0~100），真实部署替换为音频文件的预计算波形。"""
-    import hashlib
-
     seed = int(hashlib.md5(text.encode()).hexdigest(), 16)
     amps: list[int] = []
     for i in range(48):
