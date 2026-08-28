@@ -47,15 +47,20 @@ class Transcriber:
         """OpenAI 兼容转录端点返回整段文本；按标点切句并按字数比例合成毫秒时间戳。"""
         import httpx
 
-        async with httpx.AsyncClient(timeout=180) as client:
-            resp = await client.post(
-                f"{cfg['base_url'].rstrip('/')}/audio/transcriptions",
-                headers={"Authorization": f"Bearer {cfg['api_key']}"},
-                files={"file": (filename or "audio.wav", audio_bytes)},
-                data={"model": cfg["model"]},
-            )
-            resp.raise_for_status()
-            text = str(resp.json().get("text", "")).strip()
+        from app.core.security import retry_async
+
+        async def _call() -> str:
+            async with httpx.AsyncClient(timeout=180) as client:
+                resp = await client.post(
+                    f"{cfg['base_url'].rstrip('/')}/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                    files={"file": (filename or "audio.wav", audio_bytes)},
+                    data={"model": cfg["model"]},
+                )
+                resp.raise_for_status()
+                return str(resp.json().get("text", "")).strip()
+
+        text = await retry_async(_call, attempts=2, exceptions=(httpx.HTTPError,))
         return _segments_from_plain_text(text)
 
     def _load_whisper(self):  # pragma: no cover - 重型依赖懒加载

@@ -1,8 +1,11 @@
 'use client';
 
 /** 单个模型分区的配置卡片：预设一键填充 + 字段编辑 + 连通性测试 */
+import { Brain, Eye, Image as ImageIcon, Mic } from 'lucide-react';
 import { ModelSectionConfig } from '@/lib/api';
 import { PRESETS, SECTION_META, SectionKey } from './presets';
+
+const SECTION_ICONS = { llm: Brain, embedding: Eye, asr: Mic, vlm: ImageIcon } as const;
 
 export interface TestState {
   running: boolean;
@@ -40,8 +43,11 @@ export default function ModelSectionCard({
     <section className="paper-card animate-rise overflow-hidden">
       {/* 卡片头 */}
       <div className={`flex items-center gap-3 bg-gradient-to-r ${meta.gradient} px-6 py-4`}>
-        <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/15 text-xl backdrop-blur-sm" aria-hidden>
-          {meta.icon}
+        <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/10 backdrop-blur-sm" aria-hidden>
+          {(() => {
+            const Icon = SECTION_ICONS[kind];
+            return <Icon size={18} strokeWidth={1.5} className="text-white" />;
+          })()}
         </span>
         <div className="min-w-0 flex-1">
           <h2 className="font-display text-[15px] font-bold leading-tight text-white">{meta.title}</h2>
@@ -74,7 +80,7 @@ export default function ModelSectionCard({
                   className={`rounded-full border px-3 py-1 text-[11.5px] transition active:scale-95 ${
                     active
                       ? 'border-chalk bg-chalk text-white shadow-sm'
-                      : 'border-rule bg-[#fdfaf2] text-ink-soft hover:border-chalk/60 hover:text-chalk'
+                      : 'border-rule bg-white text-ink-soft hover:border-chalk/60 hover:text-chalk'
                   }`}
                 >
                   {p.name}
@@ -159,7 +165,7 @@ export default function ModelSectionCard({
           <button
             onClick={onSave}
             disabled={saving}
-            className="rounded-lg bg-chalk px-5 py-2 text-[12.5px] font-bold text-white shadow-sm transition hover:bg-[#173f37] active:scale-[0.98] disabled:opacity-50"
+            className="rounded-lg bg-chalk px-5 py-2 text-[12.5px] font-bold text-white shadow-sm transition hover:bg-zinc-800 active:scale-[0.98] disabled:opacity-50"
           >
             {saving ? '保存中…' : dirty ? '保存并生效' : '保存'}
           </button>

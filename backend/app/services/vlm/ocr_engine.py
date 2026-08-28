@@ -25,51 +25,56 @@ class OCREngine:
         """通吃 Qwen-VL / GPT-4o / GLM-4V 等 OpenAI 兼容多模态端点；Anthropic 协议单独分支。"""
         import httpx
 
+        from app.core.security import retry_async
+
         content = [
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
             {"type": "text", "text": self.PROMPT},
         ]
-        if cfg.get("provider") == "anthropic":
-            resp = await httpx.AsyncClient(timeout=120).post(
-                f"{cfg['base_url'].rstrip('/')}/v1/messages",
-                headers={"x-api-key": cfg["api_key"], "anthropic-version": "2023-06-01"},
-                json={
-                    "model": cfg["model"],
-                    "max_tokens": 2048,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": "image/png",
-                                        "data": image_b64,
+
+        async def _call() -> str:
+            if cfg.get("provider") == "anthropic":
+                resp = await httpx.AsyncClient(timeout=120).post(
+                    f"{cfg['base_url'].rstrip('/')}/v1/messages",
+                    headers={"x-api-key": cfg["api_key"], "anthropic-version": "2023-06-01"},
+                    json={
+                        "model": cfg["model"],
+                        "max_tokens": 2048,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "image/png",
+                                            "data": image_b64,
+                                        },
                                     },
-                                },
-                                {"type": "text", "text": self.PROMPT},
-                            ],
-                        }
-                    ],
-                },
-            )
-        else:
-            resp = await httpx.AsyncClient(timeout=120).post(
-                f"{cfg['base_url'].rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {cfg['api_key']}"},
-                json={
-                    "model": cfg["model"],
-                    "messages": [{"role": "user", "content": content}],
-                },
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        if "choices" in data:
-            text = data["choices"][0]["message"]["content"]
-        else:
+                                    {"type": "text", "text": self.PROMPT},
+                                ],
+                            }
+                        ],
+                    },
+                )
+            else:
+                resp = await httpx.AsyncClient(timeout=120).post(
+                    f"{cfg['base_url'].rstrip('/')}/chat/completions",
+                    headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                    json={
+                        "model": cfg["model"],
+                        "messages": [{"role": "user", "content": content}],
+                    },
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"]
             blocks = data.get("content") or []
-            text = "".join(b.get("text", "") for b in blocks)
+            return "".join(b.get("text", "") for b in blocks)
+
+        text = await retry_async(_call, attempts=2, exceptions=(httpx.HTTPError,))
         return {"latex": text, "problem_text": text, "figure_hints": []}
 
     @staticmethod

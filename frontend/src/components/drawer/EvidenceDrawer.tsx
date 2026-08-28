@@ -1,15 +1,16 @@
 'use client';
 
 /** 右侧协作抽屉容器：证据 / 大纲 / 入库三页签，滑出式面板 */
+import { ListTree, Search, Upload } from 'lucide-react';
 import { useEvidenceStore, type DrawerTab } from '@/stores/useEvidenceStore';
 import EvidenceViewer from './EvidenceViewer';
 import CourseOutlineTree from './CourseOutlineTree';
 import QuickIngestPanel from './QuickIngestPanel';
 
-const TABS: { key: DrawerTab; label: string }[] = [
-  { key: 'evidence', label: '🔍 证据' },
-  { key: 'outline', label: '🌳 大纲' },
-  { key: 'ingest', label: '⬆️ 入库' },
+const TABS: { key: DrawerTab; label: string; icon: typeof Search }[] = [
+  { key: 'evidence', label: '证据', icon: Search },
+  { key: 'outline', label: '大纲', icon: ListTree },
+  { key: 'ingest', label: '入库', icon: Upload },
 ];
 
 export default function EvidenceDrawer() {
@@ -32,10 +33,11 @@ export default function EvidenceDrawer() {
               role="tab"
               aria-selected={tab === t.key}
               onClick={() => setTab(t.key)}
-              className={`rounded-md px-3 py-1.5 text-[12.5px] font-medium transition ${
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12.5px] font-medium transition ${
                 tab === t.key ? 'bg-ink text-paper' : 'text-ink-soft hover:bg-paper-deep'
               }`}
             >
+              <t.icon size={14} strokeWidth={1.5} />
               {t.label}
             </button>
           ))}

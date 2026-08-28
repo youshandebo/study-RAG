@@ -47,7 +47,7 @@ check("读取配置（Key 已打码）", r.status_code == 200 and masked_ok, jso
 
 # ------------------------------------------------------------ 配置热更新 ----
 payload = {"asr": {"base_url": "", "api_key": "", "model": ""}, 
-           "llm": {"provider": "openai-compatible", "base_url": "https://example.invalid/v1",
+           "llm": {"provider": "openai-compatible", "base_url": "https://api.openai.com/v1",
                    "api_key": "sk-test-1234567890abcdef", "model": "test-llm"}}
 r = client.put("/api/v1/admin/config", headers=H, json=payload)
 new_view = r.json()

@@ -2,6 +2,7 @@
 
 /** 对话内快速上传录音/板书/文字素材：悬浮进度 + 完成后更新考点库 */
 import { useRef, useState } from 'react';
+import { FileText, Image as ImageIcon, Mic } from 'lucide-react';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useEvidenceStore } from '@/stores/useEvidenceStore';
 import { uploadAsset, uploadTextAsset } from '@/lib/api';
@@ -72,7 +73,7 @@ export default function QuickIngestPanel() {
           onClick={() => audioRef.current?.click()}
           className="rounded-lg border border-dashed border-chalk/50 bg-chalk-soft/50 px-2 py-5 text-center transition hover:bg-chalk-soft"
         >
-          <div className="text-xl" aria-hidden>🎙️</div>
+          <Mic size={18} strokeWidth={1.5} className="mx-auto text-chalk" aria-hidden />
           <div className="mt-1 text-[13px] font-semibold text-chalk">课堂录音</div>
           <div className="mt-0.5 text-[11px] text-ink-faint">wav / mp3</div>
         </button>
@@ -80,7 +81,7 @@ export default function QuickIngestPanel() {
           onClick={() => boardRef.current?.click()}
           className="rounded-lg border border-dashed border-warn/50 bg-warn-soft/50 px-2 py-5 text-center transition hover:bg-warn-soft"
         >
-          <div className="text-xl" aria-hidden>🖼️</div>
+          <ImageIcon size={18} strokeWidth={1.5} className="mx-auto text-warn" aria-hidden />
           <div className="mt-1 text-[13px] font-semibold text-warn">板书照片</div>
           <div className="mt-0.5 text-[11px] text-ink-faint">png / jpg</div>
         </button>
@@ -90,7 +91,7 @@ export default function QuickIngestPanel() {
             showTextBox ? 'border-cinnabar/60 bg-cinnabar-soft' : 'border-rule bg-paper-deep/40 hover:bg-paper-deep'
           }`}
         >
-          <div className="text-xl" aria-hidden>📝</div>
+          <FileText size={18} strokeWidth={1.5} className="mx-auto text-ink-soft" aria-hidden />
           <div className="mt-1 text-[13px] font-semibold text-ink">粘贴文字</div>
           <div className="mt-0.5 text-[11px] text-ink-faint">笔记 / 讲义</div>
         </button>
@@ -117,7 +118,7 @@ export default function QuickIngestPanel() {
             <button
               onClick={() => void handleTextSubmit()}
               disabled={!noteText.trim() || !!ingestProgress}
-              className="rounded-md bg-chalk px-3.5 py-1.5 text-[12px] font-semibold text-white transition hover:bg-[#173f37] disabled:opacity-50"
+              className="rounded-md bg-chalk px-3.5 py-1.5 text-[12px] font-semibold text-white transition hover:bg-zinc-800 disabled:opacity-50"
             >
               入库
             </button>
@@ -150,7 +151,7 @@ export default function QuickIngestPanel() {
 
       {/* 悬浮进度条 */}
       {ingestProgress && (
-        <div className="rounded-lg border border-rule bg-[#fdfaf2] px-4 py-3">
+        <div className="rounded-lg border border-rule bg-white px-4 py-3">
           <div className="mb-1.5 flex items-center justify-between text-[12.5px]">
             <span className="truncate text-ink-soft">{ingestProgress.filename}</span>
             <span className="text-chalk">{ingestProgress.percent}%</span>
@@ -181,11 +182,11 @@ export default function QuickIngestPanel() {
         ) : (
           <ul className="space-y-2">
             {assets.map((a) => (
-              <li key={a.id} className="rounded-lg border border-rule bg-[#fdfaf2] px-3.5 py-2.5">
+              <li key={a.id} className="rounded-lg border border-rule bg-white px-3.5 py-2.5">
                 <div className="flex items-center justify-between text-[12.5px]">
                   <span className="font-medium text-ink">{a.filename}</span>
                   <span className="rounded bg-chalk-soft px-1.5 py-0.5 text-[11px] text-chalk">
-                    {a.kind === 'audio' ? '🎙️ 录音' : a.kind === 'text' ? '📝 笔记' : '🖼️ 板书'}
+                    {a.kind === 'audio' ? '录音' : a.kind === 'text' ? '笔记' : '板书'}
                   </span>
                 </div>
                 <div className="mt-1 text-[11.5px] text-ink-faint">

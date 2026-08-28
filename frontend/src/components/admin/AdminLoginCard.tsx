@@ -2,6 +2,7 @@
 
 /** 管理员登录：黑板报风格 */
 import { useState } from 'react';
+import { Eye, EyeOff, GraduationCap } from 'lucide-react';
 
 export default function AdminLoginCard({
   onLogin,
@@ -45,10 +46,10 @@ export default function AdminLoginCard({
       <div className="animate-rise relative w-full max-w-sm">
         <div className="rounded-2xl border border-white/15 bg-white/[0.07] p-8 shadow-[0_24px_60px_-16px_rgba(0,0,0,0.55)] backdrop-blur-md">
           <div className="mb-6 text-center">
-            <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl border border-white/20 bg-white/10 text-3xl" aria-hidden>
-              🎓
+            <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl border border-white/15 bg-white/10" aria-hidden>
+              <GraduationCap size={24} strokeWidth={1.5} className="text-zinc-200" />
             </div>
-            <h1 className="font-display text-xl font-bold tracking-wide text-[#f3efe2]">管理员登录</h1>
+            <h1 className="font-display text-xl font-bold tracking-wide text-zinc-100">管理员登录</h1>
             <p className="mt-1 text-[12px] text-white/50">课堂原法助教 · 模型与知识库控制台</p>
           </div>
 
@@ -60,7 +61,7 @@ export default function AdminLoginCard({
               onChange={(e) => setPassword(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && void submit()}
               placeholder="管理员密码"
-              className="w-full rounded-lg border border-white/20 bg-black/25 px-3.5 py-2.5 pr-12 text-[13.5px] text-[#f3efe2] placeholder-white/50 outline-none transition focus:border-[#7fd6c2] focus:ring-2 focus:ring-[#7fd6c2]/25"
+              className="w-full rounded-lg border border-white/20 bg-black/25 px-3.5 py-2.5 pr-12 text-[13.5px] text-zinc-100 placeholder-white/50 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20"
             />
             <button
               type="button"
@@ -68,7 +69,7 @@ export default function AdminLoginCard({
               className="absolute right-2 top-1/2 -translate-y-1/2 rounded px-2 py-1 text-[13px] text-white/60 transition hover:text-white/85"
               aria-label={show ? '隐藏密码' : '显示密码'}
             >
-              {show ? '🙈' : '👁️'}
+              {show ? <EyeOff size={14} strokeWidth={1.5} /> : <Eye size={14} strokeWidth={1.5} />}
             </button>
           </div>
 
@@ -81,7 +82,7 @@ export default function AdminLoginCard({
           <button
             onClick={() => void submit()}
             disabled={busy || !password}
-            className="mt-4 w-full rounded-lg bg-[#7fd6c2] py-2.5 text-[13.5px] font-bold text-[#17332c] transition hover:bg-[#96e2d1] active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40"
+            className="mt-4 w-full rounded-lg bg-blue-600 py-2.5 text-[13.5px] font-bold text-[#17332c] transition hover:bg-blue-500 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40"
           >
             {busy ? (
               <span className="inline-flex items-center gap-2">
@@ -99,7 +100,7 @@ export default function AdminLoginCard({
               <br />
               可用环境变量 <code className="font-mono text-[10.5px]">ADMIN_PASSWORD</code> 覆盖
             </p>
-            <a href="/" className="mt-3 inline-block text-[11.5px] text-[#7fd6c2]/80 underline-offset-2 transition hover:text-[#7fd6c2] hover:underline">
+            <a href="/" className="mt-3 inline-block text-[11.5px] text-blue-400/90 underline-offset-2 transition hover:text-blue-300 hover:underline">
               ← 返回工作台
             </a>
           </div>

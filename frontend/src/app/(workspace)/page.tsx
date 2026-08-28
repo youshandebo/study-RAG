@@ -2,6 +2,7 @@
 
 /** 统一主工作台：左会话栏 + 中全能对话画布 + 右证据抽屉 */
 import { useEffect, useRef, useState } from 'react';
+import { BookOpen, ChevronRight, Settings } from 'lucide-react';
 import SessionSidebar from '@/components/chat/SessionSidebar';
 import UnifiedMessageList from '@/components/chat/UnifiedMessageList';
 import OmniChatInput from '@/components/chat/OmniChatInput';
@@ -42,29 +43,16 @@ export default function WorkspacePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSessionId]);
 
-  // 首个会话自动生成演示欢迎卡片（仅一次）
-  const welcomed = useRef(false);
-  useEffect(() => {
-    if (welcomed.current || !activeSessionId || sessions.length === 0) return;
-    welcomed.current = true;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSessionId, sessions.length]);
-
   return (
     <div className="flex h-screen overflow-hidden">
       <SessionSidebar />
 
       <main className="flex min-w-0 flex-1 flex-col">
         {/* 顶部工具栏 */}
-        <header className="flex items-center justify-between border-b border-rule bg-[#fdfaf2]/85 px-6 py-3 backdrop-blur-md">
+        <header className="flex items-center justify-between border-b border-rule bg-white/85 px-6 py-3 backdrop-blur-sm">
           <div className="min-w-0">
-            <h1 className="font-display flex items-center gap-2 truncate text-[15px] font-bold text-ink">
-              <span
-                aria-hidden
-                className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-chalk/30 bg-chalk-soft text-[12px]"
-              >
-                📖
-              </span>
+            <h1 className="flex items-center gap-2 truncate text-[15px] font-semibold text-ink">
+              <BookOpen size={16} strokeWidth={1.5} className="shrink-0 text-chalk" aria-hidden />
               {sessions.find((s) => s.id === activeSessionId)?.title ?? '统一工作台'}
             </h1>
             <p className="mt-0.5 text-[11.5px] text-ink-faint">
@@ -80,7 +68,7 @@ export default function WorkspacePage() {
                     ? 'bg-chalk-soft text-chalk'
                     : 'bg-cinnabar-soft text-cinnabar'
               }`}
-              title={backendOk ? '后端已连接（无 API Key 时自动运行内置演示引擎）' : '后端未连接：npm run dev 之外请先启动 uvicorn'}
+              title={backendOk ? '后端已连接（无 API Key 时自动运行内置演示引擎）' : '后端未连接：请先启动 uvicorn'}
             >
               {backendOk ? (
                 <span className="relative flex h-1.5 w-1.5">
@@ -90,20 +78,22 @@ export default function WorkspacePage() {
               ) : (
                 <span className={`h-1.5 w-1.5 rounded-full ${backendOk === null ? 'bg-ink-faint' : 'bg-cinnabar'}`} />
               )}
-              {backendOk === null ? '检查后端…' : backendOk ? '助教引擎在线' : '后端未连接'}
+              {backendOk === null ? '检查后端…' : backendOk ? '引擎在线' : '后端未连接'}
             </span>
             <a
               href="/admin"
-              className="rounded-lg border border-rule bg-white/70 px-3 py-1.5 text-[12.5px] text-ink-soft shadow-sm transition hover:-translate-y-px hover:border-chalk hover:text-chalk"
+              className="flex items-center gap-1.5 rounded-lg border border-rule/60 bg-white/70 px-3 py-1.5 text-[12.5px] text-ink-soft transition hover:border-rule hover:text-ink"
               title="模型配置 · 知识库统计 · 管理员密码"
             >
-              ⚙️ 管理后台
+              <Settings size={14} strokeWidth={1.5} />
+              管理后台
             </a>
             <button
               onClick={() => openDrawer()}
-              className="rounded-lg border border-rule bg-white/70 px-3 py-1.5 text-[12.5px] text-ink-soft shadow-sm transition hover:-translate-y-px hover:border-chalk hover:text-chalk"
+              className="flex items-center gap-1.5 rounded-lg border border-rule/60 bg-white/70 px-3 py-1.5 text-[12.5px] text-ink-soft transition hover:border-rule hover:text-ink"
             >
-              {drawerOpen ? '隐藏抽屉' : '协作抽屉'} ⟩
+              {drawerOpen ? '隐藏抽屉' : '协作抽屉'}
+              <ChevronRight size={14} strokeWidth={1.5} />
             </button>
           </div>
         </header>

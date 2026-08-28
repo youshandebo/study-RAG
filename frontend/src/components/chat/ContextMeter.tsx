@@ -2,6 +2,7 @@
 
 /** 上下文容量面板：仿 Cherry Studio「上下文容量」弹层，数据取最近一轮 usage 事件 */
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Gauge } from 'lucide-react';
 import type { UsageInfo } from '@/types/message';
 
 const LABEL_COLORS: Record<string, string> = {
@@ -58,12 +59,12 @@ export default function ContextMeter({ usages }: { usages: UsageInfo[] }) {
           open ? 'border-chalk bg-chalk-soft text-chalk' : 'border-rule bg-white/70 text-ink-faint hover:text-ink-soft'
         }`}
       >
-        <span aria-hidden>📊</span>
+        <Gauge size={12} strokeWidth={1.5} aria-hidden />
         <span className="font-mono">上下文 {pct.toFixed(1)}%</span>
       </button>
 
       {open && (
-        <div className="animate-rise absolute bottom-full right-0 mb-3 w-80 rounded-xl border border-rule bg-[#fdfaf2] p-4 shadow-[0_18px_48px_-12px_rgba(50,40,20,0.35)]">
+        <div className="animate-rise absolute bottom-full right-0 mb-3 w-80 rounded-xl border border-rule bg-white p-4 shadow-[0_18px_48px_-12px_rgba(50,40,20,0.35)]">
           {/* 标题行 */}
           <div className="mb-2 flex items-baseline justify-between">
             <span className="text-[13px] font-semibold text-ink">上下文容量</span>

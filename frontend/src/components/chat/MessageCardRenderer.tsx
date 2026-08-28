@@ -1,6 +1,7 @@
 'use client';
 
 /** 多态消息渲染分发器：按 type 派发到具体卡片组件；统一携带会话双方头像标识 */
+import { Bot, Clock, Gauge, Zap } from 'lucide-react';
 import Markdown from './Markdown';
 import SolveSolutionCard from './SolveSolutionCard';
 import SocraticDialogueCard from './SocraticDialogueCard';
@@ -24,7 +25,7 @@ export default function MessageCardRenderer({
         </div>
         <div
           aria-hidden
-          className="font-display flex h-8 w-8 shrink-0 select-none items-center justify-center rounded-full border border-white/20 bg-board text-[12px] font-bold text-[#a8e3d3]"
+          className="font-display flex h-8 w-8 shrink-0 select-none items-center justify-center rounded-full border border-white/20 bg-board text-[12px] font-bold text-zinc-300"
         >
           我
         </div>
@@ -37,10 +38,10 @@ export default function MessageCardRenderer({
     <div className="msg-enter flex items-start gap-2.5">
       <div
         aria-hidden
-        className="sticky top-0 flex h-8 w-8 shrink-0 select-none items-center justify-center rounded-full border border-chalk/30 bg-chalk-soft text-[15px] shadow-sm"
+        className="sticky top-0 flex h-8 w-8 shrink-0 select-none items-center justify-center rounded-full border border-rule/60 bg-paper-deep"
         title="课堂专属助教"
       >
-        🎓
+        <Bot size={15} strokeWidth={1.5} className="text-ink-soft" />
       </div>
       <div className="min-w-0 flex-1">
         {renderAssistantCard(message, streaming)}
@@ -61,16 +62,19 @@ function UsageFootnote({ usage }: { usage?: PolymorphicMessage['usage'] }) {
       title={`估算口径 · 上下文已用 ${usage.context_used}/${usage.context_limit} tokens`}
     >
       <span className="inline-flex items-center gap-1">
-        ⚡ 本轮
-        <b className="font-mono font-semibold text-ink-soft">↑{usage.input}</b>
-        <b className="font-mono font-semibold text-ink-soft">↓{usage.output}</b>
+        <Zap size={11} strokeWidth={1.5} aria-hidden />
+        本轮
+        <b className="font-mono font-medium text-ink-soft">↑{usage.input}</b>
+        <b className="font-mono font-medium text-ink-soft">↓{usage.output}</b>
         <span className="font-mono">合计 {usage.total} tokens</span>
       </span>
       <span className="inline-flex items-center gap-1">
-        🕐 {secs}s
+        <Clock size={11} strokeWidth={1.5} aria-hidden />
+        {secs}s
       </span>
-      <span className="hidden items-center gap-1.5 sm:inline-flex">
-        📊 上下文 {pct.toFixed(1)}%
+      <span className="hidden items-center gap-1 sm:inline-flex">
+        <Gauge size={11} strokeWidth={1.5} aria-hidden />
+        上下文 {pct.toFixed(1)}%
       </span>
     </div>
   );
@@ -89,10 +93,11 @@ function renderAssistantCard(message: PolymorphicMessage, streaming: boolean) {
     default:
       return (
         <div className="paper-card margin-rule msg-enter px-5 py-4">
-          <div className="font-display mb-2 flex items-center gap-1.5 text-[12.5px] font-bold tracking-wide text-chalk">
-            🤖 课堂专属助教
+          <div className="mb-2 flex items-center gap-1.5 text-[12.5px] font-semibold text-ink-soft">
+            <Bot size={13} strokeWidth={1.5} className="text-chalk" aria-hidden />
+            课堂专属助教
             {streaming && (
-              <span className="inline-flex items-center gap-1 rounded-full bg-chalk-soft px-1.5 py-0.5 text-[10px] font-medium">
+              <span className="inline-flex items-center gap-1 rounded-full bg-chalk-soft px-1.5 py-0.5 text-[10px] font-medium text-chalk">
                 <span className="h-1 w-1 animate-ping rounded-full bg-chalk" />
                 正在作答
               </span>

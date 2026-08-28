@@ -2,16 +2,17 @@
 
 /** 全能输入框：文本 / 拍照上传 / 拖拽 / 粘贴图片 / 指令前缀 / 停止生成 */
 import { useCallback, useRef, useState } from 'react';
+import { Camera, GitCompareArrows, Lightbulb, SendHorizontal, Square, Zap } from 'lucide-react';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { streamChat } from '@/lib/api';
 import type { PolymorphicMessage, UsageInfo } from '@/types/message';
 import ContextMeter from './ContextMeter';
 
 const QUICK_CMDS = [
-  { label: '📸 拍照解题', text: '', action: 'upload' as const },
-  { label: '💡 教我', text: '教我', intent: 'socratic' as const },
-  { label: '⚡ 考我', text: '考我', intent: 'quiz' as const },
-  { label: '🔀 对比', text: '对比一下不同模型的解法', intent: 'compare' as const },
+  { label: '拍照解题', icon: Camera, text: '', action: 'upload' as const },
+  { label: '教我', icon: Lightbulb, text: '教我', intent: 'socratic' as const },
+  { label: '考我', icon: Zap, text: '考我', intent: 'quiz' as const },
+  { label: '对比', icon: GitCompareArrows, text: '对比一下不同模型的解法', intent: 'compare' as const },
 ];
 
 export default function OmniChatInput() {
@@ -138,7 +139,7 @@ export default function OmniChatInput() {
     <div className="border-t border-rule bg-paper px-6 py-4">
       <div className="mx-auto max-w-3xl">
         <div
-          className={`rounded-2xl border bg-[#fdfaf2] px-4 pb-3 pt-3 shadow-[0_10px_34px_-16px_rgba(60,50,30,0.28)] transition ${
+          className={`rounded-xl border bg-white px-4 pb-3 pt-3 transition ${
             dragOver ? 'border-chalk ring-2 ring-chalk/20' : 'border-rule focus-within:border-chalk/70 focus-within:ring-2 focus-within:ring-chalk/15'
           }`}
           onDragOver={(e) => {
@@ -184,44 +185,41 @@ export default function OmniChatInput() {
             {busy ? (
               <button
                 onClick={stop}
-                className="shrink-0 rounded-lg bg-cinnabar px-4 py-2 text-[13px] font-semibold text-white transition hover:opacity-90 active:scale-[0.98]"
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-cinnabar px-4 py-2 text-[13px] font-semibold text-white transition hover:opacity-90 active:scale-[0.98]"
               >
-                ■ 停止
+                <Square size={12} strokeWidth={2} /> 停止
               </button>
             ) : (
               <button
                 onClick={send}
                 disabled={!text.trim() && !image}
                 title="Enter 发送，Shift+Enter 换行"
-                className="shrink-0 rounded-lg bg-chalk px-4 py-2 text-[13px] font-semibold text-white transition hover:bg-[#173f37] active:scale-[0.98] disabled:opacity-40"
+                aria-label="发送"
+                className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-chalk px-3.5 py-2 text-[13px] font-semibold text-white transition hover:bg-blue-700 active:scale-[0.98] disabled:opacity-40"
               >
-                发送 ➤
+                发送 <SendHorizontal size={14} strokeWidth={1.5} />
               </button>
             )}
           </div>
 
           {/* 快捷指令 */}
           <div className="mt-2 flex flex-wrap items-center gap-1.5 border-t border-dashed border-rule/70 pt-2.5">
-            {QUICK_CMDS.map((cmd) =>
-              cmd.action === 'upload' ? (
-                <button
-                  key={cmd.label}
-                  onClick={() => fileRef.current?.click()}
-                  className="rounded-full border border-rule bg-white/70 px-3 py-1 text-[12px] text-ink-soft transition hover:border-chalk hover:text-chalk active:scale-95"
-                >
+            {QUICK_CMDS.map((cmd) => {
+              const Icon = cmd.icon;
+              const cls =
+                'inline-flex items-center gap-1.5 rounded-full border border-rule bg-white/70 px-3 py-1 text-[12px] text-ink-soft transition hover:border-chalk hover:text-chalk active:scale-95';
+              return cmd.action === 'upload' ? (
+                <button key={cmd.label} onClick={() => fileRef.current?.click()} className={cls}>
+                  <Icon size={14} strokeWidth={1.5} />
                   {cmd.label}
                 </button>
               ) : (
-                <button
-                  key={cmd.label}
-                  disabled={busy}
-                  onClick={() => setText(cmd.text)}
-                  className="rounded-full border border-rule bg-white/70 px-3 py-1 text-[12px] text-ink-soft transition hover:border-chalk hover:text-chalk active:scale-95 disabled:opacity-40"
-                >
+                <button key={cmd.label} disabled={busy} onClick={() => setText(cmd.text)} className={`${cls} disabled:opacity-40`}>
+                  <Icon size={14} strokeWidth={1.5} />
                   {cmd.label}
                 </button>
-              ),
-            )}
+              );
+            })}
             <span className="ml-auto hidden text-[10.5px] text-ink-faint sm:block">Enter 发送 · Shift+Enter 换行</span>
             <ContextMeter usages={sessionUsages} />
           </div>

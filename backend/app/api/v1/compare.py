@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import json
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.core.security import SlidingWindowLimiter
 from app.services.llm.dispatch import TrackDispatcher
 
 
@@ -18,13 +19,23 @@ class CompareBody(BaseModel):
 
 router = APIRouter()
 
+# 分屏比对是并发放大器：限流比对聊天更严（10 次/分钟）
+_compare_limiter = SlidingWindowLimiter(max_events=10, window_seconds=60)
+
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 @router.post("/compare/stream")
-async def compare_stream(req: CompareBody) -> StreamingResponse:
+async def compare_stream(req: CompareBody, request: Request) -> StreamingResponse:
+    ip = request.client.host if request.client else "unknown"
+    if not _compare_limiter.check(ip):
+        raise HTTPException(
+            status_code=429,
+            detail="比对请求过于频繁（限 10 次/分钟），请稍后再试",
+            headers={"Retry-After": str(_compare_limiter.retry_after(ip))},
+        )
     dispatcher = TrackDispatcher()
     track_defs = dispatcher.track_names(req.model_keys)
 

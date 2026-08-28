@@ -12,7 +12,7 @@ export interface ToastItem {
 const STYLE: Record<ToastItem['kind'], { icon: string; cls: string }> = {
   ok: { icon: '✓', cls: 'border-chalk/40 bg-chalk-soft text-chalk' },
   err: { icon: '✕', cls: 'border-cinnabar/40 bg-cinnabar-soft text-cinnabar' },
-  info: { icon: 'ℹ', cls: 'border-rule bg-[#fdfaf2] text-ink-soft' },
+  info: { icon: 'ℹ', cls: 'border-rule bg-white text-ink-soft' },
 };
 
 export default function ToastStack({ items, onDismiss }: { items: ToastItem[]; onDismiss: (id: number) => void }) {

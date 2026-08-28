@@ -1,7 +1,9 @@
-"""管理员面板接口：登录认证 + 四类模型(LLM/嵌入/ASR/VLM)运行时配置 + 连通性测试 + 用量统计。
+"""管理员面板接口：JWT 登录认证 + 四类模型(LLM/嵌入/ASR/VLM)运行时配置 + 连通性测试 + 用量统计。
 
-- 认证：POST /admin/login 换取 Token（24h 有效，进程内存储），后续请求带 X-Admin-Token。
+- 认证：POST /admin/login 换取 HS256 签名 JWT（24h 有效，无状态可校验），
+  后续请求必须携带 X-Admin-Token 或 Authorization: Bearer。
 - 配置语义：GET 返回打码视图；PUT 提交掩码值 = 保持不变，提交空串 = 回落 .env 默认。
+- 配置写入前做 SSRF 校验：base_url 不允许指向内网 / 云元数据端点。
 """
 from __future__ import annotations
 
@@ -9,34 +11,38 @@ import asyncio
 import io
 import json
 import os
-import secrets
 import time
 import wave
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
 import app.core.runtime_config as runtime_config
 import app.db.relational as repo
+from app.core.security import assert_safe_url, jwt_sign, jwt_verify
 
 router = APIRouter()
 
 _TOKEN_TTL = 24 * 3600
-_tokens: dict[str, float] = {}
 _fail_count = {"n": 0, "last": 0.0}
+# 登录暴力破解防护之外，管理接口本身也限流（防脚本扫端）
+from app.core.security import SlidingWindowLimiter  # noqa: E402
+
+_admin_limiter = SlidingWindowLimiter(max_events=60, window_seconds=60)
 
 
 def _check_token(token: str) -> bool:
-    now = time.time()
-    for k in [k for k, exp in _tokens.items() if exp < now]:
-        _tokens.pop(k, None)
-    return token in _tokens
+    return bool(token) and jwt_verify(token) is not None
 
 
 async def require_admin(
+    request: Request,
     x_admin_token: str = Header(default=""),
     authorization: str = Header(default=""),
 ) -> str:
+    client_ip = request.client.host if request.client else "unknown"
+    if not _admin_limiter.check(f"admin-api:{client_ip}"):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
     token = x_admin_token or (authorization[7:] if authorization.startswith("Bearer ") else "")
     if not token or not _check_token(token):
         raise HTTPException(status_code=401, detail="未登录或会话已过期")
@@ -54,18 +60,20 @@ class PasswordBody(BaseModel):
 
 
 @router.post("/admin/login")
-async def admin_login(body: LoginBody):
+async def admin_login(request: Request, body: LoginBody):
     # 简单防爆破：连续失败递增冷却
     if _fail_count["n"] >= 5 and time.time() - _fail_count["last"] < min(8.0, _fail_count["n"] * 1.6):
         raise HTTPException(status_code=429, detail="尝试过于频繁，请稍后再试")
+    client_ip = request.client.host if request.client else "unknown"
+    if not _admin_limiter.check(f"admin-login:{client_ip}"):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
     await asyncio.sleep(0.25)
     if not runtime_config.verify_admin_password(body.password):
         _fail_count["n"] += 1
         _fail_count["last"] = time.time()
         raise HTTPException(status_code=401, detail="管理员密码不正确")
     _fail_count["n"] = 0
-    token = secrets.token_urlsafe(24)
-    _tokens[token] = time.time() + _TOKEN_TTL
+    token = jwt_sign({"role": "admin"}, _TOKEN_TTL)
     return {
         "token": token,
         "expires_in": _TOKEN_TTL,
@@ -77,7 +85,7 @@ async def admin_login(body: LoginBody):
 
 @router.post("/admin/logout")
 async def admin_logout(token: str = Depends(require_admin)):
-    _tokens.pop(token, None)
+    # JWT 为无状态凭证，客户端删除即可；预留服务端吊销位
     return {"ok": True}
 
 
@@ -108,6 +116,11 @@ async def put_admin_config(payload: dict, _: str = Depends(require_admin)):
             v = str(val or "").strip()
             if runtime_config.is_masked(v):
                 continue  # 掩码 = 保持现有存储不动
+            if key == "base_url" and v:
+                try:
+                    assert_safe_url(v)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=f"{kind} base_url 不安全：{exc}") from None
             out[key] = v
         patch[kind] = out
     runtime_config.save_runtime_config(patch)

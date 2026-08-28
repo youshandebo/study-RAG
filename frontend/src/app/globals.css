@@ -3,20 +3,21 @@
 @tailwind utilities;
 
 :root {
-  --paper: #f7f2e6;
-  --paper-deep: #efe7d2;
-  --paper-edge: #e3d8bc;
-  --ink: #26241f;
-  --ink-soft: #5c5648;
-  --ink-faint: #8a8371;
-  --cinnabar: #b5432f;
-  --cinnabar-soft: #f6e3dd;
-  --chalk-green: #1f5c50;
-  --chalk-green-soft: #e2ece8;
-  --board: #22382f;
-  --amber-warn: #9a6b1f;
-  --amber-warn-soft: #f7ecd4;
-  --rule: #d8cdb4;
+  /* Linear / Cherry Studio 式中性色：zinc 底 + 蓝色主强调 + 琥珀警示 */
+  --paper: #fafafa;
+  --paper-deep: #f4f4f5;
+  --paper-edge: #e4e4e7;
+  --ink: #18181b;
+  --ink-soft: #3f3f46;
+  --ink-faint: #71717a;
+  --cinnabar: #dc2626;
+  --cinnabar-soft: #fef2f2;
+  --chalk-green: #2563eb;
+  --chalk-green-soft: #eff6ff;
+  --board: #101013;
+  --amber-warn: #b45309;
+  --amber-warn-soft: #fffbeb;
+  --rule: #e4e4e7;
 }
 
 html,
@@ -28,9 +29,6 @@ body {
   background: var(--paper);
   color: var(--ink);
   font-family: 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
-  /* 纸张纤维噪点 */
-  background-image: radial-gradient(rgba(140, 120, 80, 0.05) 1px, transparent 1px);
-  background-size: 22px 22px;
 }
 
 .font-display {
@@ -39,27 +37,18 @@ body {
 
 /* ---------- 讲义卡片 ---------- */
 .paper-card {
-  background: #fdfaf2;
-  border: 1px solid var(--rule);
+  background: #ffffff;
+  border: 1px solid color-mix(in srgb, var(--rule) 60%, transparent);
   border-radius: 10px;
-  box-shadow:
-    0 1px 2px rgba(60, 50, 30, 0.06),
-    0 6px 18px -8px rgba(60, 50, 30, 0.12);
+  transition: border-color 0.15s;
+}
+.paper-card:hover {
+  border-color: color-mix(in srgb, var(--rule) 90%, transparent);
 }
 
 /* 左侧红线条——课堂讲义的装订线意象 */
 .margin-rule {
   position: relative;
-}
-.margin-rule::before {
-  content: '';
-  position: absolute;
-  left: -14px;
-  top: 4px;
-  bottom: 4px;
-  width: 2px;
-  background: linear-gradient(to bottom, var(--cinnabar) 0%, rgba(181, 67, 47, 0.25) 100%);
-  border-radius: 2px;
 }
 
 /* ---------- 徽章 ---------- */
@@ -75,9 +64,9 @@ body {
 
 /* ---------- 易错警示卡 ---------- */
 .pitfall-card {
-  background: var(--amber-warn-soft);
-  border: 1px dashed rgba(154, 107, 31, 0.55);
-  border-left: 4px solid var(--amber-warn);
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.2);
+  border-left: 3px solid rgba(245, 158, 11, 0.55);
   border-radius: 8px;
 }
 

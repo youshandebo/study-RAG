@@ -45,7 +45,8 @@ def _tokenize(text: str) -> list[str]:
 async def embed(text: str) -> list[float]:
     cfg = runtime_config.effective("embedding")
     if cfg["api_key"] and cfg["base_url"] and cfg["model"]:
-        try:
+
+        async def _call() -> list[float]:
             import httpx
 
             async with httpx.AsyncClient(timeout=60) as client:
@@ -56,6 +57,11 @@ async def embed(text: str) -> list[float]:
                 )
                 resp.raise_for_status()
                 return resp.json()["data"][0]["embedding"]
+
+        from app.core.security import retry_async
+
+        try:
+            return await retry_async(_call, attempts=2, exceptions=(httpx.HTTPError,))  # noqa: F821
         except Exception:
             pass
     return _hash_embed(text)

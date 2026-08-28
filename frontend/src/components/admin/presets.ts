@@ -10,35 +10,31 @@ export interface Preset {
 
 export const SECTION_META: Record<
   SectionKey,
-  { title: string; short: string; icon: string; desc: string; gradient: string }
+  { title: string; short: string; desc: string; gradient: string }
 > = {
   llm: {
     title: '大语言模型（LLM）',
     short: 'LLM',
-    icon: '🧠',
     desc: '对话与解题的主脑，回答课堂提问、推导解题步骤。支持 OpenAI 兼容协议或 Anthropic 协议，保存后即刻热生效。',
-    gradient: 'from-[#1f5c50] to-[#2e7a6a]',
+    gradient: 'from-zinc-800 to-zinc-700',
   },
   embedding: {
     title: '嵌入模型（向量化）',
     short: '嵌入',
-    icon: '🧲',
     desc: '把课堂切片与提问映射为向量驱动检索，兼容任意 OpenAI /embeddings 端点。更换模型后请重新上传素材重建向量。',
-    gradient: 'from-[#3d5a80] to-[#5b7fa6]',
+    gradient: 'from-zinc-700 to-zinc-600',
   },
   asr: {
     title: '语音转文字模型（ASR）',
     short: '语音',
-    icon: '🎙️',
     desc: '课堂录音转录为带时间戳的切片。兼容 /audio/transcriptions 端点；未配置时回落本地 faster-whisper 或演示转录。',
-    gradient: 'from-[#9a6b1f] to-[#b98a3c]',
+    gradient: 'from-amber-700 to-amber-600',
   },
   vlm: {
     title: '多模态识图模型（VLM）',
     short: '识图',
-    icon: '🖼️',
     desc: '板书与题目照片的手写公式识别。支持 Qwen-VL、GPT-4o、GLM-4V 等视觉端点，Anthropic 协议自动适配。',
-    gradient: 'from-[#8e4a68] to-[#ab6484]',
+    gradient: 'from-zinc-700 to-zinc-600',
   },
 };
 

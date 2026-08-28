@@ -1,11 +1,14 @@
-"""多模态资产入库流水线接口：录音/板书/文字上传 → 异步 ASR/VLM/切片/向量化。"""
+"""多模态资产入库流水线接口：录音/板书/文字上传 → 异步 ASR/VLM/切片/向量化。
+
+上传安全：魔数嗅探（拒绝伪装扩展名的文件）、单文件大小上限、UUID 重命名落盘。
+"""
 from __future__ import annotations
 
 import base64
 import re
 import uuid
 
-from fastapi import APIRouter, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 
 import app.db.relational as repo
 from app.db.minio_client import put_object
@@ -19,6 +22,56 @@ from app.services.rag.retriever import get_retriever
 from app.services.vlm.ocr_engine import OCREngine
 
 router = APIRouter()
+
+# ---- 上传限制：音频 200MB / 图片 20MB / 文字 1MB ----
+LIMITS = {"audio": 200 * 1024 * 1024, "board": 20 * 1024 * 1024, "image": 20 * 1024 * 1024, "text": 1 * 1024 * 1024}
+
+
+def _sniff_magic(raw: bytes, media_type: str) -> bool:
+    """真实文件魔数校验（纯 stdlib）：保证内容与声明的媒体类型一致。"""
+    head = raw[:16]
+    if media_type == "audio":
+        # WAV(RIFF) / MP3(ID3 或帧同步) / MP4-M4A(ftyp) / FLAC / OGG
+        if head[:4] == b"RIFF" and raw[8:12] == b"WAVE":
+            return True
+        if head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+            return True
+        if head[4:8] == b"ftyp":
+            return True
+        return head[:4] == b"fLaC" or head[:4] == b"OggS"
+    if media_type in ("board", "image"):
+        # PNG / JPEG / GIF / WebP(RIFF....WEBP) / BMP / HEIC(ftypheic/heix/mif1)
+        sig = {
+            b"\x89PNG": True,
+            b"\xff\xd8\xff": True,
+            b"GIF8": True,
+            b"BM": True,
+        }
+        for prefix, ok in sig.items():
+            if head.startswith(prefix):
+                return ok
+        if head[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            return True
+        if head[4:8] == b"ftyp" and raw[8:12] in (b"heic", b"heix", b"mif1", b"hevc"):
+            return True
+        return False
+    return True  # text 类型由解码校验兜底
+
+
+def _validate_upload(raw: bytes, media_type: str, filename: str) -> None:
+    limit_key = "image" if media_type == "board" else media_type
+    limit = LIMITS.get(limit_key, 20 * 1024 * 1024)
+    if len(raw) > limit:
+        mb = limit // (1024 * 1024)
+        raise HTTPException(status_code=413, detail=f"文件超过上限（{media_type} 最大 {mb}MB）")
+    if len(raw) < 8:
+        raise HTTPException(status_code=400, detail="文件内容为空或过小")
+    if media_type in ("audio", "board") and not _sniff_magic(raw, media_type):
+        raise HTTPException(status_code=415, detail=f"文件内容与类型不符（伪扩展名已拦截）：{filename[:60]}")
+    # 文件名只用于展示，入库统一重命名，路径穿越无从谈起；仍过滤控制字符
+    if re.search(r"[\x00-\x1f]", filename or ""):
+        raise HTTPException(status_code=400, detail="文件名包含非法字符")
+
 
 TEXT_CHUNK_TARGET = 220  # 文字素材单切片目标字数
 
@@ -66,6 +119,8 @@ async def ingest(
     - text   直接提交文字素材（text_content 表单字段，或 .txt/.md 文件）→ 切片入库
     """
     raw = await file.read() if file is not None else b""
+    if file is not None:
+        _validate_upload(raw, media_type, file.filename or "")
     content_b64 = base64.b64encode(raw).decode()
 
     if media_type == "text":

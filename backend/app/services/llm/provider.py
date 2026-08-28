@@ -14,6 +14,7 @@ from typing import AsyncIterator
 import httpx
 
 from app.core.config import Settings, get_settings
+from app.core.security import assert_safe_url
 
 
 class BaseLLMProvider(abc.ABC):
@@ -51,6 +52,7 @@ class OpenAICompatibleProvider(BaseLLMProvider):
     """OpenAI / DeepSeek / Qwen(DashScope compatible-mode) 共用协议。"""
 
     def __init__(self, name: str, api_key: str, base_url: str, model: str) -> None:
+        assert_safe_url(base_url)  # SSRF 防护：拒绝内网 / 元数据端点
         self.name = name
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
@@ -82,6 +84,7 @@ class OpenAICompatibleProvider(BaseLLMProvider):
 
 class AnthropicProvider(BaseLLMProvider):
     def __init__(self, api_key: str, base_url: str, model: str) -> None:
+        assert_safe_url(base_url)
         self.name = "anthropic"
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")

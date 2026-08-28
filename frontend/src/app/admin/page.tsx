@@ -3,6 +3,16 @@
 /** 管理员控制台：左侧导航（概览 / 四类模型 / 安全）+ 概览仪表盘 + 配置热生效 */
 import { useCallback, useEffect, useState } from 'react';
 import {
+  Brain,
+  Eye,
+  Gauge,
+  GraduationCap,
+  Image as ImageIcon,
+  KeyRound,
+  LayoutDashboard,
+  Mic,
+} from 'lucide-react';
+import {
   AdminConfigView,
   AdminStats,
   ModelSectionConfig,
@@ -24,13 +34,13 @@ import { SECTION_META, SectionKey } from '@/components/admin/presets';
 type TabKey = 'overview' | SectionKey | 'security';
 type Drafts = Record<SectionKey, ModelSectionConfig>;
 
-const NAV: Array<{ key: TabKey; label: string; icon: string }> = [
-  { key: 'overview', label: '概览', icon: '📊' },
-  { key: 'llm', label: '大语言模型', icon: '🧠' },
-  { key: 'embedding', label: '嵌入模型', icon: '🧲' },
-  { key: 'asr', label: '语音转文字', icon: '🎙️' },
-  { key: 'vlm', label: '多模态识图', icon: '🖼️' },
-  { key: 'security', label: '密码与安全', icon: '🔐' },
+const NAV: Array<{ key: TabKey; label: string; icon: typeof Gauge }> = [
+  { key: 'overview', label: '概览', icon: LayoutDashboard },
+  { key: 'llm', label: '大语言模型', icon: Brain },
+  { key: 'embedding', label: '嵌入模型', icon: Eye },
+  { key: 'asr', label: '语音转文字', icon: Mic },
+  { key: 'vlm', label: '多模态识图', icon: ImageIcon },
+  { key: 'security', label: '密码与安全', icon: KeyRound },
 ];
 
 const SECTION_KEYS: SectionKey[] = ['llm', 'embedding', 'asr', 'vlm'];
@@ -193,10 +203,12 @@ export default function AdminPage() {
   return (
     <div className="min-h-screen bg-paper">
       {/* 顶栏 */}
-      <header className="sticky top-0 z-40 border-b border-rule bg-[#fdfaf2]/90 backdrop-blur">
+      <header className="sticky top-0 z-40 border-b border-rule bg-white/90 backdrop-blur">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-5 py-3">
           <div className="flex items-center gap-2.5">
-            <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-board text-lg text-white" aria-hidden>🎓</span>
+            <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-zinc-900" aria-hidden>
+              <GraduationCap size={16} strokeWidth={1.5} className="text-zinc-200" />
+            </span>
             <div>
               <div className="font-display text-[15px] font-bold leading-tight text-ink">管理员控制台</div>
               <div className="text-[11px] text-ink-faint">模型配置即时热生效 · 无需重启</div>
@@ -235,11 +247,12 @@ export default function AdminPage() {
           <button
             key={n.key}
             onClick={() => setTab(n.key)}
-            className={`shrink-0 rounded-full px-3 py-1.5 text-[12px] transition ${
-              tab === n.key ? 'bg-board font-semibold text-white' : 'bg-paper-deep/70 text-ink-soft'
+            className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1.5 text-[12px] transition ${
+              tab === n.key ? 'bg-zinc-900 font-semibold text-white' : 'bg-paper-deep/70 text-ink-soft'
             }`}
           >
-            {n.icon} {n.label}
+            <n.icon size={13} strokeWidth={1.5} />
+            {n.label}
           </button>
         ))}
       </nav>
@@ -260,7 +273,7 @@ export default function AdminPage() {
                     : 'text-ink-soft hover:bg-paper-deep/70 hover:text-ink'
                 }`}
               >
-                <span className="text-[15px]" aria-hidden>{n.icon}</span>
+                <n.icon size={15} strokeWidth={1.5} aria-hidden />
                 <span className={`flex-1 font-medium ${tab === n.key ? '' : 'group-hover:text-ink'}`}>{n.label}</span>
                 {SECTION_KEYS.includes(sk) && (
                   <span
@@ -316,17 +329,17 @@ export default function AdminPage() {
 // ------------------------------------------------------------------ 概览 ----
 function Overview({ stats, onGoto }: { stats: AdminStats; onGoto: (tab: TabKey) => void }) {
   const cards = [
-    { label: '对话会话', value: stats.sessions, icon: '💬', tint: 'bg-blue-50 text-blue-600' },
-    { label: '入库资产', value: stats.assets, icon: '📦', tint: 'bg-amber-50 text-amber-600' },
-    { label: '知识库切片', value: stats.chunks, icon: '🗂️', tint: 'bg-emerald-50 text-emerald-600' },
-    { label: '用户上传切片', value: stats.uploaded_chunks, icon: '⬆️', tint: 'bg-rose-50 text-rose-500' },
+    { label: '对话会话', value: stats.sessions, icon: '💬', tint: 'bg-blue-500/10 text-blue-600' },
+    { label: '入库资产', value: stats.assets, icon: '📦', tint: 'bg-amber-500/10 text-amber-600' },
+    { label: '知识库切片', value: stats.chunks, icon: '🗂️', tint: 'bg-emerald-500/10 text-emerald-600' },
+    { label: '用户上传切片', value: stats.uploaded_chunks, icon: '⬆️', tint: 'bg-rose-500/10 text-rose-500' },
   ];
   return (
     <div className="animate-rise space-y-5">
       {/* 引擎状态横幅 */}
       <div
         className={`relative overflow-hidden rounded-2xl px-6 py-5 text-white shadow-md ${
-          stats.mock_mode ? 'bg-gradient-to-r from-[#9a6b1f] to-[#c19142]' : 'bg-gradient-to-r from-[#1f5c50] to-[#2e8a75]'
+          stats.mock_mode ? 'bg-gradient-to-r from-amber-600 to-amber-500' : 'bg-gradient-to-r from-zinc-800 to-zinc-700'
         }`}
       >
         <div
@@ -335,8 +348,8 @@ function Overview({ stats, onGoto }: { stats: AdminStats; onGoto: (tab: TabKey) 
         />
         <div className="relative flex flex-wrap items-center justify-between gap-3">
           <div>
-            <div className="font-display text-[17px] font-bold">
-              {stats.mock_mode ? '🧪 内置演示引擎运行中' : '🚀 真实 API 模式运行中'}
+            <div className="text-[17px] font-semibold">
+              {stats.mock_mode ? '内置演示引擎运行中' : '真实 API 模式运行中'}
             </div>
             <p className="mt-1 text-[12px] text-white/80">
               {stats.mock_mode
@@ -380,7 +393,10 @@ function Overview({ stats, onGoto }: { stats: AdminStats; onGoto: (tab: TabKey) 
               onClick={() => onGoto(kind)}
               className="flex w-full items-center gap-3 px-5 py-3.5 text-left transition hover:bg-paper/70"
             >
-              <span className="text-lg" aria-hidden>{meta.icon}</span>
+              {(() => {
+                const Icon = NAV.find((n) => n.key === kind)!.icon;
+                return <Icon size={16} strokeWidth={1.5} className="text-ink-soft" aria-hidden />;
+              })()}
               <div className="min-w-0 flex-1">
                 <div className="text-[13px] font-medium text-ink">{meta.title}</div>
                 <div className="truncate text-[11px] text-ink-faint">{meta.desc}</div>
@@ -432,7 +448,10 @@ function SecuritySection({ onToast }: { onToast: (kind: ToastItem['kind'], text:
 
   return (
     <section className="paper-card animate-rise px-6 py-5">
-      <h2 className="font-display text-[14.5px] font-bold text-ink">🔐 管理员密码</h2>
+      <h2 className="flex items-center gap-1.5 text-[14.5px] font-semibold text-ink">
+        <KeyRound size={15} strokeWidth={1.5} aria-hidden />
+        管理员密码
+      </h2>
       <p className="mt-1 text-[12px] text-ink-faint">修改后立即生效；强烈建议首次部署即更换默认口令 admin123。</p>
       <div className="mt-4 grid gap-3.5 sm:grid-cols-3">
         <Field label="当前密码">
@@ -458,7 +477,7 @@ function SecuritySection({ onToast }: { onToast: (kind: ToastItem['kind'], text:
       <button
         onClick={() => void submit()}
         disabled={busy || !oldP || !newP}
-        className="mt-5 rounded-lg bg-chalk px-5 py-2 text-[12.5px] font-bold text-white shadow-sm transition hover:bg-[#173f37] disabled:opacity-50"
+        className="mt-5 rounded-lg bg-chalk px-5 py-2 text-[12.5px] font-bold text-white shadow-sm transition hover:bg-zinc-800 disabled:opacity-50"
       >
         {busy ? '更新中…' : '更新密码'}
       </button>

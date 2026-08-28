@@ -76,7 +76,7 @@ export default function EvidenceViewer() {
       </div>
 
       {/* 波形播放器 */}
-      <div className="rounded-xl border border-rule bg-[#fdfaf2] p-4">
+      <div className="rounded-xl border border-rule bg-white p-4">
         <div
           className="flex h-16 items-center gap-[2px]"
           role="meter"

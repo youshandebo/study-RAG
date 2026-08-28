@@ -31,7 +31,7 @@ export default function CourseOutlineTree() {
   return (
     <div className="px-5 py-4">
       {/* 掌握度总览 */}
-      <div className="mb-4 rounded-xl border border-rule bg-[#fdfaf2] p-4">
+      <div className="mb-4 rounded-xl border border-rule bg-white p-4">
         <div className="mb-2 flex items-center justify-between text-[13px]">
           <span className="font-semibold text-ink">本讲掌握度</span>
           <span className="font-display font-bold text-chalk">{mastery}%</span>

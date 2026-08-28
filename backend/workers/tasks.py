@@ -38,6 +38,8 @@ def run_ingest_pipeline(session_id: str, media_type: str, raw: bytes, filename: 
             c.difficulty = score(c.text)
 
         retriever = await get_retriever()
+        # Embedding 写入向量库(Qdrant/内存)后，register_chunks 内部会同步增量更新
+        # 内存 BM25 倒排索引（读写锁保护，写独占/读共享，避免并发检索读到半成品索引）
         added = await retriever.register_chunks(chunks)
         await repo.add_asset(session_id, {"kind": media_type, "uri": url, "filename": filename, "chunk_count": added})
         return {"uri": url, "chunks_added": added}

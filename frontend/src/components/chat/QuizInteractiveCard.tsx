@@ -70,7 +70,7 @@ export default function QuizInteractiveCard({
                     ? 'border-chalk bg-chalk-soft text-chalk'
                     : state === 'wrong'
                       ? 'border-cinnabar bg-cinnabar-soft text-cinnabar'
-                      : 'border-rule bg-[#fdfaf2] hover:border-warn hover:bg-warn-soft/50'
+                      : 'border-rule bg-white hover:border-warn hover:bg-warn-soft/50'
                 }`}
               >
                 <Markdown text={opt} />

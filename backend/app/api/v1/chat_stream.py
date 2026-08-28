@@ -15,10 +15,11 @@ import hashlib
 import json
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 import app.db.relational as repo
+from app.core.security import SlidingWindowLimiter
 from app.models.domain import (
     ChatRequest,
     ComparePayload,
@@ -47,6 +48,9 @@ from app.services.rag.retriever import get_retriever
 from app.services.tokens import estimate_tokens
 
 router = APIRouter()
+
+# 流式对话限流：单 IP+会话 每分钟最多 15 次（SSE 单次连接即计数一次）
+_chat_limiter = SlidingWindowLimiter(max_events=15, window_seconds=60)
 
 SOLVE_SYSTEM = (
     "你是一位大学课堂的专属助教。请严格依据提供的课堂切片（老师原话与板书）所体现的解法和口吻来解题，"
@@ -129,7 +133,15 @@ async def _build_usage(session_id: str, system_text: str, retrieval_text: str, o
 
 
 @router.post("/chat/stream")
-async def chat_stream(req: ChatRequest) -> StreamingResponse:
+async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
+    ip = request.client.host if request.client else "unknown"
+    if not _chat_limiter.check(f"{ip}:{req.session_id}"):
+        retry = _chat_limiter.retry_after(f"{ip}:{req.session_id}")
+        raise HTTPException(
+            status_code=429,
+            detail=f"提问过于频繁（限 15 次/分钟），请 {retry} 秒后再试",
+            headers={"Retry-After": str(retry)},
+        )
     return StreamingResponse(_stream(req), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
 
