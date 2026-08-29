@@ -1,14 +1,16 @@
 # Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
-"""混合检索器：向量相似度 + BM25 倒排 + 词面重合 + 考点元数据过滤。
+"""混合检索器：向量相似度 + BM25 倒排 + 课程作用域隔离 + 时序衰减 + 邻近切片窗口。
 
-优先写入/查询 Qdrant；未配置 Qdrant 时自动使用进程内向量索引（零依赖兜底）。
-进程内 BM25 关键词倒排索引随每次向量入库同步增量更新，读写锁保证并发安全。
+优先写入/查询 Qdrant（带 course_id payload filter）；未配置 Qdrant 时自动使用
+进程内向量索引（零依赖兜底）。进程内 BM25 倒排索引随每次向量入库同步增量
+更新，读写锁保证并发安全。
 """
 from __future__ import annotations
 
 import asyncio
 import math
 import threading
+from datetime import date
 
 from app.core.config import get_settings
 from app.db.vector_store import get_vector_store
@@ -129,38 +131,102 @@ class HybridRetriever:
         top_k: int = 3,
         exam_point: str | None = None,
         min_score: float | None = None,
+        course_id: str | None = None,
+        retrieval_mode: str = "lecture",
+        with_context_window: bool = True,
     ) -> list[Chunk]:
-        if min_score is None:
-            return [c for _, c in await self.retrieve_scored(query, top_k, exam_point)]
-        return [
-            c
-            for s, c in await self.retrieve_scored(query, top_k * 3, exam_point)
-            if s >= min_score
-        ][:top_k]
+        scored = await self.retrieve_scored(query, top_k, exam_point, course_id, retrieval_mode)
+        picked = (
+            [c for _, c in scored]
+            if min_score is None
+            else [c for s, c in scored if s >= min_score][:top_k]
+        )
+        # 微观授课时序窗口：命中的切片自动前/后各拼接 1 个相邻时间戳切片，
+        # 保证推导前提与结论完整进入 Prompt（course_id 相同才拼接）
+        if with_context_window:
+            picked = self._expand_with_neighbors(picked, course_id)
+        return picked
+
+    def _expand_with_neighbors(self, picked: list[Chunk], course_id: str | None) -> list[Chunk]:
+        """In-lecture Context Window：按 (course_id, audio_id) 分组内的时间戳近邻拼接。"""
+        out: list[Chunk] = []
+        seen: set[str] = set()
+        for chunk in picked:
+            for neighbor in self._neighbors_of(chunk, course_id):
+                if neighbor.id not in seen:
+                    seen.add(neighbor.id)
+                    out.append(neighbor)
+            if chunk.id not in seen:
+                seen.add(chunk.id)
+                out.append(chunk)
+        return out
+
+    def _neighbors_of(self, chunk: Chunk, course_id: str | None) -> list[Chunk]:
+        """同一堂课（audio_id）内按时间戳排序，取命中切片前后各 1 个。"""
+        if course_id and chunk.course_id != course_id:
+            return []
+        siblings = sorted(
+            (c for c in self._chunks.values() if c.audio_id == chunk.audio_id),
+            key=lambda c: self._clock_ms(c.start),
+        )
+        idx = next((i for i, c in enumerate(siblings) if c.id == chunk.id), -1)
+        if idx < 0:
+            return []
+        return [siblings[i] for i in (idx - 1, idx + 1) if 0 <= i < len(siblings)]
+
+    @staticmethod
+    def _clock_ms(clock: str) -> int:
+        try:
+            mm, ss = clock.split(":")
+            return (int(mm) * 60 + int(ss)) * 1000
+        except ValueError:
+            return 0
 
     async def retrieve_scored(
         self,
         query: str,
         top_k: int = 3,
         exam_point: str | None = None,
+        course_id: str | None = None,
+        retrieval_mode: str = "lecture",
     ) -> list[tuple[float, Chunk]]:
-        """返回 (融合得分, 切片)：0.50 向量 + 0.20 词面 + 0.20 BM25 + 0.15 元数据。"""
+        """返回 (融合得分, 切片)：0.50 向量 + 0.20 词面 + 0.20 BM25 + 0.15 元数据。
+
+        - course_id 强作用域：非空时只在该课程的切片内检索（Qdrant 走 payload filter）
+        - retrieval_mode=lecture（随堂）：Score ×= (1 + α·e^(-λΔt))，α=0.30、λ=0.05/天，
+          提升最近 1~2 周新授内容排名；review（备考）：α=0 纯语义，支持跨月多跳
+        """
         await self._ensure_seeded()
         qvec = await embedder.embed(query)
         qtokens = embedder._tokenize(query)
         bm25_raw = self._bm25.scores(qtokens)
         bm25_max = max(bm25_raw.values(), default=0.0)
 
+        alpha = 0.0 if retrieval_mode == "review" else 0.30
+        lam = 0.05
+        today = date.today()
+
         scored: list[tuple[float, Chunk]] = []
         for cid, chunk in self._chunks.items():
+            # 课程作用域硬隔离：杜绝跨科目串台
+            if course_id and chunk.course_id != course_id:
+                continue
             if exam_point and exam_point not in chunk.exam_point and exam_point != chunk.exam_point:
                 continue
             sim = embedder.cosine(qvec, self._vectors[cid])
             lex = self._lexical_overlap(set(qtokens), chunk.text)
             bm25 = (bm25_raw.get(cid, 0.0) / bm25_max) if bm25_max > 0 else 0.0
             meta_bonus = 1.0 if any(k in chunk.text for k in ["抓大头", "审敛", "p-积分", "比阶"]) else 0.0
-            score = 0.50 * sim + 0.20 * lex + 0.20 * bm25 + 0.15 * meta_bonus
-            scored.append((score, chunk))
+            base = 0.50 * sim + 0.20 * lex + 0.20 * bm25 + 0.15 * meta_bonus
+
+            # 场景化动态时间衰减：Δt 为距今日的天数
+            if alpha > 0 and chunk.lecture_date:
+                try:
+                    dt_days = max(0.0, (today - date.fromisoformat(chunk.lecture_date)).days)
+                    base *= 1 + alpha * math.exp(-lam * dt_days)
+                except ValueError:
+                    pass
+            scored.append((base, chunk))
 
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return scored[:top_k]

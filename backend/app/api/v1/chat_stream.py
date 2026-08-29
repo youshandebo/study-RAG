@@ -63,9 +63,18 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-async def _retrieve_evidence(query: str, top_k: int = 3, min_score: float | None = None) -> tuple[list[EvidenceRef], list]:
+async def _retrieve_evidence(
+    query: str,
+    top_k: int = 3,
+    min_score: float | None = None,
+    course_id: str | None = None,
+    retrieval_mode: str = "lecture",
+) -> tuple[list[EvidenceRef], list]:
     retriever = await get_retriever()
-    chunks = await retriever.retrieve(query, top_k=top_k, min_score=min_score)
+    chunks = await retriever.retrieve(
+        query, top_k=top_k, min_score=min_score, course_id=course_id or None,
+        retrieval_mode=retrieval_mode, with_context_window=False,
+    )
     refs = [
         EvidenceRef(
             audio_id=c.audio_id,
@@ -179,7 +188,9 @@ async def _stream(req: ChatRequest):
 
     # ---------------------------------------------------------- solve ----
     if intent == Intent.solve:
-        refs, chunks = await _retrieve_evidence(query)
+        refs, chunks = await _retrieve_evidence(
+            query, course_id=req.course_id, retrieval_mode=req.retrieval_mode
+        )
         yield _sse("evidence", {"list": [r.model_dump(mode="json") for r in refs]})
 
         context = "\n---\n".join(f"[{c.start}-{c.end}] {c.text}" for c in chunks)
@@ -235,7 +246,10 @@ async def _stream(req: ChatRequest):
     # --------------------------------------------------------- general ---
     elif intent == Intent.general:
         # 普通提问同样自动检索知识库：相关性达标的课堂切片注入上下文并暴露证据链
-        refs, chunks = await _retrieve_evidence(query, top_k=3, min_score=GENERAL_RELEVANCE_FLOOR)
+        refs, chunks = await _retrieve_evidence(
+            query, top_k=3, min_score=GENERAL_RELEVANCE_FLOOR,
+            course_id=req.course_id, retrieval_mode=req.retrieval_mode,
+        )
         relevant = [c for c in chunks if _is_relevant(query, c)] or chunks
         if relevant:
             yield _sse("evidence", {"list": [r.model_dump(mode="json") for r in refs[: len(relevant)]]})

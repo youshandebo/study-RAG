@@ -8,6 +8,12 @@ export interface SessionMeta {
   id: string;
   title: string;
   createdAt: number;
+  /** 课程作用域：检索强隔离 + 侧栏分组 + 顶栏标签 */
+  subject?: string;   // 学科：数学 / 物理 / …
+  courseId?: string;  // 课程唯一标识（空=全库检索）
+  chapter?: string;
+  /** 检索模式：lecture=随堂(时间衰减) / review=备考(纯语义跨月) */
+  retrievalMode?: 'lecture' | 'review';
 }
 
 interface SessionState {
@@ -23,6 +29,7 @@ interface SessionState {
   init: () => Promise<void>;
   createSession: (title?: string) => Promise<string>;
   switchSession: (id: string) => void;
+  updateSessionMeta: (id: string, patch: Partial<SessionMeta>) => void;
   removeSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
 
@@ -84,6 +91,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   switchSession(id) {
     if (id !== get().activeSessionId) get().abortActive(); // 离开会话即中断该会话流
     set({ activeSessionId: id });
+  },
+
+  /** 更新会话的课程绑定 / 检索模式 */
+  updateSessionMeta(id, patch: Partial<SessionMeta>) {
+    set((s) => ({ sessions: s.sessions.map((m) => (m.id === id ? { ...m, ...patch } : m)) }));
+    void db.sessions.update(id, patch);
   },
 
   async removeSession(id) {

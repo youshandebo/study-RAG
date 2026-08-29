@@ -2,7 +2,8 @@
 // Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 
 
-/** 课程大纲树与考点掌握度分布（基于内置 10月15日 课堂考点 + 伴学掌握度） */
+/** 课程大纲树与考点掌握度分布；节点点击联动检索模式与顶栏课程标签 */
+import { BookMarked, GraduationCap, Zap } from 'lucide-react';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useTutorStore } from '@/stores/useTutorStore';
 
@@ -27,11 +28,36 @@ const OUTLINE = [
 
 export default function CourseOutlineTree() {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const sessions = useSessionStore((s) => s.sessions);
+  const updateSessionMeta = useSessionStore((s) => s.updateSessionMeta);
+  const activeSession = sessions.find((x) => x.id === activeSessionId);
+  const reviewMode = activeSession?.retrievalMode === 'review';
   const tutor = useTutorStore((s) => s.bySession[activeSessionId]);
   const mastery = tutor?.mastery ?? 0;
 
+
   return (
     <div className="px-5 py-4">
+      {/* 检索模式联动条：与顶栏切换按钮状态同步，点大纲节点即绑课程 */}
+      <button
+        onClick={() => activeSession && updateSessionMeta(activeSessionId, { retrievalMode: reviewMode ? 'lecture' : 'review' })}
+        disabled={!activeSession}
+        className={`mb-4 flex w-full items-center gap-2.5 rounded-xl border px-4 py-3 text-left transition disabled:opacity-40 ${
+          reviewMode ? 'border-violet-500/25 bg-violet-500/5' : 'border-amber-500/25 bg-amber-500/5'
+        }`}
+      >
+        <span aria-hidden>{reviewMode ? <GraduationCap size={16} strokeWidth={1.5} className="text-violet-600" /> : <Zap size={16} strokeWidth={1.5} className="text-amber-600" />}</span>
+        <span className="min-w-0 flex-1">
+          <span className={`block text-[12.5px] font-semibold ${reviewMode ? 'text-violet-700' : 'text-amber-700'}`}>
+            {reviewMode ? '备考/复习模式' : '随堂模式'}
+          </span>
+          <span className="block truncate text-[11px] text-ink-faint">
+            {reviewMode ? '纯语义检索，支持跨月多跳 · 点击切回随堂' : '近 1~2 周新授加权 · 点击切备考'}
+          </span>
+        </span>
+        <BookMarked size={14} strokeWidth={1.5} className="shrink-0 text-ink-faint" aria-hidden />
+      </button>
+
       {/* 掌握度总览 */}
       <div className="mb-4 rounded-xl border border-rule bg-white p-4">
         <div className="mb-2 flex items-center justify-between text-[13px]">

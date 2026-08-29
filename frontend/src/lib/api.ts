@@ -154,7 +154,14 @@ function dispatch(event: string, payload: unknown, h: StreamHandlers): void {
 
 // ------------------------------------------------------------- chat stream --
 export async function streamChat(
-  body: { sessionId: string; text?: string; imageB64?: string; forceIntent?: Intent },
+  body: {
+    sessionId: string;
+    text?: string;
+    imageB64?: string;
+    forceIntent?: Intent;
+    courseId?: string;
+    retrievalMode?: 'lecture' | 'review';
+  },
   handlers: StreamHandlers,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -167,6 +174,8 @@ export async function streamChat(
         text: body.text ?? '',
         image_b64: body.imageB64 ?? null,
         force_intent: body.forceIntent ?? null,
+        course_id: body.courseId ?? '',
+        retrieval_mode: body.retrievalMode ?? 'lecture',
       }),
       signal,
     });

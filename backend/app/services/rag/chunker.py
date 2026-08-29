@@ -21,6 +21,11 @@ class Chunk:
     end: str
     text: str
     board_index: int | None = None
+    # 课程作用域元数据：检索强隔离 + 时序衰减的物理时间基准
+    subject: str = "未分类"       # 学科：数学 / 物理 / …
+    course_id: str = "default"    # 课程唯一标识，检索强制同作用域
+    chapter: str = ""             # 章节
+    lecture_date: str = ""        # 授课日期 ISO（YYYY-MM-DD），空=今天
     board_caption: str = ""
     exam_point: str = ""
     difficulty: int = 3
@@ -28,6 +33,10 @@ class Chunk:
 
     def to_payload(self) -> dict:
         return {
+            "subject": self.subject,
+            "course_id": self.course_id,
+            "chapter": self.chapter,
+            "lecture_date": self.lecture_date,
             "audio_id": self.audio_id,
             "start": self.start,
             "end": self.end,

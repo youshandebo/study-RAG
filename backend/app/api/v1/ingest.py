@@ -113,6 +113,9 @@ async def ingest(
     file: UploadFile | None = File(None),
     lecture_date: str = Form(""),
     text_content: str = Form(""),
+    subject: str = Form("未分类"),   # 学科：数学 / 物理 / …
+    course_id: str = Form("default"),  # 课程唯一标识，检索强作用域
+    chapter: str = Form(""),          # 章节
 ):
     """同步执行轻量流水线（演示规模），返回处理摘要。重型部署走 workers/tasks.py 的 Celery 版本。
 
@@ -168,6 +171,7 @@ async def ingest(
         url = await put_object("boards", filename or f"note-{uuid.uuid4().hex[:6]}.txt",
                                base64.b64encode(note_text.encode()).decode())
         chunks = _build_text_chunks(note_text, filename or "文字笔记")
+        _tag_scope(chunks)
         pitfalls = extract_from_chunks(chunks)
 
         retriever = await get_retriever()
@@ -200,16 +204,28 @@ async def ingest(
         else ""
     )
 
+    def _tag_scope(chunk_list: list[Chunk]) -> None:
+        """为切片补齐课程作用域元数据（检索强隔离与时间衰减的数据基础）。"""
+        from datetime import date as _date
+
+        effective_date = lecture_date or _date.today().isoformat()
+        for c in chunk_list:
+            c.subject = subject
+            c.course_id = course_id or "default"
+            c.chapter = chapter
+            c.lecture_date = effective_date
+
     if media_type == "audio":
         segments = await Transcriber().transcribe(raw, file.filename or "")  # raw=16k PCM
         for seg in segments:
             seg.text = correct(seg.text)
-        audio_id = f"ing-{abs(hash(file.filename or 'audio')) % 10_000}"
+        audio_id = f"ing-{abs(hash(file.filename + course_id)) % 10_000}"
         chunks = chunk_transcript(audio_id, segments)
         chunks = align_boards(chunks, board_count=12)
         for c in chunks:
             c.difficulty = score(c.text)
             c.pitfalls = []
+        _tag_scope(chunks)
         pitfalls = extract_from_chunks(chunks)
     else:
         ocr = await OCREngine().recognize(recognize_b64)
@@ -228,6 +244,7 @@ async def ingest(
                 difficulty=score(text),
             )
         ]
+        _tag_scope(chunks)
         pitfalls = []
 
     retriever = await get_retriever()

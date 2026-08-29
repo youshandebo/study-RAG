@@ -11,7 +11,7 @@ from app.core.config import get_settings
 class VectorStore(Protocol):
     async def upsert(self, point_id: str, vector: list[float], payload: dict) -> None: ...
 
-    async def search(self, vector: list[float], top_k: int) -> list[tuple[str, float, dict]]: ...
+    async def search(self, vector: list[float], top_k: int, course_id: str | None = None) -> list[tuple[str, float, dict]]: ...
 
 
 class InMemoryVectorStore:
@@ -25,11 +25,13 @@ class InMemoryVectorStore:
         with self._lock:
             self._points[point_id] = (vector, payload)
 
-    async def search(self, vector: list[float], top_k: int) -> list[tuple[str, float, dict]]:
+    async def search(self, vector: list[float], top_k: int, course_id: str | None = None) -> list[tuple[str, float, dict]]:
         from app.services.rag import embedder
 
         with self._lock:
             items = list(self._points.items())
+        if course_id:
+            items = [(pid, vp) for pid, vp in items if vp[1].get("course_id") == course_id]
         results = [
             (pid, embedder.cosine(vector, vec), payload) for pid, (vec, payload) in items
         ]
@@ -62,8 +64,18 @@ class QdrantVectorStore:
             points=[models.PointStruct(id=point_id, vector=vector, payload=payload)],
         )
 
-    async def search(self, vector: list[float], top_k: int) -> list[tuple[str, float, dict]]:
-        hits = await self._client.search(collection_name=self._collection, query_vector=vector, limit=top_k)
+    async def search(self, vector: list[float], top_k: int, course_id: str | None = None) -> list[tuple[str, float, dict]]:
+        query_filter = None
+        if course_id:
+            from qdrant_client import models
+
+            # Payload Filter：检索强作用域隔离，杜绝跨课程串台
+            query_filter = models.Filter(
+                must=[models.FieldCondition(key="course_id", match=models.MatchValue(value=course_id))]
+            )
+        hits = await self._client.search(
+            collection_name=self._collection, query_vector=vector, limit=top_k, query_filter=query_filter
+        )
         return [(str(h.id), h.score, h.payload or {}) for h in hits]
 
 

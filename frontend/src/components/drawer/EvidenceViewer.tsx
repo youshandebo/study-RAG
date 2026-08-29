@@ -49,7 +49,10 @@ function usePanZoom() {
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
   const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
+  const pinchRef = useRef<{ startDist: number; startScale: number } | null>(null);
   const boxRef = useRef<HTMLDivElement>(null);
+
+  const clampScale = (v: number) => Math.max(1, Math.min(5, v));
 
   const reset = useCallback(() => {
     setScale(1);
@@ -80,6 +83,29 @@ function usePanZoom() {
     [clampOffset],
   );
 
+  // 双指捏合（Pinch-to-Zoom）：适配 iPad / 手机端
+  const onTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length === 2) {
+      const [a, b] = [e.touches[0], e.touches[1]];
+      pinchRef.current = {
+        startDist: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY),
+        startScale: scale,
+      };
+      setDragging(false);
+      dragRef.current = null;
+    }
+  };
+  const onTouchMove = (e: React.TouchEvent) => {
+    const pinch = pinchRef.current;
+    if (!pinch || e.touches.length !== 2) return;
+    const [a, b] = [e.touches[0], e.touches[1]];
+    const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+    setScale(clampScale(pinch.startScale * (dist / Math.max(1, pinch.startDist))));
+  };
+  const onTouchEnd = () => {
+    pinchRef.current = null;
+  };
+
   const onPointerDown = (e: React.PointerEvent) => {
     if (scale <= 1) return;
     (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
@@ -96,7 +122,11 @@ function usePanZoom() {
     setDragging(false);
   };
 
-  return { scale, offset, dragging, boxRef, reset, onWheel, onPointerDown, onPointerMove, onPointerUp };
+  return {
+    scale, offset, dragging, boxRef, reset, onWheel,
+    onPointerDown, onPointerMove, onPointerUp,
+    onTouchStart, onTouchMove, onTouchEnd,
+  };
 }
 
 export default function EvidenceViewer() {
@@ -187,12 +217,15 @@ export default function EvidenceViewer() {
           ref={zoom.boxRef}
           className="relative touch-none select-none overflow-hidden rounded-lg border border-rule bg-board"
           onWheel={zoom.onWheel}
+          onTouchStart={zoom.onTouchStart}
+          onTouchMove={zoom.onTouchMove}
+          onTouchEnd={zoom.onTouchEnd}
           onPointerDown={zoom.onPointerDown}
           onPointerMove={zoom.onPointerMove}
           onPointerUp={zoom.onPointerUp}
           onPointerLeave={zoom.onPointerUp}
           onDoubleClick={zoom.reset}
-          title="滚轮缩放 · 拖拽平移 · 双击复位"
+          title="滚轮/双指捏合缩放 · 拖拽平移 · 双击复位"
         >
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img

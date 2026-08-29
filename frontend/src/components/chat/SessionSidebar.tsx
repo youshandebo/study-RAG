@@ -1,28 +1,64 @@
 'use client';
 // Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 
-/** 会话隔离列表：新建 / 切换 / 重命名 / 删除 / 搜索（严格 sessionId 隔离） */
+/** 会话隔离列表：新建（可绑定课程）/ 搜索 / 按学科分组 / 切换 / 重命名 / 删除 */
 import { useMemo, useState } from 'react';
-import { FileText, Plus, Search, X } from 'lucide-react';
+import { BookMarked, FileText, Plus, Search, X } from 'lucide-react';
 import { useSessionStore } from '@/stores/useSessionStore';
 import AboutDialog from './AboutDialog';
 
+// 内置课程目录（生产环境改为接口拉取）
+const COURSES = [
+  { courseId: 'math-calculus-101', subject: '数学', name: '高等数学 · 反常积分专题' },
+  { courseId: 'math-linear-102', subject: '数学', name: '线性代数 · 矩阵与行列式' },
+  { courseId: 'physics-mech-201', subject: '物理', name: '大学物理 · 力学' },
+  { courseId: '', subject: '通识', name: '不绑定课程（全库检索）' },
+];
+
 export default function SessionSidebar() {
-  const { sessions, activeSessionId, createSession, switchSession, removeSession, renameSession } =
+  const { sessions, activeSessionId, createSession, switchSession, removeSession, renameSession, updateSessionMeta } =
     useSessionStore();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState('');
   const [query, setQuery] = useState('');
+  const [showCoursePicker, setShowCoursePicker] = useState(false);
 
-  // 标题/学科/考点关键词模糊过滤：空格分词，词间 AND
+  // 新建时选中的课程
+  const [pendingCourse, setPendingCourse] = useState(COURSES[0]);
+
+  // 标题/学科/考点关键词模糊过滤（空格分词 AND）
   const filtered = useMemo(() => {
     const tokens = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
     if (tokens.length === 0) return sessions;
     return sessions.filter((s) => {
-      const hay = s.title.toLowerCase();
+      const hay = `${s.title} ${s.subject ?? ''} ${s.chapter ?? ''}`.toLowerCase();
       return tokens.every((tk) => hay.includes(tk));
     });
   }, [sessions, query]);
+
+  // 按学科分组（保持时间倒序）
+  const groups = useMemo(() => {
+    const map = new Map<string, typeof filtered>();
+    for (const s of filtered) {
+      const key = s.subject?.trim() || '未分类';
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(s);
+    }
+    return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0], 'zh'));
+  }, [filtered]);
+
+  const createIn = async () => {
+    setShowCoursePicker(false);
+    const id = await createSession(`${pendingCourse.name.split('·')[0].trim()} · 新对话`);
+    if (pendingCourse.courseId) {
+      updateSessionMeta(id, {
+        subject: pendingCourse.subject,
+        courseId: pendingCourse.courseId,
+        chapter: '',
+      });
+    }
+    setPendingCourse(COURSES[0]);
+  };
 
   const commitRename = async (id: string) => {
     if (draftTitle.trim()) await renameSession(id, draftTitle.trim());
@@ -44,15 +80,40 @@ export default function SessionSidebar() {
         </div>
       </div>
 
-      {/* 新建会话 */}
-      <button
-        onClick={() => createSession()}
-        className="mx-4 mt-4 flex items-center justify-center gap-1.5 rounded-lg border border-dashed border-white/15 bg-white/[0.03] px-3 py-2.5 text-sm text-paper/85 transition hover:border-white/30 hover:bg-white/[0.06]"
-      >
-        <Plus size={14} strokeWidth={1.5} /> 新建对话
-      </button>
+      {/* 新建对话：点展开课程选择 */}
+      <div className="mx-4 mt-4">
+        <button
+          onClick={() => setShowCoursePicker((v) => !v)}
+          className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-white/15 bg-white/[0.03] px-3 py-2.5 text-sm text-paper/85 transition hover:border-white/30 hover:bg-white/[0.06]"
+        >
+          <Plus size={14} strokeWidth={1.5} /> 新建对话{pendingCourse.courseId ? ` · ${pendingCourse.subject}` : ''}
+        </button>
+        {showCoursePicker && (
+          <div className="mt-1.5 space-y-1 rounded-lg border border-white/10 bg-white/[0.04] p-1.5">
+            {COURSES.map((c) => (
+              <button
+                key={c.name}
+                onClick={() => setPendingCourse(c)}
+                className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[12px] transition ${
+                  pendingCourse.name === c.name ? 'bg-blue-600/25 text-paper' : 'text-paper/60 hover:bg-white/[0.05]'
+                }`}
+              >
+                <BookMarked size={12} strokeWidth={1.5} className="shrink-0 opacity-60" aria-hidden />
+                <span className="flex-1 truncate">{c.name}</span>
+                <span className="shrink-0 text-[10px] text-paper/40">{c.subject}</span>
+              </button>
+            ))}
+            <button
+              onClick={() => void createIn()}
+              className="mt-0.5 w-full rounded-md bg-blue-600 py-1.5 text-[12px] font-semibold text-white transition hover:bg-blue-500"
+            >
+              创建
+            </button>
+          </div>
+        )}
+      </div>
 
-      {/* 搜索框：按标题/学科/考点关键词即时过滤 */}
+      {/* 搜索框 */}
       <div className="relative mx-4 mt-3">
         <Search size={13} strokeWidth={1.5} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-paper/35" aria-hidden />
         <input
@@ -72,54 +133,68 @@ export default function SessionSidebar() {
         )}
       </div>
 
-      {/* 会话列表 */}
-      <nav className="mt-3 flex-1 space-y-1 overflow-y-auto px-3 pb-4" aria-label="会话列表">
-        {filtered.map((s) => {
-          const active = s.id === activeSessionId;
-          return (
-            <div
-              key={s.id}
-              className={`group relative flex cursor-pointer items-center gap-2 rounded-lg px-3 py-2.5 text-sm transition ${
-                active
-                  ? 'bg-white/[0.08] text-paper'
-                  : 'text-paper/60 hover:bg-white/[0.04] hover:text-paper'
-              }`}
-              onClick={() => editingId !== s.id && switchSession(s.id)}
-            >
-              {active && <span className="absolute left-0 top-2 bottom-2 w-[2px] rounded-full bg-blue-500" />}
-              <FileText
-                size={14}
-                strokeWidth={1.5}
-                aria-hidden
-                className={`shrink-0 ${active ? 'text-zinc-300' : 'text-zinc-500'}`}
-              />
-              {editingId === s.id ? (
-                <input
-                  autoFocus
-                  value={draftTitle}
-                  onChange={(e) => setDraftTitle(e.target.value)}
-                  onBlur={() => commitRename(s.id)}
-                  onKeyDown={(e) => e.key === 'Enter' && commitRename(s.id)}
-                  className="w-full rounded border border-white/20 bg-transparent px-1.5 py-0.5 text-sm outline-none"
-                />
-              ) : (
-                <span className="flex-1 truncate" onDoubleClick={() => { setEditingId(s.id); setDraftTitle(s.title); }}>
-                  {s.title}
-                </span>
-              )}
-              <button
-                aria-label={`删除会话 ${s.title}`}
-                className="hidden shrink-0 rounded px-1 text-paper/40 transition hover:text-red-400 group-hover:block"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void removeSession(s.id);
-                }}
-              >
-                ✕
-              </button>
+      {/* 会话列表：按学科分组 */}
+      <nav className="mt-3 flex-1 overflow-y-auto px-3 pb-4" aria-label="会话列表">
+        {groups.map(([subject, list]) => (
+          <div key={subject} className="mb-3">
+            <div className="mb-1 flex items-center gap-1.5 px-2 text-[10px] font-semibold tracking-wider text-paper/35">
+              <BookMarked size={10} strokeWidth={1.5} aria-hidden />
+              {subject}
+              <span className="ml-auto font-normal">{list.length}</span>
             </div>
-          );
-        })}
+            <div className="space-y-1">
+              {list.map((s) => {
+                const active = s.id === activeSessionId;
+                return (
+                  <div
+                    key={s.id}
+                    className={`group relative flex cursor-pointer items-center gap-2 rounded-lg px-3 py-2.5 text-sm transition ${
+                      active ? 'bg-white/[0.08] text-paper' : 'text-paper/60 hover:bg-white/[0.04] hover:text-paper'
+                    }`}
+                    onClick={() => editingId !== s.id && switchSession(s.id)}
+                  >
+                    {active && <span className="absolute left-0 top-2 bottom-2 w-[2px] rounded-full bg-blue-500" />}
+                    <FileText
+                      size={14}
+                      strokeWidth={1.5}
+                      aria-hidden
+                      className={`shrink-0 ${active ? 'text-zinc-300' : 'text-zinc-500'}`}
+                    />
+                    {editingId === s.id ? (
+                      <input
+                        autoFocus
+                        value={draftTitle}
+                        onChange={(e) => setDraftTitle(e.target.value)}
+                        onBlur={() => commitRename(s.id)}
+                        onKeyDown={(e) => e.key === 'Enter' && commitRename(s.id)}
+                        className="w-full rounded border border-paper/30 bg-transparent px-1.5 py-0.5 text-sm outline-none"
+                      />
+                    ) : (
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate" onDoubleClick={() => { setEditingId(s.id); setDraftTitle(s.title); }}>
+                          {s.title}
+                        </span>
+                        {s.courseId && (
+                          <span className="mt-0.5 block truncate text-[10px] text-paper/35">{s.chapter || s.courseId}</span>
+                        )}
+                      </span>
+                    )}
+                    <button
+                      aria-label={`删除会话 ${s.title}`}
+                      className="hidden shrink-0 rounded px-1 text-paper/40 transition hover:text-red-400 group-hover:block"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void removeSession(s.id);
+                      }}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
         {filtered.length === 0 && (
           <div className="px-3 py-6 text-center text-[11.5px] text-paper/35">
             {sessions.length === 0 ? '暂无会话' : `没有匹配「${query}」的会话`}

@@ -24,7 +24,8 @@ export default function OmniChatInput() {
   const fileRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  const { activeSessionId, appendMessage, setStreamingId, streamingMessageId, registerAbort } = useSessionStore();
+  const { sessions, activeSessionId, appendMessage, setStreamingId, streamingMessageId, registerAbort } = useSessionStore();
+  const activeSession = sessions.find((x) => x.id === activeSessionId);
   const busy = streamingMessageId !== null;
   // 当前会话每轮用量（供右下角上下文容量面板聚合展示）
   const messagesMap = useSessionStore((s) => s.messagesBySession);
@@ -82,6 +83,8 @@ export default function OmniChatInput() {
         sessionId: activeSessionId,
         text: text.trim(),
         imageB64: image?.b64,
+        courseId: activeSession?.courseId ?? '',
+        retrievalMode: activeSession?.retrievalMode ?? 'lecture',
       },
       {
         onMeta: (meta) => useSessionStore.setState((s) => ({

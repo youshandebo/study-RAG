@@ -105,6 +105,8 @@ class ChatRequest(BaseModel):
     text: str = ""
     image_b64: Optional[str] = None
     force_intent: Optional[Intent] = None
+    course_id: str = ""      # 课程作用域：限定检索范围（空=全库）
+    retrieval_mode: str = "lecture"  # lecture=随堂(时间衰减) / review=备考(纯语义)
 
 
 class IngestRequest(BaseModel):
