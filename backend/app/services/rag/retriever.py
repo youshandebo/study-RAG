@@ -209,6 +209,9 @@ class HybridRetriever:
 
         # 模式映射：canonical 权重与时间衰减分离——
         #   时间衰减回答"现在在讲什么"（仅随堂），canonical 回答"这道题该用哪个方法"
+        # practice 是 lecture（随堂）的语义别名：做题场景=时间衰减提权近讲
+        if retrieval_mode == "practice":
+            retrieval_mode = "lecture"
         explore = retrieval_mode == "explore"
         alpha = 0.0 if retrieval_mode in ("review", "explore") else float(weights["time_alpha"])
         canonical_w = 0.0 if explore else float(weights["canonical_bonus"])

@@ -37,3 +37,30 @@ def extract_for_solution(problem_text: str) -> ExamPoint:
         if any(s in lowered for s in signals):
             return ExamPoint(name=name, source_chunk_ids=[])
     return ExamPoint(name="p-反常积分比较审敛法", source_chunk_ids=[], summary="；".join(SOLVE_STEPS[:2]))
+
+
+async def match_from_text(text: str, course_id: str | None = None, top: int = 1) -> ExamPoint:
+    """通用考点匹配：对已入库切片做向量+BM25 混合检索，取最相关切片的考点标注。
+
+    取代旧的关键词表硬编码——新学科/新课程入库即自动可匹配，无需改代码。
+    检索不可用或无命中时回落关键词规则。
+    """
+    if not (text or "").strip():
+        return ExamPoint(name="未识别考点", source_chunk_ids=[])
+    try:
+        from app.services.rag.retriever import get_retriever
+
+        retriever = await get_retriever()
+        hits = await retriever.retrieve_scored(
+            text, top_k=top, course_id=course_id or None, retrieval_mode="review"
+        )
+        if hits:
+            best = hits[0][1]
+            return ExamPoint(
+                name=best.exam_point or "未识别考点",
+                source_chunk_ids=[c.id for _, c in hits],
+                summary=best.text[:120],
+            )
+    except Exception:
+        pass
+    return extract_for_solution(text)

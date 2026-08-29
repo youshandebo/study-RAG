@@ -236,7 +236,7 @@ async def _stream(req: ChatRequest):
 
     # ------------------------------------------------------------ quiz ---
     elif intent == Intent.quiz:
-        payload: QuizPayload = QuizGenerator().generate()
+        payload: QuizPayload = await QuizGenerator().generate()
         yield _sse("delta", {"text": payload.question_text})
         assistant.type = MessageType.quiz_card
         assistant.content = payload.question_text

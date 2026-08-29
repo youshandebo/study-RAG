@@ -55,6 +55,8 @@ class QuizPayload(BaseModel):
     options: Optional[list[str]] = None
     target_pitfall: str
     explanation: str
+    answer: Optional[str] = None        # 正确答案（批改用，前端选择性展示）
+    difficulty: int = 3                 # 1-5
 
 
 class CompareTrack(BaseModel):

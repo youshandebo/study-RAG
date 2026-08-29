@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api.v1 import admin, chat_stream, compare, evidence, ingest, sessions
+from app.api.v1 import admin, chat_stream, compare, evidence, exam, ingest, sessions
 from app.core.config import get_settings
 from app.db.minio_client import BOARDS_DIR, ensure_static_dirs
 
@@ -43,6 +43,7 @@ app.include_router(compare.router, prefix=prefix, tags=["compare"])
 app.include_router(ingest.router, prefix=prefix, tags=["ingest"])
 app.include_router(evidence.router, prefix=prefix, tags=["evidence"])
 app.include_router(admin.router, prefix=prefix, tags=["admin"])
+app.include_router(exam.router, prefix=prefix, tags=["exam"])
 
 
 @app.get("/api/v1/health")
