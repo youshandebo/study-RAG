@@ -122,6 +122,7 @@ docker-compose.yml   一键编排
 - 无 Qdrant → 进程内余弦向量索引
 - 无 Postgres → 内存仓储
 - 无 Whisper → 内置带毫秒时间戳的演示转录
+- **持久化为真实可选**：`POSTGRES_DSN` 需先 `pip install asyncpg "sqlalchemy[asyncio]>=2.0"`，`QDRANT_URL` 需先 `pip install qdrant-client`；未安装驱动/未配置时自动降级进程内存储（重启即失，部署多副本必须配置）
 - 无 MinIO → 本地静态目录托管
 
 ---

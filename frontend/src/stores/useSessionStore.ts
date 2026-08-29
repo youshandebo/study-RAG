@@ -95,10 +95,21 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     set({ activeSessionId: id });
   },
 
-  /** 更新会话的课程绑定 / 检索模式 */
+  /** 更新会话的课程绑定 / 检索模式：本地 Dexie + 服务端（Postgres）双写 */
   updateSessionMeta(id, patch: Partial<SessionMeta>) {
     set((s) => ({ sessions: s.sessions.map((m) => (m.id === id ? { ...m, ...patch } : m)) }));
     void db.sessions.update(id, patch);
+    void fetch(`${(process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000/api/v1')}/sessions/${id}/meta`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        subject: patch.subject ?? null,
+        course_id: patch.courseId ?? null,
+        chapter: patch.chapter ?? null,
+        retrieval_mode: patch.retrievalMode ?? null,
+        time_alpha_override: patch.timeAlphaOverride ?? null,
+      }),
+    }).catch(() => undefined);
   },
 
   async removeSession(id) {

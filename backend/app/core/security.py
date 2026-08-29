@@ -11,8 +11,10 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import random
+import secrets
 import socket
 import time
 from collections import defaultdict, deque
@@ -96,7 +98,8 @@ class SlidingWindowLimiter:
             client = redis.Redis.from_url(url, decode_responses=True, socket_timeout=0.5)
             client.ping()
             return client
-        except Exception:
+        except Exception as exc:
+            _logger.warning("REDIS_URL 已配置但连接失败，限流降级为进程内实现: %s", exc)
             return None
 
     def _redis_check(self, key: str) -> bool:
@@ -116,8 +119,9 @@ class SlidingWindowLimiter:
         if self._redis is not None:
             try:
                 return self._redis_check(key)
-            except Exception:
-                pass  # Redis 抖动时降级进程内限流
+            except Exception as exc:
+                # 降级必须可见：多副本共享限流失效不能无感裸奔
+                _logger.warning("Redis 限流执行失败，本次请求降级进程内窗口: %s", exc)
         now = time.time()
         dq = self._hits[key]
         while dq and now - dq[0] > self.window:
@@ -155,6 +159,8 @@ async def retry_async(coro_factory, *, attempts: int = 3, base_delay: float = 0.
 
 # ------------------------------------------------------------------ JWT -----
 _SECRET = os.getenv("ADMIN_JWT_SECRET", "") or os.getenv("ADMIN_PASSWORD", "") or "studay-rag-dev-secret"
+
+_logger = logging.getLogger("app.security")
 
 
 def jwt_sign(payload: dict, ttl_seconds: int) -> str:

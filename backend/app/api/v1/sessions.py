@@ -14,6 +14,14 @@ class SessionBody(BaseModel):
     title: str = "新对话"
 
 
+class SessionMetaBody(BaseModel):
+    subject: str | None = None
+    course_id: str | None = None
+    chapter: str | None = None
+    retrieval_mode: str | None = None
+    time_alpha_override: float | None = None
+
+
 @router.post("/sessions")
 async def create_session(body: SessionBody | None = None):
     return await repo.create_session((body.title if body else None) or "新对话")
@@ -58,6 +66,13 @@ async def session_usage(session_id: str):
 @router.patch("/sessions/{session_id}")
 async def rename_session(session_id: str, body: SessionBody):
     await repo.rename_session(session_id, body.title)
+    return {"ok": True}
+
+
+@router.patch("/sessions/{session_id}/meta")
+async def patch_session_meta(session_id: str, body: SessionMetaBody):
+    """课程绑定 / 检索模式持久化（Postgres 配置时落库）。"""
+    await repo.update_session_meta(session_id, body.model_dump(exclude_none=False))
     return {"ok": True}
 
 

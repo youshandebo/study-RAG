@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import threading
 from datetime import date
@@ -226,7 +227,6 @@ class HybridRetriever:
         qtokens = embedder._tokenize(query)
         bm25_raw = self._bm25.scores(qtokens)
         bm25_max = max(bm25_raw.values(), default=0.0)
-
         # 模式映射：canonical 权重与时间衰减分离——
         #   时间衰减回答"现在在讲什么"（仅随堂），canonical 回答"这道题该用哪个方法"
         explore = retrieval_mode == "explore"
@@ -247,27 +247,51 @@ class HybridRetriever:
         lam = 0.05
         today = date.today()
 
-        # 候选池 + 版本去重：被显式 supersedes 的旧解法不参与竞争，避免 LLM"串戏"
-        candidates = [
-            c for c in self._chunks.values()
-            if not course_id or c.course_id == course_id
-        ]
-        candidates = self._filter_superseded(candidates)
+        # 候选池：一律经由 store.search（Qdrant 带 payload filter / 内存库等价余弦），
+        # 多副本部署时检索结果由共享向量库决定，不再依赖进程内字典。
+        # 远端命中的切片若不在本进程缓存，用 payload 重建元数据。
+        try:
+            hits = await self._store.search(
+                qvec, top_k=top_k * 4, course_id=course_id or None
+            )
+        except Exception as exc:
+            _logger.warning("store.search 失败，回退进程内候选池: %s", exc)
+            hits = [
+                (cid, embedder.cosine(qvec, self._vectors[cid]), self._chunks[cid].to_payload())
+                for cid in self._vectors
+                if not course_id or self._chunks[cid].course_id == course_id
+            ]
+
+        candidate_map: dict[str, tuple[float, Chunk]] = {}
+        for pid, sim, payload in hits:
+            chunk = self._chunks.get(pid)
+            if chunk is None:
+                payload = dict(payload or {})
+                payload.setdefault("id", pid)
+                try:
+                    chunk = Chunk(**payload)
+                except TypeError:
+                    continue  # payload 缺关键字段（脏数据）跳过
+                self._chunks[pid] = chunk
+            candidate_map[pid] = (float(sim), chunk)
+
+        # 版本去重：被显式 supersedes 的旧解法不参与竞争，避免 LLM"串戏"
+        candidates = self._filter_superseded([c for _, c in candidate_map.values()])
+        sim_of = {c.id: candidate_map[c.id][0] for c in candidates if c.id in candidate_map}
 
         scored: list[tuple[float, Chunk]] = []
         for chunk in candidates:
             if exam_point and exam_point not in chunk.exam_point and exam_point != chunk.exam_point:
                 continue
             cid = chunk.id
-            sim = embedder.cosine(qvec, self._vectors[cid])
+            sim = sim_of.get(cid, 0.0)
             lex = self._lexical_overlap(set(qtokens), chunk.text)
             bm25 = (bm25_raw.get(cid, 0.0) / bm25_max) if bm25_max > 0 else 0.0
-            meta_bonus = 1.0 if any(k in chunk.text for k in ["抓大头", "审敛", "p-积分", "比阶"]) else 0.0
+            # 通用信号：向量 / 词面 / BM25——无演示课程关键词
             base = (
                 float(weights["vector"]) * sim
                 + float(weights["lexical"]) * lex
                 + float(weights["bm25"]) * bm25
-                + 0.15 * meta_bonus
             )
             # canonical 定版权威加分：explore 模式下为 0（学生已掌握老师方法，看别的思路）
             if chunk.is_canonical:
