@@ -61,6 +61,7 @@ SEED_CHUNKS: list[dict] = [
         "board_caption": "板书第 09 张 - p-积分口诀与标准形",
         "exam_point": "p-积分敛散性判定定理",
         "difficulty": 2,
+        "is_canonical": True, "method_version": 1,
         "subject": "数学", "course_id": "math-calculus-101", "chapter": "5.3 反常积分", "lecture_date": _seed_date(10),
     },
     {

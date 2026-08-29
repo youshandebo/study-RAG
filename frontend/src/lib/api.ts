@@ -160,7 +160,7 @@ export async function streamChat(
     imageB64?: string;
     forceIntent?: Intent;
     courseId?: string;
-    retrievalMode?: 'lecture' | 'review';
+    retrievalMode?: 'lecture' | 'review' | 'explore';
   },
   handlers: StreamHandlers,
   signal?: AbortSignal,
@@ -318,6 +318,27 @@ export interface ModelSectionConfig {
   configured?: boolean;
 }
 
+export interface RetrievalWeights {
+  profile: 'strict' | 'balanced' | 'explore';
+  vector: number;
+  lexical: number;
+  bm25: number;
+  canonical_bonus: number;
+  time_alpha: number;
+}
+
+export interface AdminChunkInfo {
+  id: string;
+  exam_point: string;
+  course_id: string;
+  chapter: string;
+  lecture_date: string;
+  is_canonical: boolean;
+  method_version: number;
+  supersedes: string | null;
+  text: string;
+}
+
 export interface MediaSettings {
   image_quality: number;
   image_max_edge: number;
@@ -332,6 +353,7 @@ export interface AdminConfigView {
   asr: ModelSectionConfig;
   vlm: ModelSectionConfig;
   media?: MediaSettings;
+  retrieval?: RetrievalWeights;
   model_tracks: Array<{ key: string; name: string }>;
 }
 
@@ -386,6 +408,35 @@ export async function saveAdminConfig(
   },
 ): Promise<AdminConfigView> {
   return adminFetch('/admin/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+}
+
+export async function saveRetrievalWeights(weights: Partial<RetrievalWeights>): Promise<AdminConfigView> {
+  return adminFetch('/admin/config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      retrieval: {
+        profile: weights.profile ?? '',
+        ...(weights.vector !== undefined ? { vector: String(weights.vector) } : {}),
+        ...(weights.lexical !== undefined ? { lexical: String(weights.lexical) } : {}),
+        ...(weights.bm25 !== undefined ? { bm25: String(weights.bm25) } : {}),
+        ...(weights.canonical_bonus !== undefined ? { canonical_bonus: String(weights.canonical_bonus) } : {}),
+        ...(weights.time_alpha !== undefined ? { time_alpha: String(weights.time_alpha) } : {}),
+      },
+    }),
+  });
+}
+
+export async function fetchAdminChunks(courseId = ''): Promise<AdminChunkInfo[]> {
+  return adminFetch(`/admin/chunks?course_id=${encodeURIComponent(courseId)}`);
+}
+
+export async function setChunkCanonical(chunkId: string, canonical: boolean): Promise<void> {
+  await adminFetch(`/admin/chunks/${chunkId}/canonical`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ canonical }),
+  });
 }
 
 export async function resetAdminSection(kind: 'llm' | 'embedding' | 'asr' | 'vlm'): Promise<AdminConfigView> {

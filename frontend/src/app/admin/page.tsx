@@ -34,8 +34,9 @@ import AdminLoginCard from '@/components/admin/AdminLoginCard';
 import ModelSectionCard, { TestState } from '@/components/admin/ModelSectionCard';
 import ToastStack, { ToastItem } from '@/components/admin/Toast';
 import { SECTION_META, SectionKey } from '@/components/admin/presets';
+import RetrievalSection from '@/components/admin/RetrievalSection';
 
-type TabKey = 'overview' | SectionKey | 'media' | 'security';
+type TabKey = 'overview' | SectionKey | 'media' | 'retrieval' | 'security';
 type Drafts = Record<SectionKey, ModelSectionConfig>;
 
 const NAV: Array<{ key: TabKey; label: string; icon: typeof Gauge }> = [
@@ -45,6 +46,7 @@ const NAV: Array<{ key: TabKey; label: string; icon: typeof Gauge }> = [
   { key: 'asr', label: '语音转文字', icon: Mic },
   { key: 'vlm', label: '多模态识图', icon: ImageIcon },
   { key: 'media', label: '媒体压缩', icon: SlidersHorizontal },
+  { key: 'retrieval', label: '检索调权', icon: Gauge },
   { key: 'security', label: '密码与安全', icon: KeyRound },
 ];
 
@@ -338,6 +340,8 @@ export default function AdminPage() {
           )}
 
           {tab === 'media' && mediaDraft && <MediaSection draft={mediaDraft} setDraft={setMediaDraft} saving={savingKey === ('media' as SectionKey)} onSave={() => void handleSave('media' as SectionKey)} />}
+
+          {tab === 'retrieval' && config?.retrieval && <RetrievalSection config={config} />}
 
           {tab === 'security' && <SecuritySection onToast={toast} />}
         </main>

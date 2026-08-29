@@ -4,7 +4,8 @@
 
 /** 全能输入框：文本 / 拍照上传 / 拖拽 / 粘贴图片 / 指令前缀 / 停止生成 */
 import { useCallback, useRef, useState } from 'react';
-import { Camera, GitCompareArrows, Lightbulb, SendHorizontal, Square, Zap } from 'lucide-react';
+import { BookOpen, Camera, Compass, GitCompareArrows, Lightbulb, SendHorizontal, Square, Zap } from 'lucide-react';
+import ModeChangeDialog from './ModeChangeDialog';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { streamChat } from '@/lib/api';
 import type { PolymorphicMessage, UsageInfo } from '@/types/message';
@@ -24,8 +25,11 @@ export default function OmniChatInput() {
   const fileRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  const { sessions, activeSessionId, appendMessage, setStreamingId, streamingMessageId, registerAbort } = useSessionStore();
+  const { sessions, activeSessionId, updateSessionMeta, appendMessage, setStreamingId, streamingMessageId, registerAbort } = useSessionStore();
   const activeSession = sessions.find((x) => x.id === activeSessionId);
+  const exploreMode = activeSession?.retrievalMode === 'explore';
+  // 切到"更多解法"时强制阅读弹窗（5s + 红色确认），防误触
+  const [pendingExplore, setPendingExplore] = useState(false);
   const busy = streamingMessageId !== null;
   // 当前会话每轮用量（供右下角上下文容量面板聚合展示）
   const messagesMap = useSessionStore((s) => s.messagesBySession);
@@ -230,7 +234,53 @@ export default function OmniChatInput() {
             <span className="ml-auto hidden text-[10.5px] text-ink-faint sm:block">Enter 发送 · Shift+Enter 换行</span>
             <ContextMeter usages={sessionUsages} />
           </div>
+
+          {/* 检索视角：老师原法（默认）/ 更多解法——面向学生的语义化开关 */}
+          <div className="mt-2 flex items-center justify-end">
+            <div className="inline-flex overflow-hidden rounded-full border border-rule bg-white/70" role="group" aria-label="检索视角">
+              <button
+                onClick={() => activeSession && updateSessionMeta(activeSessionId, { retrievalMode: 'lecture' })}
+                disabled={!activeSession}
+                className={`inline-flex items-center gap-1 px-3 py-1 text-[11.5px] transition ${
+                  !exploreMode ? 'bg-chalk font-semibold text-white' : 'text-ink-faint hover:text-ink-soft'
+                } disabled:opacity-40`}
+              >
+                <BookOpen size={11} strokeWidth={1.5} aria-hidden />
+                老师原法
+              </button>
+              <button
+                onClick={() => {
+                  if (!activeSession) return;
+                  if (exploreMode) updateSessionMeta(activeSessionId, { retrievalMode: 'lecture' });
+                  else setPendingExplore(true); // 切换前强制阅读
+                }}
+                disabled={!activeSession}
+                className={`inline-flex items-center gap-1 px-3 py-1 text-[11.5px] transition ${
+                  exploreMode ? 'bg-violet-600 font-semibold text-white' : 'text-ink-faint hover:text-ink-soft'
+                } disabled:opacity-40`}
+              >
+                <Compass size={11} strokeWidth={1.5} aria-hidden />
+                更多解法
+              </button>
+            </div>
+          </div>
         </div>
+
+        {pendingExplore && (
+          <ModeChangeDialog
+            targetLabel="更多解法"
+            description={[
+              'AI 将不再强制按老师的标准解法讲解，改为综合知识库做纯语义检索；',
+              '可能看到多种思路，包括与课堂讲法不同的解法；',
+              '随时可点「老师原法」切回，本会话的提问记录不受影响。',
+            ]}
+            onConfirm={() => {
+              if (activeSession) updateSessionMeta(activeSessionId, { retrievalMode: 'explore' });
+              setPendingExplore(false);
+            }}
+            onCancel={() => setPendingExplore(false)}
+          />
+        )}
 
         <input
           ref={fileRef}

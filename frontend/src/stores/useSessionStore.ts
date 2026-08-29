@@ -12,8 +12,8 @@ export interface SessionMeta {
   subject?: string;   // 学科：数学 / 物理 / …
   courseId?: string;  // 课程唯一标识（空=全库检索）
   chapter?: string;
-  /** 检索模式：lecture=随堂(时间衰减) / review=备考(纯语义跨月) */
-  retrievalMode?: 'lecture' | 'review';
+  /** 检索模式：lecture=随堂 / review=备考 / explore=拓展解法（解除定版与章节聚合） */
+  retrievalMode?: 'lecture' | 'review' | 'explore';
 }
 
 interface SessionState {

@@ -152,6 +152,17 @@ async def ingest(
             compress_meta = {"skipped": "压缩异常，保留原始文件"}  # 压缩失败不影响入库主链路
             archive_raw = raw
 
+    def _tag_scope(chunk_list: list[Chunk]) -> None:
+        """为切片补齐课程作用域元数据（检索强隔离与时间衰减的数据基础）。"""
+        from datetime import date as _date
+
+        effective_date = lecture_date or _date.today().isoformat()
+        for c in chunk_list:
+            c.subject = subject
+            c.course_id = course_id or "default"
+            c.chapter = chapter
+            c.lecture_date = effective_date
+
     if media_type == "text":
         note_text = (text_content or "").strip()
         filename = file.filename or "" if file else ""
@@ -204,16 +215,6 @@ async def ingest(
         else ""
     )
 
-    def _tag_scope(chunk_list: list[Chunk]) -> None:
-        """为切片补齐课程作用域元数据（检索强隔离与时间衰减的数据基础）。"""
-        from datetime import date as _date
-
-        effective_date = lecture_date or _date.today().isoformat()
-        for c in chunk_list:
-            c.subject = subject
-            c.course_id = course_id or "default"
-            c.chapter = chapter
-            c.lecture_date = effective_date
 
     if media_type == "audio":
         segments = await Transcriber().transcribe(raw, file.filename or "")  # raw=16k PCM

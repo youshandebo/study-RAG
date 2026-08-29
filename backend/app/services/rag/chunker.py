@@ -26,6 +26,10 @@ class Chunk:
     course_id: str = "default"    # 课程唯一标识，检索强制同作用域
     chapter: str = ""             # 章节
     lecture_date: str = ""        # 授课日期 ISO（YYYY-MM-DD），空=今天
+    # 解法定版权威信号：显式声明取代时间衰减的隐式推断
+    is_canonical: bool = False    # 该考点的"标准解法"定版切片
+    method_version: int = 1       # 解法版本号，老师改进讲法时递增
+    supersedes: str | None = None # 指向被本版本取代的旧切片 id
     board_caption: str = ""
     exam_point: str = ""
     difficulty: int = 3
@@ -33,6 +37,9 @@ class Chunk:
 
     def to_payload(self) -> dict:
         return {
+            "is_canonical": self.is_canonical,
+            "method_version": self.method_version,
+            "supersedes": self.supersedes,
             "subject": self.subject,
             "course_id": self.course_id,
             "chapter": self.chapter,

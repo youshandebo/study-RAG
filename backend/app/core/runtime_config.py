@@ -36,6 +36,8 @@ def _blank() -> dict:
         "vlm": {"base_url": "", "api_key": "", "model": ""},
         # 媒体压缩参数（数值以字符串形式存储，effective() 负责转型）
         "media": {"image_quality": "", "image_max_edge": "", "audio_bitrate": "", "audio_max_mb": ""},
+        # 检索调权：预设档位 + 可选的原始系数覆盖（留空=跟随预设）
+        "retrieval": {"profile": "", "vector": "", "lexical": "", "bm25": "", "canonical_bonus": "", "time_alpha": ""},
     }
 
 
@@ -61,6 +63,13 @@ def _normalize(raw: dict | None) -> dict:
             val = media_src.get(key)
             if val is not None and str(val).strip() != "":
                 cfg["media"][key] = str(int(val))
+    retrieval_src = raw.get("retrieval")
+    if isinstance(retrieval_src, dict):
+        cfg["retrieval"]["profile"] = str(retrieval_src.get("profile") or "").strip()
+        for key in ("vector", "lexical", "bm25", "canonical_bonus", "time_alpha"):
+            val = retrieval_src.get(key)
+            if val is not None and str(val).strip() != "":
+                cfg["retrieval"][key] = str(float(val))
     return cfg
 
 
@@ -95,7 +104,7 @@ def save_runtime_config(patch: dict) -> dict:
     global _cache, _cache_mtime
     current = _load_from_disk()
     patch = patch if isinstance(patch, dict) else {}
-    for section in ("llm", "embedding", "asr", "vlm", "media"):
+    for section in ("llm", "embedding", "asr", "vlm", "media", "retrieval"):
         src = patch.get(section)
         if not isinstance(src, dict):
             continue
@@ -104,7 +113,13 @@ def save_runtime_config(patch: dict) -> dict:
             if key not in src:
                 continue
             val = src[key]
-            if section == "media":
+            if section == "retrieval" and key != "profile":
+                try:
+                    float(val)
+                except (TypeError, ValueError):
+                    continue
+                target[key] = str(float(val))
+            elif section == "media":
                 try:
                     int(val)
                 except (TypeError, ValueError):
@@ -174,6 +189,24 @@ def effective(kind: str):
     rc = get_runtime_config()
     settings = get_settings()
 
+    if kind == "retrieval":
+        # 预设档位 + 高级覆盖：未覆盖字段回落预设值
+        presets = {
+            "strict":   {"vector": 0.45, "lexical": 0.15, "bm25": 0.15, "canonical_bonus": 0.5, "time_alpha": 0.30},
+            "balanced": {"vector": 0.50, "lexical": 0.20, "bm25": 0.20, "canonical_bonus": 0.3, "time_alpha": 0.20},
+            "explore":  {"vector": 0.65, "lexical": 0.20, "bm25": 0.15, "canonical_bonus": 0.0, "time_alpha": 0.0},
+        }
+        section = rc.get("retrieval", {})
+        profile = section.get("profile") if section.get("profile") in presets else "balanced"
+        out = {"profile": profile, **presets[profile]}
+        for key in ("vector", "lexical", "bm25", "canonical_bonus", "time_alpha"):
+            if str(section.get(key) or "").strip():
+                try:
+                    out[key] = max(0.0, min(1.0, float(section[key])))
+                except (TypeError, ValueError):
+                    pass
+        return out
+
     if kind == "media":
         # 媒体压缩参数：面板值 > 内置默认（compressor.DEFAULTS 再兜底）
         defaults = {"image_quality": 82, "image_max_edge": 2560, "audio_bitrate": 24, "audio_max_mb": 200}
@@ -239,6 +272,7 @@ def masked_view() -> dict:
     view: dict = {
         "admin_password_set": bool(rc.get("admin_password_hash") or os.getenv("ADMIN_PASSWORD", "").strip()),
         "media": effective("media"),
+        "retrieval": effective("retrieval"),
     }
     for kind in ("llm", "embedding", "asr", "vlm"):
         eff = effective(kind)

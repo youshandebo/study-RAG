@@ -283,6 +283,59 @@ async def _test_asr(cfg: dict) -> str:
         return f"连接成功 · 静音样本转录结果「{text[:40]}」"
 
 
+# ---------------------------------------------------------------- 定版管理 --
+class CanonicalBody(BaseModel):
+    canonical: bool
+
+
+@router.get("/admin/chunks")
+async def admin_list_chunks(
+    _: str = Depends(require_admin),
+    course_id: str = "",
+    exam_point: str = "",
+):
+    """切片清单（供老师定版管理）：可按课程/考点过滤。"""
+    from app.services.rag.retriever import get_retriever
+
+    retriever = await get_retriever()
+    chunks = await retriever.all_chunks()
+    out = []
+    for c in chunks:
+        if course_id and c.course_id != course_id:
+            continue
+        if exam_point and exam_point not in c.exam_point:
+            continue
+        out.append({
+            "id": c.id,
+            "exam_point": c.exam_point,
+            "course_id": c.course_id,
+            "chapter": c.chapter,
+            "lecture_date": c.lecture_date,
+            "is_canonical": c.is_canonical,
+            "method_version": c.method_version,
+            "supersedes": c.supersedes,
+            "text": c.text[:80],
+        })
+    return out
+
+
+@router.post("/admin/chunks/{chunk_id}/canonical")
+async def admin_set_canonical(chunk_id: str, body: CanonicalBody, _: str = Depends(require_admin)):
+    """老师"设为标准解法"：自动接管同考点旧定版（旧版降级 + supersedes 指针 + 版本递增）。"""
+    from app.services.rag.retriever import get_retriever
+
+    retriever = await get_retriever()
+    chunk = await retriever.set_canonical(chunk_id, body.canonical)
+    if chunk is None:
+        raise HTTPException(status_code=404, detail="切片不存在")
+    return {
+        "id": chunk.id,
+        "is_canonical": chunk.is_canonical,
+        "method_version": chunk.method_version,
+        "supersedes": chunk.supersedes,
+    }
+
+
 # -------------------------------------------------------------------- stats --
 @router.get("/admin/stats")
 async def admin_stats(_: str = Depends(require_admin)):

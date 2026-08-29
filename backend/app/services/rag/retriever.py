@@ -193,34 +193,56 @@ class HybridRetriever:
         """返回 (融合得分, 切片)：0.50 向量 + 0.20 词面 + 0.20 BM25 + 0.15 元数据。
 
         - course_id 强作用域：非空时只在该课程的切片内检索（Qdrant 走 payload filter）
-        - retrieval_mode=lecture（随堂）：Score ×= (1 + α·e^(-λΔt))，α=0.30、λ=0.05/天，
-          提升最近 1~2 周新授内容排名；review（备考）：α=0 纯语义，支持跨月多跳
+        - retrieval_mode：lecture（随堂，时间衰减提权近讲）/ review（备考，纯语义跨月，
+          canonical 仍生效）/ explore（拓展解法：解除 canonical 与章节聚合，纯语义）
+        - 权重系数来自 runtime_config 的 retrieval 预设档位（strict/balanced/explore）
+          + 管理后台高级覆盖，热生效
         """
         await self._ensure_seeded()
+        from app.core.runtime_config import effective as cfg_effective
+
+        weights = cfg_effective("retrieval")
         qvec = await embedder.embed(query)
         qtokens = embedder._tokenize(query)
         bm25_raw = self._bm25.scores(qtokens)
         bm25_max = max(bm25_raw.values(), default=0.0)
 
-        alpha = 0.0 if retrieval_mode == "review" else 0.30
+        # 模式映射：canonical 权重与时间衰减分离——
+        #   时间衰减回答"现在在讲什么"（仅随堂），canonical 回答"这道题该用哪个方法"
+        explore = retrieval_mode == "explore"
+        alpha = 0.0 if retrieval_mode in ("review", "explore") else float(weights["time_alpha"])
+        canonical_w = 0.0 if explore else float(weights["canonical_bonus"])
         lam = 0.05
         today = date.today()
 
+        # 候选池 + 版本去重：被显式 supersedes 的旧解法不参与竞争，避免 LLM"串戏"
+        candidates = [
+            c for c in self._chunks.values()
+            if not course_id or c.course_id == course_id
+        ]
+        candidates = self._filter_superseded(candidates)
+
         scored: list[tuple[float, Chunk]] = []
-        for cid, chunk in self._chunks.items():
-            # 课程作用域硬隔离：杜绝跨科目串台
-            if course_id and chunk.course_id != course_id:
-                continue
+        for chunk in candidates:
             if exam_point and exam_point not in chunk.exam_point and exam_point != chunk.exam_point:
                 continue
+            cid = chunk.id
             sim = embedder.cosine(qvec, self._vectors[cid])
             lex = self._lexical_overlap(set(qtokens), chunk.text)
             bm25 = (bm25_raw.get(cid, 0.0) / bm25_max) if bm25_max > 0 else 0.0
             meta_bonus = 1.0 if any(k in chunk.text for k in ["抓大头", "审敛", "p-积分", "比阶"]) else 0.0
-            base = 0.50 * sim + 0.20 * lex + 0.20 * bm25 + 0.15 * meta_bonus
+            base = (
+                float(weights["vector"]) * sim
+                + float(weights["lexical"]) * lex
+                + float(weights["bm25"]) * bm25
+                + 0.15 * meta_bonus
+            )
+            # canonical 定版权威加分：explore 模式下为 0（学生已掌握老师方法，看别的思路）
+            if chunk.is_canonical:
+                base += canonical_w
 
-            # 场景化动态时间衰减：Δt 为距今日的天数
-            if alpha > 0 and chunk.lecture_date:
+            # 时间衰减：仅作用于非 canonical 切片（定版不随时间贬值，直到被新版本显式取代）
+            if alpha > 0 and chunk.lecture_date and not chunk.is_canonical:
                 try:
                     dt_days = max(0.0, (today - date.fromisoformat(chunk.lecture_date)).days)
                     base *= 1 + alpha * math.exp(-lam * dt_days)
@@ -230,6 +252,14 @@ class HybridRetriever:
 
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return scored[:top_k]
+
+    @staticmethod
+    def _filter_superseded(candidates: list[Chunk]) -> list[Chunk]:
+        """考点内版本去重：supersedes 链上被取代的旧版本直接剔除候选池。"""
+        superseded_ids = {c.supersedes for c in candidates if c.supersedes}
+        if not superseded_ids:
+            return candidates
+        return [c for c in candidates if c.id not in superseded_ids]
 
     async def register_chunks(self, new_chunks: list[Chunk]) -> int:
         """入库流水线回写入口：Embedding 写入向量库后，同步增量更新内存 BM25 倒排索引。
@@ -252,6 +282,38 @@ class HybridRetriever:
     async def all_chunks(self) -> list[Chunk]:
         await self._ensure_seeded()
         return list(self._chunks.values())
+
+    async def set_canonical(self, chunk_id: str, canonical: bool) -> Chunk | None:
+        """老师定版操作：将切片设为/取消考点标准解法。
+
+        设为定版时自动：同 exam_point（同课程）旧 canonical 降级并写入
+        supersedes 指向新版本，method_version 在其基础上递增——版本关系显式
+        声明，不靠衰减曲线隐式猜。Qdrant payload 同步更新。
+        """
+        await self._ensure_seeded()
+        target = self._chunks.get(chunk_id)
+        if target is None:
+            return None
+        target.is_canonical = canonical
+        if canonical:
+            deposed: Chunk | None = None
+            for other in self._chunks.values():
+                if (
+                    other.id != chunk_id
+                    and other.is_canonical
+                    and other.exam_point == target.exam_point
+                    and other.course_id == target.course_id
+                ):
+                    other.is_canonical = False
+                    deposed = other
+            if deposed is not None:
+                # 版本链：新版本指向被取代的旧版本（_filter_superseded 据此剔除旧版）
+                target.supersedes = deposed.id
+                target.method_version = deposed.method_version + 1
+        vec = self._vectors.get(chunk_id)
+        if vec is not None:
+            await self._store.upsert(chunk_id, vec, target.to_payload())
+        return target
 
 
 _retriever: HybridRetriever | None = None
