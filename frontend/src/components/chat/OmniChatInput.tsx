@@ -4,7 +4,7 @@
 
 /** 全能输入框：文本 / 拍照上传 / 拖拽 / 粘贴图片 / 指令前缀 / 停止生成 */
 import { useCallback, useRef, useState } from 'react';
-import { BookOpen, Camera, Compass, GitCompareArrows, Lightbulb, SendHorizontal, Square, Zap } from 'lucide-react';
+import { BookOpen, Camera, Compass, Gauge, GitCompareArrows, Lightbulb, RotateCcw, SendHorizontal, Square, Zap } from 'lucide-react';
 import ModeChangeDialog from './ModeChangeDialog';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { streamChat } from '@/lib/api';
@@ -30,6 +30,8 @@ export default function OmniChatInput() {
   const exploreMode = activeSession?.retrievalMode === 'explore';
   // 切到"更多解法"时强制阅读弹窗（5s + 红色确认），防误触
   const [pendingExplore, setPendingExplore] = useState(false);
+  const [showAlpha, setShowAlpha] = useState(false);
+  const alphaOverride = activeSession?.timeAlphaOverride ?? null;
   const busy = streamingMessageId !== null;
   // 当前会话每轮用量（供右下角上下文容量面板聚合展示）
   const messagesMap = useSessionStore((s) => s.messagesBySession);
@@ -89,6 +91,7 @@ export default function OmniChatInput() {
         imageB64: image?.b64,
         courseId: activeSession?.courseId ?? '',
         retrievalMode: activeSession?.retrievalMode ?? 'lecture',
+        timeAlphaOverride: activeSession?.timeAlphaOverride ?? null,
       },
       {
         onMeta: (meta) => useSessionStore.setState((s) => ({
@@ -237,6 +240,51 @@ export default function OmniChatInput() {
 
           {/* 检索视角：老师原法（默认）/ 更多解法——面向学生的语义化开关 */}
           <div className="mt-2 flex items-center justify-end">
+            <div className="relative mr-2">
+              <button
+                onClick={() => setShowAlpha((v) => !v)}
+                title="时间偏好强度（任何模式下均可调）"
+                className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] transition ${
+                  alphaOverride !== null ? 'border-blue-500/50 bg-blue-500/10 text-blue-600' : 'border-rule bg-white/70 text-ink-faint hover:text-ink-soft'
+                }`}
+              >
+                <Gauge size={12} strokeWidth={1.5} aria-hidden />
+                时间偏好 {alphaOverride !== null ? alphaOverride.toFixed(2) : '默认'}
+              </button>
+              {showAlpha && (
+                <div className="absolute bottom-full right-0 z-30 mb-2 w-72 rounded-xl border border-rule bg-white p-4 shadow-xl">
+                  <div className="mb-1 flex items-baseline justify-between">
+                    <span className="text-[12px] font-semibold text-ink">时间偏好强度 α</span>
+                    <span className="font-mono text-[11px] text-ink-faint">
+                      {alphaOverride !== null ? alphaOverride.toFixed(2) : '跟随模式'}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={0.5}
+                    step={0.05}
+                    value={alphaOverride ?? 0.2}
+                    onChange={(e) =>
+                      activeSession && updateSessionMeta(activeSessionId, { timeAlphaOverride: Number(e.target.value) })
+                    }
+                    className="w-full accent-blue-600"
+                  />
+                  <p className="mt-1.5 text-[10.5px] leading-relaxed text-ink-faint">
+                    拉高：更偏向最近讲的内容；拉低：不管哪天讲的，同考点一视同仁。
+                    期末等大跨度复习建议调低，避免漏掉早期重点。仅影响排序，不影响内容正确性。
+                  </p>
+                  {alphaOverride !== null && (
+                    <button
+                      onClick={() => activeSession && updateSessionMeta(activeSessionId, { timeAlphaOverride: null })}
+                      className="mt-2 inline-flex items-center gap-1 text-[11px] text-chalk underline-offset-2 hover:underline"
+                    >
+                      <RotateCcw size={11} strokeWidth={1.5} /> 恢复跟随模式默认
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
             <div className="inline-flex overflow-hidden rounded-full border border-rule bg-white/70" role="group" aria-label="检索视角">
               <button
                 onClick={() => activeSession && updateSessionMeta(activeSessionId, { retrievalMode: 'lecture' })}

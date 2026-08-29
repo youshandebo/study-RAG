@@ -97,6 +97,19 @@ class BM25Index:
             self._lock.release_read()
 
 
+# 时间偏好默认值按场景走：窄范围复习（周测/单元）保留较高权重——近期内容
+# 与考点高度重合；宽范围复习（月考/期末）跨度大，降到很低但非强制归零。
+# 注意：时间权重只是"排序偏好"，防幻觉靠 canonical 定版 + 考点精准匹配。
+_DEFAULT_ALPHA_BY_SCOPE = {
+    "lecture": 0.30,
+    "practice": 0.30,    # lecture 的语义别名（做题场景）
+    "review_narrow": 0.20,  # 周测 / 单元复习
+    "review_broad": 0.05,   # 月考 / 期末复习
+    "review": 0.05,         # 兼容旧值：未声明范围的复习按宽处理
+    "explore": 0.0,         # 拓展解法：纯语义
+}
+
+
 class HybridRetriever:
     def __init__(self) -> None:
         self._store = get_vector_store()
@@ -134,8 +147,13 @@ class HybridRetriever:
         course_id: str | None = None,
         retrieval_mode: str = "lecture",
         with_context_window: bool = True,
+        time_alpha_override: float | None = None,
+        canonical_bonus_override: float | None = None,
     ) -> list[Chunk]:
-        scored = await self.retrieve_scored(query, top_k, exam_point, course_id, retrieval_mode)
+        scored = await self.retrieve_scored(
+            query, top_k, exam_point, course_id, retrieval_mode,
+            time_alpha_override, canonical_bonus_override,
+        )
         picked = (
             [c for _, c in scored]
             if min_score is None
@@ -189,6 +207,8 @@ class HybridRetriever:
         exam_point: str | None = None,
         course_id: str | None = None,
         retrieval_mode: str = "lecture",
+        time_alpha_override: float | None = None,
+        canonical_bonus_override: float | None = None,
     ) -> list[tuple[float, Chunk]]:
         """返回 (融合得分, 切片)：0.50 向量 + 0.20 词面 + 0.20 BM25 + 0.15 元数据。
 
@@ -209,12 +229,21 @@ class HybridRetriever:
 
         # 模式映射：canonical 权重与时间衰减分离——
         #   时间衰减回答"现在在讲什么"（仅随堂），canonical 回答"这道题该用哪个方法"
-        # practice 是 lecture（随堂）的语义别名：做题场景=时间衰减提权近讲
-        if retrieval_mode == "practice":
-            retrieval_mode = "lecture"
         explore = retrieval_mode == "explore"
-        alpha = 0.0 if retrieval_mode in ("review", "explore") else float(weights["time_alpha"])
-        canonical_w = 0.0 if explore else float(weights["canonical_bonus"])
+        # α 三级来源：请求 override（最高）> scope 场景默认 > 后台调权预设
+        if time_alpha_override is not None:
+            alpha = max(0.0, min(1.0, float(time_alpha_override)))
+        else:
+            alpha = (
+                0.0 if explore
+                else _DEFAULT_ALPHA_BY_SCOPE.get(retrieval_mode, float(weights["time_alpha"]))
+            )
+        # canonical 定版权重：请求 override > 后台预设；explore 恒 0（拓展解法）
+        canonical_w = (
+            0.0 if explore
+            else float(canonical_bonus_override) if canonical_bonus_override is not None
+            else float(weights["canonical_bonus"])
+        )
         lam = 0.05
         today = date.today()
 

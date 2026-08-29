@@ -108,7 +108,9 @@ class ChatRequest(BaseModel):
     image_b64: Optional[str] = None
     force_intent: Optional[Intent] = None
     course_id: str = ""      # 课程作用域：限定检索范围（空=全库）
-    retrieval_mode: str = "lecture"  # lecture=随堂(时间衰减) / review=备考(纯语义)
+    retrieval_mode: str = "lecture"  # lecture/review_narrow/review_broad/review/explore
+    time_alpha_override: float | None = None   # 时间偏好强度覆盖（优先于模式默认）
+    canonical_bonus_override: float | None = None  # 定版权重覆盖
 
 
 class IngestRequest(BaseModel):

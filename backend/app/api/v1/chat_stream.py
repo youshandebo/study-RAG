@@ -69,11 +69,15 @@ async def _retrieve_evidence(
     min_score: float | None = None,
     course_id: str | None = None,
     retrieval_mode: str = "lecture",
+    time_alpha_override: float | None = None,
+    canonical_bonus_override: float | None = None,
 ) -> tuple[list[EvidenceRef], list]:
     retriever = await get_retriever()
     chunks = await retriever.retrieve(
         query, top_k=top_k, min_score=min_score, course_id=course_id or None,
         retrieval_mode=retrieval_mode, with_context_window=False,
+        time_alpha_override=time_alpha_override,
+        canonical_bonus_override=canonical_bonus_override,
     )
     refs = [
         EvidenceRef(
@@ -189,7 +193,9 @@ async def _stream(req: ChatRequest):
     # ---------------------------------------------------------- solve ----
     if intent == Intent.solve:
         refs, chunks = await _retrieve_evidence(
-            query, course_id=req.course_id, retrieval_mode=req.retrieval_mode
+            query, course_id=req.course_id, retrieval_mode=req.retrieval_mode,
+            time_alpha_override=req.time_alpha_override,
+            canonical_bonus_override=req.canonical_bonus_override,
         )
         yield _sse("evidence", {"list": [r.model_dump(mode="json") for r in refs]})
 
@@ -249,6 +255,8 @@ async def _stream(req: ChatRequest):
         refs, chunks = await _retrieve_evidence(
             query, top_k=3, min_score=GENERAL_RELEVANCE_FLOOR,
             course_id=req.course_id, retrieval_mode=req.retrieval_mode,
+            time_alpha_override=req.time_alpha_override,
+            canonical_bonus_override=req.canonical_bonus_override,
         )
         relevant = [c for c in chunks if _is_relevant(query, c)] or chunks
         if relevant:

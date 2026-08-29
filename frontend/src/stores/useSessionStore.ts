@@ -12,8 +12,10 @@ export interface SessionMeta {
   subject?: string;   // 学科：数学 / 物理 / …
   courseId?: string;  // 课程唯一标识（空=全库检索）
   chapter?: string;
-  /** 检索模式：lecture=随堂 / review=备考 / explore=拓展解法（解除定版与章节聚合） */
-  retrievalMode?: 'lecture' | 'review' | 'explore';
+  /** 检索模式：lecture=随堂 / review_narrow=周测 / review_broad=期末 / explore=拓展解法 */
+  retrievalMode?: 'lecture' | 'review_narrow' | 'review_broad' | 'review' | 'explore';
+  /** 时间偏好强度覆盖（0~1；不设=跟随模式默认值） */
+  timeAlphaOverride?: number | null;
 }
 
 interface SessionState {

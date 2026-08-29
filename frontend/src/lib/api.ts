@@ -160,7 +160,9 @@ export async function streamChat(
     imageB64?: string;
     forceIntent?: Intent;
     courseId?: string;
-    retrievalMode?: 'lecture' | 'review' | 'explore';
+    retrievalMode?: 'lecture' | 'review_narrow' | 'review_broad' | 'review' | 'explore';
+    timeAlphaOverride?: number | null;
+    canonicalBonusOverride?: number | null;
   },
   handlers: StreamHandlers,
   signal?: AbortSignal,
@@ -176,6 +178,8 @@ export async function streamChat(
         force_intent: body.forceIntent ?? null,
         course_id: body.courseId ?? '',
         retrieval_mode: body.retrievalMode ?? 'lecture',
+        time_alpha_override: body.timeAlphaOverride ?? null,
+        canonical_bonus_override: body.canonicalBonusOverride ?? null,
       }),
       signal,
     });

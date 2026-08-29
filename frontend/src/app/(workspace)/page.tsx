@@ -4,7 +4,7 @@
 
 /** 统一主工作台：左会话栏 + 中全能对话画布 + 右证据抽屉 */
 import { useEffect, useRef, useState } from 'react';
-import { BookMarked, BookOpen, ChevronRight, Settings, Zap } from 'lucide-react';
+import { BookMarked, BookOpen, ChevronRight, Settings } from 'lucide-react';
 import SessionSidebar from '@/components/chat/SessionSidebar';
 import UnifiedMessageList from '@/components/chat/UnifiedMessageList';
 import OmniChatInput from '@/components/chat/OmniChatInput';
@@ -17,7 +17,20 @@ import { API_BASE } from '@/lib/api';
 export default function WorkspacePage() {
   const { sessions, activeSessionId, updateSessionMeta, init, appendMessage, messagesBySession } = useSessionStore();
   const activeSession = sessions.find((s) => s.id === activeSessionId);
-  const reviewMode = activeSession?.retrievalMode === 'review';
+  const mode = activeSession?.retrievalMode ?? 'lecture';
+  const MODE_UI: Record<string, { label: string; hint: string; cls: string }> = {
+    lecture: { label: '⚡ 随堂模式', hint: '随堂做题：优先最近 1~2 周新授内容', cls: 'bg-amber-500/10 text-amber-600' },
+    review_narrow: { label: '📖 周测复习', hint: '窄范围复习：近期内容仍强相关（α 默认 0.20）', cls: 'bg-sky-500/10 text-sky-600' },
+    review_broad: { label: '📚 期末复习', hint: '大跨度复习：几乎时间平权，防漏早期重点（α 默认 0.05）', cls: 'bg-violet-500/10 text-violet-600' },
+    explore: { label: '🧭 拓展解法', hint: '输入框下方切换的探索模式', cls: 'bg-violet-500/10 text-violet-600' },
+  };
+  const modeUi = MODE_UI[mode] ?? MODE_UI.lecture;
+  const cycleMode = () => {
+    if (!activeSession) return;
+    const order: Array<string> = ['lecture', 'review_narrow', 'review_broad'];
+    const next = order[(order.indexOf(mode === 'explore' ? 'lecture' : mode) + 1) % order.length];
+    updateSessionMeta(activeSession.id, { retrievalMode: next as never });
+  };
   const openDrawer = useEvidenceStore((s) => s.openDrawer);
   const drawerOpen = useEvidenceStore((s) => s.open);
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
@@ -93,23 +106,14 @@ export default function WorkspacePage() {
               )}
               {backendOk === null ? '检查后端…' : backendOk ? '引擎在线' : '后端未连接'}
             </span>
-            {/* 检索模式：随堂（时间衰减提权近讲） vs 备考（纯语义跨月多跳） */}
+            {/* 检索场景三档轮换：α 默认值随场景走（0.30/0.20/0.05），均可用输入卡的时间偏好滑杆覆盖 */}
             <button
-              onClick={() =>
-                activeSession && updateSessionMeta(activeSession.id, { retrievalMode: reviewMode ? 'lecture' : 'review' })
-              }
+              onClick={cycleMode}
               disabled={!activeSession}
-              title={reviewMode ? '备考/复习模式：解除时间加权，跨月份综合检索' : '随堂模式：优先最近 1~2 周新授内容'}
-              className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11.5px] font-medium transition ${
-                reviewMode ? 'bg-violet-500/10 text-violet-600' : 'bg-amber-500/10 text-amber-600'
-              } disabled:opacity-40`}
+              title={modeUi.hint + '（点击切换）'}
+              className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11.5px] font-medium transition ${modeUi.cls} disabled:opacity-40`}
             >
-              {reviewMode ? '📚 备考模式' : (
-                <>
-                  <Zap size={11} strokeWidth={1.5} aria-hidden />
-                  随堂模式
-                </>
-              )}
+              {modeUi.label}
             </button>
             <a
               href="/admin"
