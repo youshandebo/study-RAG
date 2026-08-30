@@ -1,6 +1,7 @@
 """管理员后台 + 文字入库 + RAG 检索 端到端自测（不依赖任何真实 API Key）。"""
 import json
 import sys
+from pathlib import Path
 
 sys.path.insert(0, ".")
 
@@ -10,6 +11,7 @@ from app.core import runtime_config  # noqa: E402
 
 # 清空运行时配置，从默认口令开始
 runtime_config._CONFIG_PATH.unlink(missing_ok=True) if runtime_config._CONFIG_PATH.exists() else None
+Path("data/app.db").unlink(missing_ok=True)  # SQLite 默认持久化：测试前清库保证幂等
 runtime_config._cache = None
 runtime_config._cache_mtime = -1.0
 

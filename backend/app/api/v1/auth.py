@@ -87,6 +87,53 @@ def sign_user_token(user_id: str, tier: str, ttl: int = 30 * 24 * 3600) -> str:
     return jwt_sign({"sub": user_id, "tier": tier, "kind": "user"}, ttl)
 
 
+async def _needs_setup() -> bool:
+    """首次部署判定：没有任何注册用户且管理面板未设过密码。"""
+    from app.core.runtime_config import get_runtime_config
+
+    if await repo.count_users() > 0:
+        return False
+    return not (get_runtime_config().get("admin_password_hash") or __import__("os").getenv("ADMIN_PASSWORD", "").strip())
+
+
+class SetupBody(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=72)
+
+    @field_validator("password")
+    @classmethod
+    def strong_enough(cls, v: str) -> str:
+        if not re.search(r"[A-Za-z]", v) or not re.search(r"\d", v):
+            raise ValueError("密码需同时包含字母和数字")
+        return v
+
+
+@router.get("/auth/setup/status")
+async def setup_status():
+    return {"needs_setup": await _needs_setup()}
+
+
+@router.post("/auth/setup")
+async def setup_initialize(body: SetupBody):
+    """网页初始化向导：创建平台管理员账号（旗舰档）+ 设置管理面板口令。
+
+    仅在首次部署（needs_setup）时可用；此后此端点永久 403。
+    """
+    if not await _needs_setup():
+        raise HTTPException(status_code=403, detail="系统已初始化，请直接登录")
+    email = body.email.lower()
+    if await repo.get_user_by_email(email):
+        raise HTTPException(status_code=409, detail="该邮箱已存在，请直接登录")
+    from app.core.runtime_config import set_admin_password
+
+    user = await repo.create_user(email, hash_password(body.password), tier="max")
+    set_admin_password(body.password)  # /admin 面板用同一口令
+    return {
+        "token": sign_user_token(user["id"], user["tier"]),
+        "user": {"id": user["id"], "email": user["email"], "tier": user["tier"]},
+    }
+
+
 @router.post("/auth/register")
 async def register(body: RegisterBody):
     email = body.email.lower()

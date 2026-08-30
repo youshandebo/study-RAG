@@ -28,6 +28,17 @@ docker compose up -d                 # 基础版（backend + frontend + redis）
 docker compose --profile full up -d  # 全量版（含向量库/关系库/对象存储）
 ```
 
+### 🚀 单容器部署（最简，New API 式体验）
+
+```bash
+docker run -d --name studay-rag --restart always   -p 3000:3000 -v studay-data:/app/data   ghcr.io/youshandebo/studay-rag:latest
+```
+
+浏览器打开 `http://服务器IP:3000`，**首次访问自动进入初始化向导**：网页里创建
+管理员账号（旗舰档 + 同时解锁管理控制台），完成后学生从登录页注册使用。
+数据（SQLite + 配置 + 素材）全部落在 `studay-data` 卷，重启/升级不丢。
+需要更强检索与多副本时，再用下面的 compose 全栈编排（Postgres/Qdrant/Redis）。
+
 ### 🚀 服务器一键部署（镜像由 GitHub Actions 云端构建，服务器免装构建环境）
 
 每次 push 到 `main`，[Docker 工作流](.github/workflows/docker.yml) 自动构建前后端镜像并推送至 GHCR。服务器上：

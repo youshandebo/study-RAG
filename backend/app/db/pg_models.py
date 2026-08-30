@@ -37,7 +37,8 @@ class UserRow(Base):
 class MessageRow(Base):
     __tablename__ = "messages"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # Integer（非 BigInteger）：SQLite 仅对 INTEGER 主键启用自增别名
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(String(32), index=True)
     created_at: Mapped[int] = mapped_column(BigInteger, index=True, default=0)
     payload: Mapped[str] = mapped_column(Text)  # PolymorphicMessage JSON 全文

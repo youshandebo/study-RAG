@@ -3,7 +3,7 @@
 
 /** 会员登录 / 注册：学生入口，注册即送免费档（存储 200MB + 基础模型） */
 import { useRouter } from 'next/navigation';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { GraduationCap, Mail } from 'lucide-react';
 import { login as apiLogin, register as apiRegister } from '@/lib/api';
 
@@ -15,11 +15,23 @@ const TIERS = [
 
 export default function LoginPage() {
   const router = useRouter();
+  const [needsSetup, setNeedsSetup] = useState(false);
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+
+  // 首次部署检测：未初始化则引导到向导
+  useEffect(() => {
+    void (async () => {
+      try {
+        const resp = await fetch(`${process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000/api/v1'}/auth/setup/status`);
+        const data = await resp.json();
+        if (data.needs_setup) setNeedsSetup(true);
+      } catch { /* 后端未起 */ }
+    })();
+  }, []);
 
   const submit = async () => {
     if (busy || !email || !password) return;
@@ -96,6 +108,15 @@ export default function LoginPage() {
               <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[12px] text-red-300">
                 {error}
               </div>
+            )}
+
+            {needsSetup && (
+              <a
+                href="/setup"
+                className="mb-3 flex items-center justify-center gap-1.5 rounded-lg border border-blue-500/40 bg-blue-500/10 px-3 py-2.5 text-[12.5px] font-semibold text-blue-300 transition hover:bg-blue-500/20"
+              >
+                🚀 首次部署：点击完成平台初始化
+              </a>
             )}
 
             <button

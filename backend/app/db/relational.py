@@ -20,6 +20,7 @@ _engine = None                 # AsyncEngine（惰性创建，create_async_engin
 _sessionmaker = None
 _tables_ready = False
 _pg_broken = False             # 初始化失败熔断：本进程内不再反复尝试
+_engine_kind = "memory"        # postgres | sqlite | memory
 
 _memory_sessions: dict[str, dict[str, Any]] = {}
 _memory_messages: dict[str, list[dict[str, Any]]] = {}
@@ -28,8 +29,8 @@ _memory_users: dict[str, dict[str, Any]] = {}
 
 
 def _use_postgres() -> bool:
-    """配置了 POSTGRES_DSN 且驱动/引擎可用时返回 True（本函数只建引擎，不建连）。"""
-    global _engine, _sessionmaker, _pg_broken
+    """配置了 POSTGRES_DSN 且驱动可用时返回 True（本函数只建引擎，不建连）。"""
+    global _engine, _sessionmaker, _pg_broken, _engine_kind
     if _pg_broken:
         return False
     if _engine is not None:
@@ -44,11 +45,42 @@ def _use_postgres() -> bool:
 
         _engine = create_async_engine(dsn, echo=False, pool_pre_ping=True)
         _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
+        _engine_kind = "postgres"
         _logger.info("Postgres 存储引擎已创建: %s", dsn.split("@")[-1])
         return True
     except Exception as exc:
         _pg_broken = True
         _logger.error("Postgres 引擎初始化失败（降级进程内存储）: %s", exc)
+        return False
+
+
+def _db_ready() -> bool:
+    """统一入口：Postgres（配置 DSN）或 SQLite（默认，单容器持久化）。
+
+    SQLite 库文件默认 backend/data/app.db（APP_DB_PATH 可覆盖），重启不丢数据，
+    彻底解决"内存存储重启即失"。两者都不可用时才回落内存。
+    """
+    global _engine, _sessionmaker, _pg_broken, _engine_kind
+    if _pg_broken or _engine is not None:
+        return _engine is not None
+    try:
+        import os as _os
+
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        db_path = _os.getenv("APP_DB_PATH", "").strip() or _os.path.join(
+            _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))),
+            "data", "app.db",
+        )
+        _os.makedirs(_os.path.dirname(db_path), exist_ok=True)
+        _engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
+        _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
+        _engine_kind = "sqlite"
+        _logger.info("SQLite 存储引擎已创建: %s", db_path)
+        return True
+    except Exception as exc:
+        _pg_broken = True
+        _logger.error("SQLite 引擎初始化失败（降级进程内存储）: %s", exc)
         return False
 
 
@@ -91,7 +123,7 @@ async def create_session(title: str = "新对话", owner: str | None = None) -> 
         "retrieval_mode": None,
         "time_alpha_override": None,
     }
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from app.db.pg_models import SessionRow
 
         async with await _pg_session() as s:
@@ -106,7 +138,7 @@ async def create_session(title: str = "新对话", owner: str | None = None) -> 
 
 
 async def list_sessions(owner: str | None = None, require_owner: bool = False) -> list[dict[str, Any]]:
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import select
 
         from app.db.pg_models import SessionRow
@@ -132,7 +164,7 @@ async def list_sessions(owner: str | None = None, require_owner: bool = False) -
 
 
 async def rename_session(session_id: str, title: str) -> None:
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import update
 
         from app.db.pg_models import SessionRow
@@ -146,7 +178,7 @@ async def rename_session(session_id: str, title: str) -> None:
 
 
 async def delete_session(session_id: str) -> None:
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import delete
 
         from app.db.pg_models import AssetRow, MessageRow, SessionRow
@@ -162,7 +194,7 @@ async def delete_session(session_id: str) -> None:
 
 
 async def get_session_owner(session_id: str) -> str | None:
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import select
 
         from app.db.pg_models import SessionRow
@@ -179,7 +211,7 @@ async def update_session_meta(session_id: str, patch: dict[str, Any]) -> None:
     values = {k: v for k, v in patch.items() if k in allowed}
     if not values:
         return
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import update
 
         from app.db.pg_models import SessionRow
@@ -194,7 +226,7 @@ async def update_session_meta(session_id: str, patch: dict[str, Any]) -> None:
 
 # ---------------------------------------------------------------- messages --
 async def append_message(session_id: str, message: dict[str, Any]) -> None:
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from app.db.pg_models import MessageRow
 
         row = MessageRow(
@@ -210,7 +242,7 @@ async def append_message(session_id: str, message: dict[str, Any]) -> None:
 
 
 async def list_messages(session_id: str) -> list[dict[str, Any]]:
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import select
 
         from app.db.pg_models import MessageRow
@@ -230,7 +262,7 @@ async def list_messages(session_id: str) -> list[dict[str, Any]]:
 # ------------------------------------------------------------------ assets --
 async def add_asset(session_id: str, asset: dict[str, Any]) -> dict[str, Any]:
     record = {"id": uuid.uuid4().hex[:12], "created_at": int(time.time() * 1000), **asset}
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from app.db.pg_models import AssetRow
 
         async with await _pg_session() as s:
@@ -244,7 +276,7 @@ async def add_asset(session_id: str, asset: dict[str, Any]) -> dict[str, Any]:
 
 
 async def list_assets(session_id: str) -> list[dict[str, Any]]:
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import select
 
         from app.db.pg_models import AssetRow
@@ -263,7 +295,7 @@ async def list_assets(session_id: str) -> list[dict[str, Any]]:
 
 async def count_assets() -> int:
     """素材总数（管理后台统计；PG/内存双实现）。"""
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import func, select
 
         from app.db.pg_models import AssetRow
@@ -276,7 +308,7 @@ async def count_assets() -> int:
 
 async def list_all_assets() -> list[dict[str, Any]]:
     """全量资产元数据（音频切片反查用；量级为课堂素材，千级以内可接受）。"""
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import select
 
         from app.db.pg_models import AssetRow
@@ -296,7 +328,7 @@ async def create_user(email: str, password_hash: str, tier: str = "free") -> dic
         "tier": tier,
         "created_at": int(time.time() * 1000),
     }
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from app.db.pg_models import UserRow
 
         async with await _pg_session() as s:
@@ -308,7 +340,7 @@ async def create_user(email: str, password_hash: str, tier: str = "free") -> dic
 
 
 async def get_user_by_email(email: str) -> dict[str, Any] | None:
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import select
 
         from app.db.pg_models import UserRow
@@ -326,7 +358,7 @@ async def get_user_by_email(email: str) -> dict[str, Any] | None:
 
 
 async def get_user_by_id(user_id: str) -> dict[str, Any] | None:
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import select
 
         from app.db.pg_models import UserRow
@@ -341,7 +373,7 @@ async def get_user_by_id(user_id: str) -> dict[str, Any] | None:
 
 
 async def count_users() -> int:
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import func, select
 
         from app.db.pg_models import UserRow
@@ -353,7 +385,7 @@ async def count_users() -> int:
 
 
 async def list_users() -> list[dict[str, Any]]:
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import select
 
         from app.db.pg_models import UserRow
@@ -368,7 +400,7 @@ async def list_users() -> list[dict[str, Any]]:
 
 
 async def set_user_tier(user_id: str, tier: str) -> bool:
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import update
 
         from app.db.pg_models import UserRow
@@ -385,7 +417,7 @@ async def set_user_tier(user_id: str, tier: str) -> bool:
 
 async def storage_used_bytes(owner: str) -> int:
     """用户素材存储占用（AssetRow.size_bytes 求和）。"""
-    if _use_postgres() and await _ensure_tables():
+    if _db_ready() and await _ensure_tables():
         from sqlalchemy import func, select
 
         from app.db.pg_models import AssetRow

@@ -156,6 +156,21 @@ def hash_password(password: str, salt: str | None = None) -> str:
     return f"{salt}${digest}"
 
 
+def set_admin_password(password: str) -> None:
+    """网页初始化/后台改密：写入加盐哈希（同 admin.py change_password 通道）。"""
+    from app.core.security import hash_password
+
+    with _lock:
+        current = _load_from_disk()
+        current["admin_password_hash"] = hash_password(password)
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _CONFIG_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(_CONFIG_PATH)
+        globals()["_cache"] = current
+        globals()["_cache_mtime"] = _CONFIG_PATH.stat().st_mtime
+
+
 def verify_admin_password(password: str) -> bool:
     stored = get_runtime_config().get("admin_password_hash", "")
     if not stored:
