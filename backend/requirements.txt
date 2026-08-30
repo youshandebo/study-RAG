@@ -2,6 +2,7 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
 pydantic-settings>=2.2
+email-validator>=2.0   # auth 注册 EmailStr 校验（pydantic[email]）
 httpx>=0.27
 python-multipart>=0.0.9
 
