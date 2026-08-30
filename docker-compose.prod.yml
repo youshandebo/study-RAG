@@ -1,0 +1,95 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+# 生产部署编排：镜像由 GitHub Actions 构建并推送 GHCR，服务器免构建。
+#
+# 使用：
+#   cp .env.example .env   # 按需修改（务必改掉 POSTGRES/MINIO 弱口令、设置 ADMIN_PASSWORD）
+#   docker compose -f docker-compose.prod.yml pull
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# 升级：git pull 后重复上面两条即可（数据全在具名卷中）。
+
+services:
+  backend:
+    image: ghcr.io/youshandebo/studay-rag-backend:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - ADMIN_JWT_SECRET=${ADMIN_JWT_SECRET:-}
+      - MEMBERSHIP_MODE=${MEMBERSHIP_MODE:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - POSTGRES_DSN=postgresql+asyncpg://tutor:${POSTGRES_PASSWORD:-tutor}@postgres:5432/classroom
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT:-minio:9000}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
+      - ALLOW_PRIVATE_LLM_HOSTS=${ALLOW_PRIVATE_LLM_HOSTS:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - backend-data:/app/data          # runtime_config + jwt_secret 持久化
+      - backend-static:/app/app/static  # 上传素材（未接 MinIO 时）
+
+  frontend:
+    image: ghcr.io/youshandebo/studay-rag-frontend:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # 代理目标必须含 /api/v1：前端请求 /api/proxy/sessions → 转发 /api/v1/sessions
+      - BACKEND_ORIGIN=http://backend:8000/api/v1
+    depends_on:
+      - backend
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tutor
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tutor}
+      POSTGRES_DB: classroom
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tutor -d classroom"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio-data:/data
+
+volumes:
+  backend-data:
+  backend-static:
+  pg-data:
+  redis-data:
+  qdrant-data:
+  minio-data:

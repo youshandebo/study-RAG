@@ -4,9 +4,10 @@ import { NextResponse } from 'next/server';
 /** 服务端轻量 API 代理：处理跨域与 Key 转发（按需启用） */
 const UPSTREAM = process.env.BACKEND_ORIGIN ?? 'http://localhost:8000';
 
-async function proxy(req: Request): Promise<Response> {
+async function proxy(req: Request, ctx: { params: { path?: string[] } }): Promise<Response> {
   const url = new URL(req.url);
-  const target = `${UPSTREAM}${url.pathname.replace(/^\/api\/proxy/, '')}${url.search}`;
+  const tail = `/${(ctx.params.path ?? []).join('/')}`;
+  const target = `${UPSTREAM}${tail}${url.search}`;
   const headers = new Headers(req.headers);
   headers.delete('host');
   try {
@@ -28,4 +29,5 @@ async function proxy(req: Request): Promise<Response> {
 }
 
 export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 export { proxy as GET, proxy as POST, proxy as PATCH, proxy as DELETE };

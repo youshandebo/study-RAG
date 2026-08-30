@@ -1,0 +1,12 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+__pycache__
+**/__pycache__
+*.pyc
+.venv
+venv
+data
+app/static/audio
+app/static/boards/*.txt
+tests
+e2e_admin_test.py
+.pytest_cache

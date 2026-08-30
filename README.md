@@ -28,6 +28,31 @@ docker compose up -d                 # 基础版（backend + frontend + redis）
 docker compose --profile full up -d  # 全量版（含向量库/关系库/对象存储）
 ```
 
+### 🚀 服务器一键部署（镜像由 GitHub Actions 云端构建，服务器免装构建环境）
+
+每次 push 到 `main`，[Docker 工作流](.github/workflows/docker.yml) 自动构建前后端镜像并推送至 GHCR。服务器上：
+
+```bash
+# 1. 拉取仓库（或仅复制 docker-compose.prod.yml 与 .env）
+git clone https://github.com/youshandebo/studay-RAG.git && cd studay-RAG
+
+# 2. 配置环境（务必改掉 POSTGRES/MINIO 弱口令，设置 ADMIN_PASSWORD 与 ADMIN_JWT_SECRET）
+cp .env.example .env && vi .env
+
+# 3. 拉取云端构建好的镜像并启动全栈（backend/frontend/postgres/redis/qdrant/minio）
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d
+
+# 升级版本：git pull 后重复 pull + up -d（数据全在具名卷中，不会丢失）
+```
+
+- 访问 `http://<服务器IP>:3000`；API 经前端 `/api/proxy` 同源转发，无 CORS 问题
+- 数据持久化：Postgres/Redis/Qdrant/MinIO 各自具名卷；`backend-data` 卷保存
+  runtime_config 与 JWT 密钥（勿删，否则已签发登录态失效）
+- GHCR 包默认私有：仓库 Settings → Packages 可改 Public，或在服务器
+  `docker login ghcr.io` 后再 pull
+- `NEXT_PUBLIC_API_BASE` 已在云端构建时固定为 `/api/proxy`，无需配置
+
 ## 模型接入
 
 **方式一：管理后台（推荐）** —— 访问 `http://localhost:3000/admin`（或点击工作台右上角 ⚙️ 管理后台），登录后在面板中在线配置以下四类模型，保存即时热生效、无需重启，配置持久化于 `backend/data/runtime_config.json`：
