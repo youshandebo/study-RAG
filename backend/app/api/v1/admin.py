@@ -336,12 +336,35 @@ async def admin_set_canonical(chunk_id: str, body: CanonicalBody, _: str = Depen
     }
 
 
+# ---------------------------------------------------------------- users -----
+class TierBody(BaseModel):
+    tier: str
+
+
+@router.get("/admin/users")
+async def admin_list_users(_: str = Depends(require_admin)):
+    return await repo.list_users()
+
+
+@router.post("/admin/users/{user_id}/tier")
+async def admin_set_user_tier(user_id: str, body: TierBody, _: str = Depends(require_admin)):
+    """开通/变更会员档位（付款对接前的手工开通通道）。"""
+    from app.core.membership import plans
+
+    if body.tier not in plans():
+        raise HTTPException(status_code=400, detail=f"未知档位：{body.tier}")
+    ok = await repo.set_user_tier(user_id, body.tier)
+    if not ok:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return {"ok": True, "tier": body.tier}
+
+
 # -------------------------------------------------------------------- stats --
 @router.get("/admin/stats")
 async def admin_stats(_: str = Depends(require_admin)):
     retriever = await get_retriever_safe()
     chunks = await retriever.all_chunks() if retriever else []
-    assets_total = sum(len(v) for v in repo._memory_assets.values())
+    assets_total = await repo.count_assets()
     custom = runtime_config.get_runtime_config()
     return {
         "sessions": len(await repo.list_sessions()),

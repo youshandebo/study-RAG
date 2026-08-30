@@ -158,9 +158,54 @@ async def retry_async(coro_factory, *, attempts: int = 3, base_delay: float = 0.
 
 
 # ------------------------------------------------------------------ JWT -----
-_SECRET = os.getenv("ADMIN_JWT_SECRET", "") or os.getenv("ADMIN_PASSWORD", "") or "studay-rag-dev-secret"
-
 _logger = logging.getLogger("app.security")
+
+_PBKDF2_ITERATIONS = 120_000
+
+
+def hash_password(password: str, salt: str | None = None) -> str:
+    """用户口令哈希：PBKDF2-HMAC-SHA256（120k 轮），格式 salt$hash。"""
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), _PBKDF2_ITERATIONS).hex()
+    return f"{salt}${digest}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt, digest = stored.split("$", 1)
+        expect = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), _PBKDF2_ITERATIONS).hex()
+        return hmac.compare_digest(digest, expect)
+    except (ValueError, AttributeError):
+        return False
+
+
+def _load_or_create_secret() -> str:
+    """JWT 签名密钥：环境变量 > data/jwt_secret 持久化随机值。
+
+    绝不回落硬编码常量——公开常量等于任何人可自签 admin JWT。
+    首次启动生成 64 字节随机数落盘，重启复用（已签发 token 跨进程有效）。
+    """
+    env = os.getenv("ADMIN_JWT_SECRET", "").strip()
+    if env:
+        return env
+    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data")
+    secret_path = os.path.join(data_dir, "jwt_secret")
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        if os.path.exists(secret_path):
+            existing = open(secret_path, encoding="utf-8").read().strip()
+            if existing:
+                return existing
+        fresh = secrets.token_hex(32)
+        with open(secret_path, "w", encoding="utf-8") as f:
+            f.write(fresh)
+        return fresh
+    except OSError as exc:
+        _logger.warning("JWT 密钥无法持久化，使用进程内随机值: %s", exc)
+        return secrets.token_hex(32)
+
+
+_SECRET = _load_or_create_secret()
 
 
 def jwt_sign(payload: dict, ttl_seconds: int) -> str:

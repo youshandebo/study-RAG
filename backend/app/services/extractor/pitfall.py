@@ -15,9 +15,14 @@ _DEFAULT_PITFALLS = [
 
 
 def extract_from_chunks(chunks: list[Chunk]) -> list[str]:
+    """提取老师强调的扣分点。
+
+    每个切片只扫描前 2000 字：_TRIGGER 的 [^。！？]* 结构在无句读长文本上
+    存在 O(n²) 灾难性回溯（ReDoS），限幅后单次扫描代价可控。
+    """
     pitfalls: list[str] = []
     for c in chunks:
-        for m in _TRIGGER.finditer(c.text):
+        for m in _TRIGGER.finditer(c.text[:2000]):
             sentence = m.group(0).strip()
             if len(sentence) >= 8 and sentence not in pitfalls:
                 pitfalls.append(sentence)

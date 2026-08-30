@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api.v1 import admin, chat_stream, compare, evidence, exam, ingest, sessions
+from app.api.v1 import admin, auth, chat_stream, compare, evidence, exam, ingest, sessions
 from app.core.config import get_settings
 from app.db.minio_client import BOARDS_DIR, ensure_static_dirs
 
@@ -33,6 +33,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 文字笔记走 multipart 表单字段，放宽默认 1MB 上限（text 入库另有 1MB 硬限）
+from starlette.formparsers import MultiPartParser
+
+MultiPartParser.max_field_size = 8 * 1024 * 1024
+
 ensure_static_dirs()
 app.mount("/static", StaticFiles(directory=str(BOARDS_DIR.parent)), name="static")
 
@@ -44,6 +49,7 @@ app.include_router(ingest.router, prefix=prefix, tags=["ingest"])
 app.include_router(evidence.router, prefix=prefix, tags=["evidence"])
 app.include_router(admin.router, prefix=prefix, tags=["admin"])
 app.include_router(exam.router, prefix=prefix, tags=["exam"])
+app.include_router(auth.router, prefix=prefix, tags=["auth"])
 
 
 @app.get("/api/v1/health")

@@ -10,9 +10,11 @@ import pathlib
 import re
 import uuid
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 
 import app.db.relational as repo
+from app.api.v1.auth import AuthUser, current_user_optional
+from app.core.membership import plan_for, storage_limit_bytes
 from app.db.minio_client import put_object
 from app.services.asr.hotwords import correct
 from app.services.asr.transcriber import Transcriber
@@ -89,6 +91,10 @@ def _split_text_chunks(text: str) -> list[str]:
         sentences = re.split(r"(?<=[。！？!?；;])", para)
         buf = ""
         for sent in sentences:
+            # 硬切：单个无句读单元本身超限时按长度切片，防止单切片膨胀到百 KB 级
+            while len(sent) > TEXT_CHUNK_TARGET * 2:
+                units.append(sent[:TEXT_CHUNK_TARGET])
+                sent = sent[TEXT_CHUNK_TARGET:]
             if buf and len(buf) + len(sent) > TEXT_CHUNK_TARGET:
                 units.append(buf)
                 buf = sent.lstrip()
@@ -108,6 +114,7 @@ def _split_text_chunks(text: str) -> list[str]:
 
 @router.post("/ingest")
 async def ingest(
+    user: AuthUser = Depends(current_user_optional),
     session_id: str = Form(...),
     media_type: str = Form("audio"),  # audio | board | text
     file: UploadFile | None = File(None),
@@ -124,7 +131,24 @@ async def ingest(
     - text   直接提交文字素材（text_content 表单字段，或 .txt/.md 文件）→ 切片入库
     """
     raw = await file.read() if file is not None else b""
+    if not user.anonymous:
+        owner = await repo.get_session_owner(session_id)
+        if owner and owner != user.id:
+            raise HTTPException(status_code=403, detail="无权向该会话入库素材")
     if file is not None:
+        plan = plan_for(user.tier)
+        # 会员配额：单文件上限取「档位上限 ∨ 全局硬限」较小者；总存储超配额拒绝
+        single_cap = min(int(plan["max_upload_mb"]), LIMITS.get("image" if media_type == "board" else media_type, 20 * 1024 * 1024)) * 1024 * 1024
+        if len(raw) > single_cap:
+            raise HTTPException(status_code=413, detail=f"{user.tier} 档单文件上限 {single_cap // (1024*1024)}MB，升级会员可提升")
+        if not user.anonymous:
+            used = await repo.storage_used_bytes(user.id)
+            limit = storage_limit_bytes(user.tier)
+            if used + len(raw) > limit:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"存储空间已满（{used // (1024*1024)}MB/{limit // (1024*1024)}MB），升级会员可获得更大空间",
+                )
         _validate_upload(raw, media_type, file.filename or "")
 
     # ---- 双轨压缩时序 ----
@@ -170,13 +194,9 @@ async def ingest(
             try:
                 note_text = raw.decode("utf-8")
             except UnicodeDecodeError:
-                from fastapi import HTTPException
-
                 raise HTTPException(status_code=400, detail="文字文件需为 UTF-8 编码的 txt/md") from None
         note_text = note_text.strip()
         if not note_text:
-            from fastapi import HTTPException
-
             raise HTTPException(status_code=400, detail="文字内容为空")
 
         url = await put_object("boards", filename or f"note-{uuid.uuid4().hex[:6]}.txt",
@@ -190,6 +210,8 @@ async def ingest(
         asset = await repo.add_asset(
             session_id,
             {
+                "owner": None if user.anonymous else user.id,
+                "size_bytes": len(note_text.encode()),
                 "kind": "text",
                 "uri": url,
                 "filename": filename or f"{note_text[:12]}…",
@@ -254,6 +276,8 @@ async def ingest(
     asset = await repo.add_asset(
         session_id,
         {
+            "owner": None if user.anonymous else user.id,
+            "size_bytes": len(raw),
             "kind": media_type,
             "uri": url,
             "filename": file.filename or "",

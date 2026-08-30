@@ -38,6 +38,8 @@ def _blank() -> dict:
         "media": {"image_quality": "", "image_max_edge": "", "audio_bitrate": "", "audio_max_mb": ""},
         # 检索调权：预设档位 + 可选的原始系数覆盖（留空=跟随预设）
         "retrieval": {"profile": "", "vector": "", "lexical": "", "bm25": "", "canonical_bonus": "", "time_alpha": ""},
+        # 会员档位：按 tier 覆盖 storage_mb/model/chat_per_min/max_upload_mb
+        "plans": {},
     }
 
 
@@ -63,6 +65,13 @@ def _normalize(raw: dict | None) -> dict:
             val = media_src.get(key)
             if val is not None and str(val).strip() != "":
                 cfg["media"][key] = str(int(val))
+    plans_src = raw.get("plans")
+    if isinstance(plans_src, dict):
+        for tier, patch in plans_src.items():
+            if isinstance(patch, dict):
+                cfg["plans"].setdefault(str(tier), {}).update(
+                    {str(k): v for k, v in patch.items() if v not in (None, "")}
+                )
     retrieval_src = raw.get("retrieval")
     if isinstance(retrieval_src, dict):
         cfg["retrieval"]["profile"] = str(retrieval_src.get("profile") or "").strip()
@@ -104,6 +113,8 @@ def save_runtime_config(patch: dict) -> dict:
     global _cache, _cache_mtime
     current = _load_from_disk()
     patch = patch if isinstance(patch, dict) else {}
+    if isinstance(patch.get("plans"), dict):
+        current["plans"] = _normalize({"plans": patch["plans"]}).get("plans", {})
     for section in ("llm", "embedding", "asr", "vlm", "media", "retrieval"):
         src = patch.get(section)
         if not isinstance(src, dict):
@@ -189,6 +200,9 @@ def effective(kind: str):
     rc = get_runtime_config()
     settings = get_settings()
 
+    if kind == "plans":
+        return rc.get("plans") or {}
+
     if kind == "retrieval":
         # 预设档位 + 高级覆盖：未覆盖字段回落预设值
         presets = {
@@ -273,6 +287,7 @@ def masked_view() -> dict:
         "admin_password_set": bool(rc.get("admin_password_hash") or os.getenv("ADMIN_PASSWORD", "").strip()),
         "media": effective("media"),
         "retrieval": effective("retrieval"),
+        "plans": rc.get("plans") or {},
     }
     for kind in ("llm", "embedding", "asr", "vlm"):
         eff = effective(kind)

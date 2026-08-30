@@ -79,16 +79,15 @@ async def evidence_audio_slice(chunk_id: str, start_ms: int = 0, end_ms: int = 0
     if not audio_id or audio_id.startswith(("lec-", "board-only")):
         raise HTTPException(status_code=404, detail="演示切片无真实音频文件，请先上传课堂录音后重试")
 
-    # 在已入库资产里按 audio_id 反查文件（audio_id 与上传资产一一对应由 ingest 生成）
+    # 在已入库资产里反查音频文件（走仓库 API，PG/内存双模式一致）
     import app.db.relational as repo
 
     src_path: pathlib.Path | None = None
-    for assets in repo._memory_assets.values():
-        for asset in assets:
-            if asset.get("kind") == "audio" and str(asset.get("uri", "")).startswith("/static/audio/"):
-                candidate = AUDIO_DIR / pathlib.Path(asset["uri"]).name
-                if candidate.exists():
-                    src_path = candidate  # 同一音频组的任一载体文件都含完整时间轴
+    for asset in await repo.list_all_assets():
+        if asset.get("kind") == "audio" and str(asset.get("uri", "")).startswith("/static/audio/"):
+            candidate = AUDIO_DIR / pathlib.Path(asset["uri"]).name
+            if candidate.exists():
+                src_path = candidate  # 同一音频组的任一载体文件都含完整时间轴
     if src_path is None:
         raise HTTPException(status_code=404, detail="音频文件不存在或已被清理")
 

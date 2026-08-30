@@ -16,11 +16,14 @@ import hashlib
 import json
 import time
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 import app.db.relational as repo
+from app.api.v1.auth import AuthUser, current_user_optional
+from app.core.membership import plan_for
 from app.core.security import SlidingWindowLimiter
+from app.services.llm.provider import get_tier_provider
 from app.models.domain import (
     ChatRequest,
     ComparePayload,
@@ -50,8 +53,16 @@ from app.services.tokens import estimate_tokens
 
 router = APIRouter()
 
-# 流式对话限流：单 IP+会话 每分钟最多 15 次（SSE 单次连接即计数一次）
-_chat_limiter = SlidingWindowLimiter(max_events=15, window_seconds=60)
+# 流式对话限流：按会员档位分配速率（SSE 单次连接计数一次），key=IP+会话
+_tier_limiters: dict[str, SlidingWindowLimiter] = {}
+
+
+def _limiter_for(tier: str) -> SlidingWindowLimiter:
+    if tier not in _tier_limiters:
+        _tier_limiters[tier] = SlidingWindowLimiter(
+            max_events=int(plan_for(tier).get("chat_per_min", 10)), window_seconds=60
+        )
+    return _tier_limiters[tier]
 
 SOLVE_SYSTEM = (
     "你是一位大学课堂的专属助教。请严格依据提供的课堂切片（老师原话与板书）所体现的解法和口吻来解题，"
@@ -147,19 +158,30 @@ async def _build_usage(session_id: str, system_text: str, retrieval_text: str, o
 
 
 @router.post("/chat/stream")
-async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
+async def chat_stream(req: ChatRequest, request: Request, user: AuthUser = Depends(current_user_optional)) -> StreamingResponse:
     ip = request.client.host if request.client else "unknown"
-    if not _chat_limiter.check(f"{ip}:{req.session_id}"):
-        retry = _chat_limiter.retry_after(f"{ip}:{req.session_id}")
+    # 会员会话隔离：注册用户只能在自己绑定的会话里提问
+    if not user.anonymous:
+        owner = await repo.get_session_owner(req.session_id)
+        if owner and owner != user.id:
+            raise HTTPException(status_code=403, detail="无权在该会话中提问")
+    # 档位限速
+    limiter = _limiter_for(user.tier)
+    if not limiter.check(f"{ip}:{req.session_id}"):
+        retry = limiter.retry_after(f"{ip}:{req.session_id}")
         raise HTTPException(
             status_code=429,
-            detail=f"提问过于频繁（限 15 次/分钟），请 {retry} 秒后再试",
+            detail=f"提问过于频繁（{user.tier} 档限 {limiter.max_events} 次/分钟），请 {retry} 秒后再试",
             headers={"Retry-After": str(retry)},
         )
-    return StreamingResponse(_stream(req), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    # 档位模型：plan.model 非空时用主通道凭证换档位模型名（服务端注入，客户端不可选）
+    tier_model = str(plan_for(user.tier).get("model") or "")
+    return StreamingResponse(
+        _stream(req, tier_model), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
+    )
 
 
-async def _stream(req: ChatRequest):
+async def _stream(req: ChatRequest, tier_model: str = ""):
     t0 = time.time()
     u_sys = u_ret = u_out = ""
     intent = classify(req.text, has_image=bool(req.image_b64), force=req.force_intent)
@@ -201,7 +223,7 @@ async def _stream(req: ChatRequest):
 
         context = "\n---\n".join(f"[{c.start}-{c.end}] {c.text}" for c in chunks)
         u_sys, u_ret = SOLVE_SYSTEM, context
-        provider = get_provider()
+        provider = get_tier_provider(tier_model)
         messages = [
             {"role": "system", "content": SOLVE_SYSTEM},
             {"role": "user", "content": f"{query}\n\n【课堂切片上下文】\n{context}"},
@@ -258,11 +280,18 @@ async def _stream(req: ChatRequest):
             time_alpha_override=req.time_alpha_override,
             canonical_bonus_override=req.canonical_bonus_override,
         )
+        # 过滤在 chunk 集合上做；refs 与 chunks 按 audio_snippet_url 中的 chunk_id
+        # 一一对应，避免"取前 N 个"导致前端证据与上下文错位
         relevant = [c for c in chunks if _is_relevant(query, c)] or chunks
         if relevant:
-            yield _sse("evidence", {"list": [r.model_dump(mode="json") for r in refs[: len(relevant)]]})
+            relevant_ids = {c.id for c in relevant}
+            relevant_refs = [
+                r for r in refs
+                if r.audio_snippet_url.rsplit("/", 1)[-1] in relevant_ids
+            ] or refs[:1]
+            yield _sse("evidence", {"list": [r.model_dump(mode="json") for r in relevant_refs]})
 
-        provider = get_provider()
+        provider = get_tier_provider(tier_model)
         full = ""
         user_content = req.text or "你好"
         ret_ctx = ""

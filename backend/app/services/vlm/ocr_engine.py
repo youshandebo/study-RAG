@@ -34,40 +34,41 @@ class OCREngine:
         ]
 
         async def _call() -> str:
-            if cfg.get("provider") == "anthropic":
-                resp = await httpx.AsyncClient(timeout=120).post(
-                    f"{cfg['base_url'].rstrip('/')}/v1/messages",
-                    headers={"x-api-key": cfg["api_key"], "anthropic-version": "2023-06-01"},
-                    json={
-                        "model": cfg["model"],
-                        "max_tokens": 2048,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "image",
-                                        "source": {
-                                            "type": "base64",
-                                            "media_type": "image/png",
-                                            "data": image_b64,
+            async with httpx.AsyncClient(timeout=120) as client:
+                if cfg.get("provider") == "anthropic":
+                    resp = await client.post(
+                        f"{cfg['base_url'].rstrip('/')}/v1/messages",
+                        headers={"x-api-key": cfg["api_key"], "anthropic-version": "2023-06-01"},
+                        json={
+                            "model": cfg["model"],
+                            "max_tokens": 2048,
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": "image/png",
+                                                "data": image_b64,
+                                            },
                                         },
-                                    },
-                                    {"type": "text", "text": self.PROMPT},
-                                ],
-                            }
-                        ],
-                    },
-                )
-            else:
-                resp = await httpx.AsyncClient(timeout=120).post(
-                    f"{cfg['base_url'].rstrip('/')}/chat/completions",
-                    headers={"Authorization": f"Bearer {cfg['api_key']}"},
-                    json={
-                        "model": cfg["model"],
-                        "messages": [{"role": "user", "content": content}],
-                    },
-                )
+                                        {"type": "text", "text": self.PROMPT},
+                                    ],
+                                }
+                            ],
+                        },
+                    )
+                else:
+                    resp = await client.post(
+                        f"{cfg['base_url'].rstrip('/')}/chat/completions",
+                        headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                        json={
+                            "model": cfg["model"],
+                            "messages": [{"role": "user", "content": content}],
+                        },
+                    )
             resp.raise_for_status()
             data = resp.json()
             if "choices" in data:

@@ -4,7 +4,8 @@
 
 /** 统一主工作台：左会话栏 + 中全能对话画布 + 右证据抽屉 */
 import { useEffect, useRef, useState } from 'react';
-import { BookMarked, BookOpen, ChevronRight, Settings } from 'lucide-react';
+import { BookMarked, BookOpen, ChevronRight, LogIn, LogOut, Settings, User } from 'lucide-react';
+import { fetchMe, getSassToken, setSassToken, setSassUser } from '@/lib/api';
 import SessionSidebar from '@/components/chat/SessionSidebar';
 import UnifiedMessageList from '@/components/chat/UnifiedMessageList';
 import OmniChatInput from '@/components/chat/OmniChatInput';
@@ -34,7 +35,24 @@ export default function WorkspacePage() {
   const openDrawer = useEvidenceStore((s) => s.openDrawer);
   const drawerOpen = useEvidenceStore((s) => s.open);
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
+  const [me, setMe] = useState<{ anonymous: boolean; email?: string; tier: string; plan: { label?: string } } | null>(null);
   const hydratedFor = useRef<Set<string>>(new Set());
+
+  // 当前会员身份：有 token 时拉 /auth/me（失效自动清本地态）
+  useEffect(() => {
+    if (!getSassToken()) {
+      setMe(null);
+      return;
+    }
+    void fetchMe().then((m) => {
+      if (m && !m.anonymous) setMe(m);
+      else {
+        setSassToken(null);
+        setSassUser(null);
+        setMe(null);
+      }
+    });
+  }, []);
 
   // 启动初始化：加载/创建会话
   useEffect(() => {
@@ -106,6 +124,36 @@ export default function WorkspacePage() {
               )}
               {backendOk === null ? '检查后端…' : backendOk ? '引擎在线' : '后端未连接'}
             </span>
+            {/* 会员身份：匿名=登录入口；已登录=档位徽标+退出 */}
+            {me && !me.anonymous ? (
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-chalk-soft px-2.5 py-1 text-[11.5px] text-chalk">
+                <User size={11} strokeWidth={1.5} aria-hidden />
+                <span className="max-w-[120px] truncate">{me.email}</span>
+                <span className="rounded bg-chalk px-1.5 text-[10px] font-bold uppercase text-white">
+                  {me.tier === 'max' ? 'MAX' : me.tier === 'pro' ? 'PRO' : 'FREE'}
+                </span>
+                <button
+                  onClick={() => {
+                    setSassToken(null);
+                    setSassUser(null);
+                    setMe(null);
+                  }}
+                  aria-label="退出登录"
+                  title="退出登录"
+                  className="rounded p-0.5 transition hover:bg-white/40"
+                >
+                  <LogOut size={11} strokeWidth={1.5} />
+                </button>
+              </span>
+            ) : (
+              <a
+                href="/login"
+                className="inline-flex items-center gap-1.5 rounded-full bg-blue-600 px-3 py-1 text-[11.5px] font-semibold text-white transition hover:bg-blue-500"
+              >
+                <LogIn size={11} strokeWidth={1.5} aria-hidden />
+                登录 / 注册
+              </a>
+            )}
             {/* 检索场景三档轮换：α 默认值随场景走（0.30/0.20/0.05），均可用输入卡的时间偏好滑杆覆盖 */}
             <button
               onClick={cycleMode}

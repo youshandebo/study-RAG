@@ -24,6 +24,7 @@ _pg_broken = False             # 初始化失败熔断：本进程内不再反�
 _memory_sessions: dict[str, dict[str, Any]] = {}
 _memory_messages: dict[str, list[dict[str, Any]]] = {}
 _memory_assets: dict[str, list[dict[str, Any]]] = {}
+_memory_users: dict[str, dict[str, Any]] = {}
 
 
 def _use_postgres() -> bool:
@@ -77,12 +78,13 @@ async def _pg_session():
 
 
 # ---------------------------------------------------------------- sessions --
-async def create_session(title: str = "新对话") -> dict[str, Any]:
+async def create_session(title: str = "新对话", owner: str | None = None) -> dict[str, Any]:
     sid = uuid.uuid4().hex[:12]
     record = {
         "id": sid,
         "title": title or "新对话",
         "created_at": int(time.time() * 1000),
+        "owner": owner,
         "subject": None,
         "course_id": None,
         "chapter": None,
@@ -96,29 +98,37 @@ async def create_session(title: str = "新对话") -> dict[str, Any]:
             s.add(SessionRow(**record))
             await s.commit()
         return {k: v for k, v in record.items() if v is not None or k in ("id", "title", "created_at")}
+    record["owner"] = owner
     _memory_sessions[sid] = record
     _memory_messages[sid] = []
     _memory_assets[sid] = []
-    return {k: v for k, v in record.items() if k in ("id", "title", "created_at")}
+    return {k: v for k, v in record.items() if k in ("id", "title", "created_at", "owner")}
 
 
-async def list_sessions() -> list[dict[str, Any]]:
+async def list_sessions(owner: str | None = None, require_owner: bool = False) -> list[dict[str, Any]]:
     if _use_postgres() and await _ensure_tables():
         from sqlalchemy import select
 
         from app.db.pg_models import SessionRow
 
+        stmt = select(SessionRow).order_by(SessionRow.created_at.desc())
+        if require_owner and owner:
+            stmt = stmt.where(SessionRow.owner == owner)
         async with await _pg_session() as s:
-            rows = (await s.execute(select(SessionRow).order_by(SessionRow.created_at.desc()))).scalars().all()
+            rows = (await s.execute(stmt)).scalars().all()
         return [
             {
                 "id": r.id, "title": r.title, "created_at": r.created_at,
                 "subject": r.subject, "course_id": r.course_id, "chapter": r.chapter,
                 "retrieval_mode": r.retrieval_mode, "time_alpha_override": r.time_alpha_override,
+                "owner": r.owner,
             }
             for r in rows
         ]
-    return sorted(_memory_sessions.values(), key=lambda r: r["created_at"], reverse=True)
+    result = sorted(_memory_sessions.values(), key=lambda r: r["created_at"], reverse=True)
+    if require_owner and owner:
+        result = [r for r in result if r.get("owner") == owner]
+    return result
 
 
 async def rename_session(session_id: str, title: str) -> None:
@@ -149,6 +159,18 @@ async def delete_session(session_id: str) -> None:
     _memory_sessions.pop(session_id, None)
     _memory_messages.pop(session_id, None)
     _memory_assets.pop(session_id, None)
+
+
+async def get_session_owner(session_id: str) -> str | None:
+    if _use_postgres() and await _ensure_tables():
+        from sqlalchemy import select
+
+        from app.db.pg_models import SessionRow
+
+        async with await _pg_session() as s:
+            row = (await s.execute(select(SessionRow.owner).where(SessionRow.id == session_id))).scalar_one_or_none()
+        return row
+    return (_memory_sessions.get(session_id) or {}).get("owner")
 
 
 async def update_session_meta(session_id: str, patch: dict[str, Any]) -> None:
@@ -237,6 +259,143 @@ async def list_assets(session_id: str) -> list[dict[str, Any]]:
             ).scalars().all()
         return [json.loads(r.payload) for r in rows]
     return list(_memory_assets.get(session_id, []))
+
+
+async def count_assets() -> int:
+    """素材总数（管理后台统计；PG/内存双实现）。"""
+    if _use_postgres() and await _ensure_tables():
+        from sqlalchemy import func, select
+
+        from app.db.pg_models import AssetRow
+
+        async with await _pg_session() as s:
+            total = (await s.execute(select(func.count()).select_from(AssetRow))).scalar()
+        return int(total or 0)
+    return sum(len(v) for v in _memory_assets.values())
+
+
+async def list_all_assets() -> list[dict[str, Any]]:
+    """全量资产元数据（音频切片反查用；量级为课堂素材，千级以内可接受）。"""
+    if _use_postgres() and await _ensure_tables():
+        from sqlalchemy import select
+
+        from app.db.pg_models import AssetRow
+
+        async with await _pg_session() as s:
+            rows = s.execute(select(AssetRow)).scalars().all()
+        return [json.loads(r.payload) for r in rows]
+    return [a for v in _memory_assets.values() for a in v]
+
+
+# ------------------------------------------------------------------ users --
+async def create_user(email: str, password_hash: str, tier: str = "free") -> dict[str, Any]:
+    user = {
+        "id": uuid.uuid4().hex[:12],
+        "email": email.lower(),
+        "password_hash": password_hash,
+        "tier": tier,
+        "created_at": int(time.time() * 1000),
+    }
+    if _use_postgres() and await _ensure_tables():
+        from app.db.pg_models import UserRow
+
+        async with await _pg_session() as s:
+            s.add(UserRow(**user))
+            await s.commit()
+        return {k: v for k, v in user.items() if k != "password_hash"}
+    _memory_users[user["id"]] = user
+    return {k: v for k, v in user.items() if k != "password_hash"}
+
+
+async def get_user_by_email(email: str) -> dict[str, Any] | None:
+    if _use_postgres() and await _ensure_tables():
+        from sqlalchemy import select
+
+        from app.db.pg_models import UserRow
+
+        async with await _pg_session() as s:
+            row = (await s.execute(select(UserRow).where(UserRow.email == email.lower()))).scalar_one_or_none()
+        if row is None:
+            return None
+        return {"id": row.id, "email": row.email, "password_hash": row.password_hash,
+                "tier": row.tier, "created_at": row.created_at}
+    for u in _memory_users.values():
+        if u["email"] == email.lower():
+            return u
+    return None
+
+
+async def get_user_by_id(user_id: str) -> dict[str, Any] | None:
+    if _use_postgres() and await _ensure_tables():
+        from sqlalchemy import select
+
+        from app.db.pg_models import UserRow
+
+        async with await _pg_session() as s:
+            row = s.get(UserRow, user_id)
+        if row is None:
+            return None
+        return {"id": row.id, "email": row.email, "tier": row.tier, "created_at": row.created_at}
+    u = _memory_users.get(user_id)
+    return {k: v for k, v in u.items() if k != "password_hash"} if u else None
+
+
+async def count_users() -> int:
+    if _use_postgres() and await _ensure_tables():
+        from sqlalchemy import func, select
+
+        from app.db.pg_models import UserRow
+
+        async with await _pg_session() as s:
+            total = (await s.execute(select(func.count()).select_from(UserRow))).scalar()
+        return int(total or 0)
+    return len(_memory_users)
+
+
+async def list_users() -> list[dict[str, Any]]:
+    if _use_postgres() and await _ensure_tables():
+        from sqlalchemy import select
+
+        from app.db.pg_models import UserRow
+
+        async with await _pg_session() as s:
+            rows = (await s.execute(select(UserRow).order_by(UserRow.created_at.desc()))).scalars().all()
+        return [{"id": r.id, "email": r.email, "tier": r.tier, "created_at": r.created_at} for r in rows]
+    return [
+        {k: v for k, v in u.items() if k != "password_hash"}
+        for u in sorted(_memory_users.values(), key=lambda x: x["created_at"], reverse=True)
+    ]
+
+
+async def set_user_tier(user_id: str, tier: str) -> bool:
+    if _use_postgres() and await _ensure_tables():
+        from sqlalchemy import update
+
+        from app.db.pg_models import UserRow
+
+        async with await _pg_session() as s:
+            result = await s.execute(update(UserRow).where(UserRow.id == user_id).values(tier=tier))
+            await s.commit()
+        return bool(result.rowcount)
+    if user_id in _memory_users:
+        _memory_users[user_id]["tier"] = tier
+        return True
+    return False
+
+
+async def storage_used_bytes(owner: str) -> int:
+    """用户素材存储占用（AssetRow.size_bytes 求和）。"""
+    if _use_postgres() and await _ensure_tables():
+        from sqlalchemy import func, select
+
+        from app.db.pg_models import AssetRow
+
+        async with await _pg_session() as s:
+            total = (
+                await s.execute(select(func.coalesce(func.sum(AssetRow.size_bytes), 0)).where(AssetRow.owner == owner))
+            ).scalar()
+        return int(total or 0)
+    return sum(int(a.get("size_bytes") or 0) for v in _memory_assets.values() for a in v if a.get("owner") == owner)
 
 
 # ------------------------------------------------------------- tutor state --

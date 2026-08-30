@@ -166,6 +166,19 @@ def available_model_keys(settings: Settings | None = None) -> list[str]:
     return list(_build_from_settings(settings).keys())
 
 
+def get_tier_provider(model_name: str | None) -> BaseLLMProvider:
+    """会员档位模型：主通道凭证 + 档位指定模型名；无主通道回落演示引擎。"""
+    from app.core import runtime_config
+
+    main = runtime_config.effective("llm")
+    if not (main["api_key"] and main["base_url"]):
+        return MockProvider()
+    model = (model_name or "").strip() or main["model"]
+    if main.get("provider") == "anthropic":
+        return AnthropicProvider(main["api_key"], main["base_url"], model)
+    return OpenAICompatibleProvider(f"tier-{model}", main["api_key"], main["base_url"], model)
+
+
 def get_provider(model_key: str | None = None) -> BaseLLMProvider:
     """按 key 取真实 Provider；未指定时优先主模型(面板配置>环境变量)，缺失回落 Mock 演示引擎。"""
     settings = get_settings()

@@ -21,6 +21,17 @@ class SessionRow(Base):
     chapter: Mapped[str | None] = mapped_column(String(200), nullable=True)
     retrieval_mode: Mapped[str | None] = mapped_column(String(20), nullable=True)
     time_alpha_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    owner: Mapped[str | None] = mapped_column(String(32), index=True, nullable=True)
+
+
+class UserRow(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    email: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(200))
+    tier: Mapped[str] = mapped_column(String(20), default="free", index=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, index=True)
 
 
 class MessageRow(Base):
@@ -39,3 +50,5 @@ class AssetRow(Base):
     session_id: Mapped[str] = mapped_column(String(32), index=True)
     created_at: Mapped[int] = mapped_column(BigInteger, index=True)
     payload: Mapped[str] = mapped_column(Text)  # 资产元数据 JSON
+    owner: Mapped[str | None] = mapped_column(String(32), index=True, nullable=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)

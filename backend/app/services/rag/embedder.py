@@ -46,10 +46,9 @@ def _tokenize(text: str) -> list[str]:
 async def embed(text: str) -> list[float]:
     cfg = runtime_config.effective("embedding")
     if cfg["api_key"] and cfg["base_url"] and cfg["model"]:
+        import httpx
 
         async def _call() -> list[float]:
-            import httpx
-
             async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(
                     f"{cfg['base_url'].rstrip('/')}/embeddings",
@@ -62,9 +61,13 @@ async def embed(text: str) -> list[float]:
         from app.core.security import retry_async
 
         try:
-            return await retry_async(_call, attempts=2, exceptions=(httpx.HTTPError,))  # noqa: F821
-        except Exception:
-            pass
+            return await retry_async(_call, attempts=2, exceptions=(httpx.HTTPError,))
+        except Exception as exc:
+            import logging
+
+            logging.getLogger("app.rag.embedder").warning(
+                "embedding 接口调用失败，降级哈希向量（检索质量下降）: %s", exc
+            )
     return _hash_embed(text)
 
 

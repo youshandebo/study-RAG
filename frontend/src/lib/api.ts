@@ -168,10 +168,10 @@ export async function streamChat(
   signal?: AbortSignal,
 ): Promise<void> {
   try {
-    const resp = await fetch(`${API_BASE}/chat/stream`, {
+    const resp = await fetch(`${API_BASE}/chat/stream`, authInit({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+        body: JSON.stringify({
         session_id: body.sessionId,
         text: body.text ?? '',
         image_b64: body.imageB64 ?? null,
@@ -182,7 +182,7 @@ export async function streamChat(
         canonical_bonus_override: body.canonicalBonusOverride ?? null,
       }),
       signal,
-    });
+    }));
     if (!resp.ok) throw new Error(`后端响应 ${resp.status}`);
     await consumeSSE(resp, handlers);
   } catch (err) {
@@ -213,13 +213,50 @@ export async function streamCompare(
 }
 
 // ---------------------------------------------------------------- sessions --
+export async function register(
+  email: string, password: string,
+): Promise<{ token: string; user: { email: string; tier: string } }> {
+  const resp = await fetch(`${API_BASE}/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.detail ?? '注册失败');
+  setSassToken(data.token);
+  setSassUser(data.user);
+  return data;
+}
+
+export async function login(
+  email: string, password: string,
+): Promise<{ token: string; user: { email: string; tier: string } }> {
+  const resp = await fetch(`${API_BASE}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.detail ?? '登录失败');
+  setSassToken(data.token);
+  setSassUser(data.user);
+  return data;
+}
+
+export async function fetchMe(): Promise<{ anonymous: boolean; email?: string; tier: string; plan: { storage_mb: number; chat_per_min: number; label?: string } } | null> {
+  const resp = await fetch(`${API_BASE}/auth/me`, authInit());
+  if (!resp.ok) return null;
+  return resp.json();
+}
 export async function fetchSessions() {
-  const resp = await fetch(`${API_BASE}/sessions`);
+  const resp = await fetch(`${API_BASE}/sessions`, authInit());
+  handleAuthError(resp.status);
   return resp.json();
 }
 
 export async function fetchMessages(sessionId: string) {
-  const resp = await fetch(`${API_BASE}/sessions/${sessionId}/messages`);
+  const resp = await fetch(`${API_BASE}/sessions/${sessionId}/messages`, authInit());
+  handleAuthError(resp.status);
   return resp.json();
 }
 
@@ -267,8 +304,9 @@ export async function uploadAsset(
   form.append('session_id', sessionId);
   form.append('media_type', mediaType);
   if (file) form.append('file', file);
-  if (textContent) form.append('text_content', textContent);
-  const resp = await fetch(`${API_BASE}/ingest`, { method: 'POST', body: form });
+  // 表单字段有 ~1MB 限制：大文本以 .txt 文件通道入库（后端 media_type=text 支持文件解码）
+  if (textContent && textContent.length <= 512 * 1024) form.append('text_content', textContent);
+  const resp = await fetch(`${API_BASE}/ingest`, authInit({ method: 'POST', body: form }));
   if (!resp.ok) {
     let detail = `${resp.status}`;
     try {
@@ -297,6 +335,50 @@ export async function uploadTextAsset(sessionId: string, text: string, title = '
 
 // ------------------------------------------------------------------ admin --
 const ADMIN_TOKEN_KEY = 'admin_token';
+const SAAS_TOKEN_KEY = 'saas_token';
+const SAAS_USER_KEY = 'saas_user';
+
+export function getSassToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return window.localStorage.getItem(SAAS_TOKEN_KEY);
+}
+
+export function setSassToken(token: string | null): void {
+  if (typeof window === 'undefined') return;
+  if (token) window.localStorage.setItem(SAAS_TOKEN_KEY, token);
+  else window.localStorage.removeItem(SAAS_TOKEN_KEY);
+}
+
+export function getSassUser(): { email: string; tier: string } | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(SAAS_USER_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setSassUser(user: { email: string; tier: string } | null): void {
+  if (typeof window === 'undefined') return;
+  if (user) window.localStorage.setItem(SAAS_USER_KEY, JSON.stringify(user));
+  else window.localStorage.removeItem(SAAS_USER_KEY);
+}
+
+/** 会员鉴权头；401 时清除本地态（过期/被登出） */
+function authInit(init?: RequestInit): RequestInit {
+  const token = getSassToken();
+  const headers = new Headers(init?.headers);
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  return { ...init, headers };
+}
+
+function handleAuthError(status: number): void {
+  if (status === 401 && getSassToken()) {
+    setSassToken(null);
+    setSassUser(null);
+  }
+}
 
 export function getAdminToken(): string | null {
   if (typeof window === 'undefined') return null;
