@@ -346,6 +346,14 @@ async def admin_list_users(_: str = Depends(require_admin)):
     return await repo.list_users()
 
 
+@router.get("/admin/plans")
+async def admin_plans(_: str = Depends(require_admin)):
+    """会员档位表（含 runtime_config 覆盖后的最终值，供后台展示配额口径）。"""
+    from app.core.membership import plans
+
+    return plans()
+
+
 @router.post("/admin/users/{user_id}/tier")
 async def admin_set_user_tier(user_id: str, body: TierBody, _: str = Depends(require_admin)):
     """开通/变更会员档位（付款对接前的手工开通通道）。"""

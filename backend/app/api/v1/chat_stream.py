@@ -82,6 +82,7 @@ async def _retrieve_evidence(
     retrieval_mode: str = "lecture",
     time_alpha_override: float | None = None,
     canonical_bonus_override: float | None = None,
+    chapter: str | None = None,
 ) -> tuple[list[EvidenceRef], list]:
     retriever = await get_retriever()
     chunks = await retriever.retrieve(
@@ -89,6 +90,7 @@ async def _retrieve_evidence(
         retrieval_mode=retrieval_mode, with_context_window=False,
         time_alpha_override=time_alpha_override,
         canonical_bonus_override=canonical_bonus_override,
+        chapter=chapter or None,
     )
     refs = [
         EvidenceRef(
@@ -218,6 +220,7 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
             query, course_id=req.course_id, retrieval_mode=req.retrieval_mode,
             time_alpha_override=req.time_alpha_override,
             canonical_bonus_override=req.canonical_bonus_override,
+            chapter=req.chapter,
         )
         yield _sse("evidence", {"list": [r.model_dump(mode="json") for r in refs]})
 
@@ -279,6 +282,7 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
             course_id=req.course_id, retrieval_mode=req.retrieval_mode,
             time_alpha_override=req.time_alpha_override,
             canonical_bonus_override=req.canonical_bonus_override,
+            chapter=req.chapter,
         )
         # 过滤在 chunk 集合上做；refs 与 chunks 按 audio_snippet_url 中的 chunk_id
         # 一一对应，避免"取前 N 个"导致前端证据与上下文错位

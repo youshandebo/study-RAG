@@ -364,7 +364,7 @@ async def get_user_by_id(user_id: str) -> dict[str, Any] | None:
         from app.db.pg_models import UserRow
 
         async with await _pg_session() as s:
-            row = s.get(UserRow, user_id)
+            row = await s.get(UserRow, user_id)  # AsyncSession.get 为协程，漏 await 会把协程当行对象用
         if row is None:
             return None
         return {"id": row.id, "email": row.email, "tier": row.tier, "created_at": row.created_at}

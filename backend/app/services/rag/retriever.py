@@ -150,10 +150,11 @@ class HybridRetriever:
         with_context_window: bool = True,
         time_alpha_override: float | None = None,
         canonical_bonus_override: float | None = None,
+        chapter: str | None = None,
     ) -> list[Chunk]:
         scored = await self.retrieve_scored(
             query, top_k, exam_point, course_id, retrieval_mode,
-            time_alpha_override, canonical_bonus_override,
+            time_alpha_override, canonical_bonus_override, chapter,
         )
         picked = (
             [c for _, c in scored]
@@ -210,6 +211,7 @@ class HybridRetriever:
         retrieval_mode: str = "lecture",
         time_alpha_override: float | None = None,
         canonical_bonus_override: float | None = None,
+        chapter: str | None = None,
     ) -> list[tuple[float, Chunk]]:
         """返回 (融合得分, 切片)：0.50 向量 + 0.20 词面 + 0.20 BM25 + 0.15 元数据。
 
@@ -282,6 +284,10 @@ class HybridRetriever:
         scored: list[tuple[float, Chunk]] = []
         for chunk in candidates:
             if exam_point and exam_point not in chunk.exam_point and exam_point != chunk.exam_point:
+                continue
+            # 章节软过滤：限定了 chapter 时，带章节元数据的切片需匹配才保留；
+            # 无章节元数据的切片（演示种子/存量数据）放行，避免把整个库过滤成空
+            if chapter and chunk.chapter and chapter not in chunk.chapter and chapter != chunk.chapter:
                 continue
             cid = chunk.id
             sim = sim_of.get(cid, 0.0)

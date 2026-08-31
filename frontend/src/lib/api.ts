@@ -160,6 +160,7 @@ export async function streamChat(
     imageB64?: string;
     forceIntent?: Intent;
     courseId?: string;
+    chapter?: string;
     retrievalMode?: 'lecture' | 'review_narrow' | 'review_broad' | 'review' | 'explore';
     timeAlphaOverride?: number | null;
     canonicalBonusOverride?: number | null;
@@ -177,6 +178,7 @@ export async function streamChat(
         image_b64: body.imageB64 ?? null,
         force_intent: body.forceIntent ?? null,
         course_id: body.courseId ?? '',
+        chapter: body.chapter ?? '',
         retrieval_mode: body.retrievalMode ?? 'lecture',
         time_alpha_override: body.timeAlphaOverride ?? null,
         canonical_bonus_override: body.canonicalBonusOverride ?? null,
@@ -543,4 +545,38 @@ export async function changeAdminPassword(oldPassword: string, newPassword: stri
 
 export async function fetchAdminStats(): Promise<AdminStats> {
   return adminFetch('/admin/stats');
+}
+
+// ------------------------------------------------------------------ users --
+export interface AdminUserInfo {
+  id: string;
+  email: string;
+  tier: string;
+  created_at: number;
+}
+
+export interface AdminPlanInfo {
+  label: string;
+  storage_mb: number;
+  model: string;
+  chat_per_min: number;
+  max_upload_mb: number;
+}
+
+/** 会员档位表（后台可配，读默认+覆盖合并后的最终值） */
+export async function fetchAdminPlans(): Promise<Record<string, AdminPlanInfo>> {
+  return adminFetch('/admin/plans');
+}
+
+export async function fetchAdminUsers(): Promise<AdminUserInfo[]> {
+  return adminFetch('/admin/users');
+}
+
+/** 开通/变更会员档位（付款对接前的手工开通通道） */
+export async function adminSetUserTier(userId: string, tier: string): Promise<void> {
+  await adminFetch(`/admin/users/${userId}/tier`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tier }),
+  });
 }

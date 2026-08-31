@@ -14,17 +14,23 @@ import {
   LayoutDashboard,
   Mic,
   SlidersHorizontal,
+  Users,
 } from 'lucide-react';
 import {
   AdminConfigView,
+  AdminPlanInfo,
   AdminStats,
+  AdminUserInfo,
   MediaSettings,
   ModelSectionConfig,
   adminLogin,
   adminLogout,
+  adminSetUserTier,
   changeAdminPassword,
   fetchAdminConfig,
+  fetchAdminPlans,
   fetchAdminStats,
+  fetchAdminUsers,
   getAdminToken,
   resetAdminSection,
   saveAdminConfig,
@@ -36,7 +42,7 @@ import ToastStack, { ToastItem } from '@/components/admin/Toast';
 import { SECTION_META, SectionKey } from '@/components/admin/presets';
 import RetrievalSection from '@/components/admin/RetrievalSection';
 
-type TabKey = 'overview' | SectionKey | 'media' | 'retrieval' | 'security';
+type TabKey = 'overview' | SectionKey | 'media' | 'retrieval' | 'users' | 'security';
 type Drafts = Record<SectionKey, ModelSectionConfig>;
 
 const NAV: Array<{ key: TabKey; label: string; icon: typeof Gauge }> = [
@@ -47,6 +53,7 @@ const NAV: Array<{ key: TabKey; label: string; icon: typeof Gauge }> = [
   { key: 'vlm', label: '多模态识图', icon: ImageIcon },
   { key: 'media', label: '媒体压缩', icon: SlidersHorizontal },
   { key: 'retrieval', label: '检索调权', icon: Gauge },
+  { key: 'users', label: '会员管理', icon: Users },
   { key: 'security', label: '密码与安全', icon: KeyRound },
 ];
 
@@ -343,6 +350,8 @@ export default function AdminPage() {
 
           {tab === 'retrieval' && config?.retrieval && <RetrievalSection config={config} />}
 
+          {tab === 'users' && <UsersSection onToast={toast} />}
+
           {tab === 'security' && <SecuritySection onToast={toast} />}
         </main>
       </div>
@@ -442,6 +451,142 @@ function Overview({ stats, onGoto }: { stats: AdminStats; onGoto: (tab: TabKey) 
     </div>
   );
 }
+
+// ------------------------------------------------------------ 会员管理 ----
+const TIER_BADGES: Record<string, string> = {
+  free: 'bg-paper-deep text-ink-faint',
+  guest: 'bg-paper-deep text-ink-faint',
+  pro: 'bg-blue-500/10 text-blue-600',
+  max: 'bg-violet-500/10 text-violet-600',
+};
+
+function UsersSection({ onToast }: { onToast: (kind: ToastItem['kind'], text: string) => void }) {
+  const [users, setUsers] = useState<AdminUserInfo[] | null>(null);
+  const [plans, setPlans] = useState<Record<string, AdminPlanInfo> | null>(null);
+  const [savingId, setSavingId] = useState('');
+  const [error, setError] = useState('');
+
+  const load = useCallback(async () => {
+    try {
+      const [u, p] = await Promise.all([fetchAdminUsers(), fetchAdminPlans()]);
+      setUsers(u);
+      setPlans(p);
+      setError('');
+    } catch (e) {
+      setError((e as Error).message === 'UNAUTHORIZED' ? '会话过期，请刷新页面重新登录' : (e as Error).message);
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const changeTier = async (userId: string, email: string, tier: string) => {
+    setSavingId(userId);
+    try {
+      await adminSetUserTier(userId, tier);
+      setUsers((prev) => (prev ? prev.map((u) => (u.id === userId ? { ...u, tier } : u)) : prev));
+      onToast('ok', `${email} 已切换为「${plans?.[tier]?.label ?? tier}」，限速/配额即时生效`);
+    } catch (e) {
+      onToast('err', `变更失败：${(e as Error).message}`);
+    } finally {
+      setSavingId('');
+    }
+  };
+
+  const fmtDate = (ms: number) => {
+    try {
+      return new Date(ms).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' });
+    } catch {
+      return '—';
+    }
+  };
+
+  const tierOptions = plans
+    ? Object.entries(plans).filter(([k]) => k !== 'guest')
+    : [['free', { label: '免费版' }], ['pro', { label: '专业版' }], ['max', { label: '旗舰版' }]] as Array<[string, { label: string }]>;
+
+  return (
+    <section className="paper-card animate-rise px-6 py-5">
+      <h2 className="flex items-center gap-1.5 text-[14.5px] font-semibold text-ink">
+        <Users size={15} strokeWidth={1.5} aria-hidden />
+        会员管理
+      </h2>
+      <p className="mt-1 text-[12px] text-ink-faint">
+        档位决定限速（次/分钟）、存储配额与单文件上限；学生注册默认免费档，升级即为手工开通（在线支付对接中）。
+      </p>
+
+      {/* 档位配额一览 */}
+      {plans && (
+        <div className="mt-4 grid gap-3 sm:grid-cols-3">
+          {(['free', 'pro', 'max'] as const).map((k) => {
+            const p = plans[k];
+            if (!p) return null;
+            return (
+              <div key={k} className={`rounded-xl border px-4 py-3 ${k === 'pro' ? 'border-blue-500/40 bg-blue-500/[0.05]' : 'border-rule bg-paper/60'}`}>
+                <div className="flex items-baseline justify-between">
+                  <span className="text-[13px] font-semibold text-ink">{p.label}</span>
+                  <span className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium ${TIER_BADGES[k] ?? ''}`}>{k}</span>
+                </div>
+                <div className="mt-1 text-[11px] leading-relaxed text-ink-faint">
+                  存储 {p.storage_mb >= 1024 ? `${(p.storage_mb / 1024).toFixed(0)}GB` : `${p.storage_mb}MB`} ·
+                  提问 {p.chat_per_min} 次/分 · 单文件 ≤{p.max_upload_mb}MB
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* 用户列表 */}
+      <div className="mt-4 overflow-hidden rounded-xl border border-rule">
+        <div className="grid grid-cols-[1fr_90px_130px_100px] items-center gap-2 border-b border-rule bg-paper/80 px-4 py-2.5 text-[11px] font-semibold text-ink-faint">
+          <span>邮箱</span>
+          <span>注册时间</span>
+          <span>当前档位</span>
+          <span className="text-right">变更档位</span>
+        </div>
+        {error ? (
+          <div className="px-4 py-6 text-center text-[12px] text-cinnabar">{error}</div>
+        ) : users === null ? (
+          <div className="px-4 py-6 text-center text-[12px] text-ink-faint">加载中…</div>
+        ) : users.length === 0 ? (
+          <div className="px-4 py-6 text-center text-[12px] text-ink-faint">
+            暂无注册用户（当前为开放演示模式，首位用户注册后自动开启全站登录）
+          </div>
+        ) : (
+          users.map((u) => (
+            <div key={u.id} className="grid grid-cols-[1fr_90px_130px_100px] items-center gap-2 border-b border-rule/50 px-4 py-3 last:border-0 transition hover:bg-paper/50">
+              <span className="min-w-0 truncate text-[13px] text-ink">{u.email}</span>
+              <span className="text-[11.5px] text-ink-faint">{fmtDate(u.created_at)}</span>
+              <span>
+                <span className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-medium ${TIER_BADGES[u.tier] ?? 'bg-paper-deep text-ink-faint'}`}>
+                  {plans?.[u.tier]?.label ?? u.tier}
+                </span>
+              </span>
+              <span className="flex justify-end">
+                {/* 原生 select（样式轻量统一），避免自绘下拉的交互差异 */}
+                <select
+                  value={u.tier}
+                  disabled={savingId === u.id}
+                  onChange={(e) => void changeTier(u.id, u.email, e.target.value)}
+                  className="rounded-lg border border-rule bg-white px-2 py-1.5 text-[12px] text-ink-soft outline-none transition focus:border-chalk disabled:opacity-50"
+                  aria-label={`变更 ${u.email} 的会员档位`}
+                >
+                  {tierOptions.map(([k, p]) => (
+                    <option key={k} value={k}>{p.label}</option>
+                  ))}
+                </select>
+              </span>
+            </div>
+          ))
+        )}
+      </div>
+      <p className="mt-2.5 text-[10.5px] leading-relaxed text-ink-faint">
+        档位与配额口径可在 runtime_config 的 plans 中热调（默认：免费 200MB/10 次 · 专业 2GB/30 次 · 旗舰 10GB/60 次）。
+      </p>
+    </section>
+  );
+}
+
 
 // ------------------------------------------------------------------ 安全 ----
 function SecuritySection({ onToast }: { onToast: (kind: ToastItem['kind'], text: string) => void }) {

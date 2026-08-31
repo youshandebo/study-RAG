@@ -5,12 +5,12 @@ pydantic-settings>=2.2
 email-validator>=2.0   # auth 注册 EmailStr 校验（pydantic[email]）
 httpx>=0.27
 python-multipart>=0.0.9
-aiosqlite>=0.20   # 默认持久化（SQLite 单容器模式；配置 POSTGRES_DSN 时可不装）
+aiosqlite>=0.20   # SQLite 异步驱动（单容器默认持久化）
+sqlalchemy[asyncio]>=2.0  # 关系库引擎：SQLite(默认)与 Postgres 共用；缺失会静默降级内存存储导致重启丢用户
 
 # ---- 可选重型依赖（生产部署按需启用，启用对应配置项时必须安装）----
 # qdrant-client>=1.9          # 配置 QDRANT_URL 时必须（检索候选真正走 Qdrant payload filter）
-# sqlalchemy[asyncio]>=2.0    # 配置 POSTGRES_DSN 时必须
-# asyncpg>=0.29               # 同上（Postgres 异步驱动）
+# asyncpg>=0.29               # 配置 POSTGRES_DSN 时必须（Postgres 异步驱动）
 # celery[redis]>=5.3
 # redis>=5.0
 # minio>=7.2
