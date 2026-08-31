@@ -121,8 +121,40 @@ def _is_relevant(query: str, chunk) -> bool:
     return bool(qtokens & hay)
 
 
-def _user_query(req: ChatRequest, ocr_text: str | None) -> str:
-    return req.text.strip() or (ocr_text or "") or "反常积分收敛性判定"
+async def _history_messages(session_id: str, max_turns: int = 6) -> list[dict]:
+    """最近 N 轮 user/assistant 对话 → LLM messages。
+
+    多轮上下文贯通：此前每个意图调 LLM 都是拿当前一条消息现造 messages 数组，
+    "再讲讲第二步"这类追问模型根本接不住。此处取历史（调用方在 append 当前
+    消息之前调用），每条截断防爆 token。
+    """
+    try:
+        msgs = await repo.list_messages(session_id)
+    except Exception:
+        return []
+    turns: list[dict] = []
+    for m in reversed(msgs):
+        if len(turns) >= max_turns * 2:
+            break
+        role = m.get("role")
+        content = str(m.get("content") or "").strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        turns.append({"role": role, "content": content[:2000]})
+    turns.reverse()
+    return turns
+
+
+def _user_query(req: ChatRequest, ocr_text: str | None, history: list[dict]) -> str:
+    """当前问题：原文 > OCR 识别 > 最近一轮提问 > 演示兜底。"""
+    if req.text.strip():
+        return req.text.strip()
+    if ocr_text:
+        return ocr_text
+    for m in reversed(history):
+        if m.get("role") == "user":
+            return str(m.get("content") or "")
+    return "反常积分收敛性判定"
 
 
 _CONTEXT_LIMIT = 131072  # 演示口径：128K
@@ -188,6 +220,9 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
     u_sys = u_ret = u_out = ""
     intent = classify(req.text, has_image=bool(req.image_b64), force=req.force_intent)
 
+    # 多轮上下文：先取历史（此刻当前消息尚未入库），所有意图的 LLM 调用共享
+    history = await _history_messages(req.session_id)
+
     user_msg = PolymorphicMessage(
         session_id=req.session_id,
         role="user",
@@ -204,7 +239,7 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
         ocr = await OCREngine().recognize(req.image_b64)
         ocr_text = ocr.get("problem_text")
 
-    query = _user_query(req, ocr_text)
+    query = _user_query(req, ocr_text, history)
     assistant = PolymorphicMessage(
         session_id=req.session_id,
         role="assistant",
@@ -229,6 +264,7 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
         provider = get_tier_provider(tier_model)
         messages = [
             {"role": "system", "content": SOLVE_SYSTEM},
+            *history,
             {"role": "user", "content": f"{query}\n\n【课堂切片上下文】\n{context}"},
         ]
         full = ""
@@ -258,7 +294,19 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
 
     # -------------------------------------------------------- socratic ---
     elif intent == Intent.socratic:
-        payload = await SocraticTutor().start_or_advance(req.session_id, req.text if req.text else None)
+        # 检索课堂切片做主题锚定，真实模型可用时引导问题现场生成（不再走死脚本）
+        _refs, _chunks = await _retrieve_evidence(
+            query, top_k=3, course_id=req.course_id, retrieval_mode=req.retrieval_mode,
+            time_alpha_override=req.time_alpha_override,
+            canonical_bonus_override=req.canonical_bonus_override, chapter=req.chapter,
+        )
+        socratic_ctx = "\n---\n".join(
+            f"[{_c.board_caption or _c.exam_point}] {_c.text[:200]}" for _c in _chunks[:3]
+        )
+        payload = await SocraticTutor().start_or_advance(
+            req.session_id, req.text if req.text else None,
+            topic=query, context=socratic_ctx, history=history,
+        )
         yield _sse("delta", {"text": payload.guiding_question})
         assistant.type = MessageType.socratic_card
         assistant.content = payload.guiding_question
@@ -267,7 +315,22 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
 
     # ------------------------------------------------------------ quiz ---
     elif intent == Intent.quiz:
-        payload: QuizPayload = await QuizGenerator().generate()
+        # 出题锚定当前所学：检索相关切片，把考点/易错点喂给出题器
+        _refs, _chunks = await _retrieve_evidence(
+            query, top_k=3, course_id=req.course_id, retrieval_mode=req.retrieval_mode,
+            time_alpha_override=req.time_alpha_override,
+            canonical_bonus_override=req.canonical_bonus_override, chapter=req.chapter,
+        )
+        _pitfalls = extract_from_chunks(_chunks)
+        _exam_point = _chunks[0].exam_point if _chunks else ""
+        quiz_ctx = "\n---\n".join(
+            f"[{_c.board_caption or _c.exam_point}] {_c.text[:200]}" for _c in _chunks[:3]
+        )
+        payload: QuizPayload = await QuizGenerator().generate(
+            target_pitfall=_pitfalls[0] if _pitfalls else None,
+            exam_point=_exam_point,
+            context=quiz_ctx,
+        )
         yield _sse("delta", {"text": payload.question_text})
         assistant.type = MessageType.quiz_card
         assistant.content = payload.question_text
@@ -309,7 +372,7 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
                 f"不相关时再按通识作答】\n{ret_ctx}"
             )
         try:
-            async for piece in provider.stream_chat([{"role": "user", "content": user_content}]):
+            async for piece in provider.stream_chat([*history, {"role": "user", "content": user_content}]):
                 full += piece
                 yield _sse("delta", {"text": piece})
         except Exception:
@@ -336,7 +399,7 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
 
         async def pump(index: int, key: str, display: str) -> None:
             try:
-                async for piece in dispatcher.stream(key, req.text or query):
+                async for piece in dispatcher.stream(key, req.text or query, history):
                     await queue.put((index, display, piece))
             except Exception:
                 pass

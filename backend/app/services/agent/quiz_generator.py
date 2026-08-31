@@ -57,12 +57,23 @@ def _mock_quiz(target_pitfall: str | None) -> QuizPayload:
 
 
 class QuizGenerator:
-    async def generate(self, target_pitfall: str | None = None) -> QuizPayload:
-        """即时自测：LLM 围绕易错点出单选题；不可用时回落演示题。"""
+    async def generate(
+        self,
+        target_pitfall: str | None = None,
+        exam_point: str | None = None,
+        context: str = "",
+    ) -> QuizPayload:
+        """即时自测：LLM 围绕当前所学（考点+课堂切片+易错点）出题；不可用时回落演示题。"""
         pitfall = target_pitfall or QUIZ_TARGET_PITFALL
         prompt = (
-            f"请围绕易错点「{pitfall}」出一道大学数学单选题，"
-            "干扰项须来自学生的典型错误思路。输出 JSON。"
+            f"请围绕易错点「{pitfall}」出一道大学数学单选题。"
+            + (f"本题考查的考点：{exam_point}。" if exam_point else "")
+            + (
+                "\n以下是学生正在学习的课堂切片，出题必须取材于这些内容：\n" + context[:1500]
+                if context
+                else ""
+            )
+            + "\n干扰项须来自学生的典型错误思路。输出 JSON。"
         )
         return _valid_quiz(await ask_llm_json(_SYSTEM, prompt)) or _mock_quiz(pitfall)
 

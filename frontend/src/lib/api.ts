@@ -245,7 +245,7 @@ export async function login(
   return data;
 }
 
-export async function fetchMe(): Promise<{ anonymous: boolean; email?: string; tier: string; plan: { storage_mb: number; chat_per_min: number; label?: string } } | null> {
+export async function fetchMe(): Promise<{ anonymous: boolean; email?: string; tier: string; is_admin?: boolean; plan: { storage_mb: number; chat_per_min: number; label?: string } } | null> {
   const resp = await fetch(`${API_BASE}/auth/me`, authInit());
   if (!resp.ok) return null;
   return resp.json();

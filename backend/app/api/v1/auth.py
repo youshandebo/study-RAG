@@ -41,11 +41,12 @@ class AuthUser:
     """请求级用户上下文；anonymous=True 表示开放演示模式。"""
 
     def __init__(self, user_id: str | None, email: str | None, tier: str | None,
-                 anonymous: bool = False) -> None:
+                 anonymous: bool = False, is_admin: bool = False) -> None:
         self.id = user_id
         self.email = email
         self.tier = tier or ("guest" if anonymous else "free")
         self.anonymous = anonymous
+        self.is_admin = is_admin
 
     def to_public(self) -> dict:
         return {
@@ -53,8 +54,24 @@ class AuthUser:
             "id": self.id,
             "email": self.email,
             "tier": self.tier,
+            "is_admin": self.is_admin,
             "plan": plan_for(self.tier),
         }
+
+
+def _is_admin_email(email: str | None) -> bool:
+    """平台管理员判定：初始化向导写入的 admin_email（env 可覆盖）。"""
+    import os as _os
+
+    if not email:
+        return False
+    from app.core.runtime_config import get_runtime_config
+
+    configured = (
+        _os.getenv("ADMIN_EMAIL", "").strip().lower()
+        or str(get_runtime_config().get("admin_email") or "").strip().lower()
+    )
+    return bool(configured) and email.strip().lower() == configured
 
 
 async def _resolve_user(payload: dict | None) -> AuthUser | None:
@@ -63,7 +80,7 @@ async def _resolve_user(payload: dict | None) -> AuthUser | None:
     user = await repo.get_user_by_id(str(payload.get("sub", "")))
     if user is None:
         return None
-    return AuthUser(user["id"], user["email"], user.get("tier"))
+    return AuthUser(user["id"], user["email"], user.get("tier"), is_admin=_is_admin_email(user.get("email")))
 
 
 async def current_user_optional(
@@ -124,10 +141,11 @@ async def setup_initialize(body: SetupBody):
     email = body.email.lower()
     if await repo.get_user_by_email(email):
         raise HTTPException(status_code=409, detail="该邮箱已存在，请直接登录")
-    from app.core.runtime_config import set_admin_password
+    from app.core.runtime_config import set_admin_email, set_admin_password
 
     user = await repo.create_user(email, hash_password(body.password), tier="max")
     set_admin_password(body.password)  # /admin 面板用同一口令
+    set_admin_email(email)             # /auth/me 判定 is_admin（工作台管理入口显隐）
     return {
         "token": sign_user_token(user["id"], user["tier"]),
         "user": {"id": user["id"], "email": user["email"], "tier": user["tier"]},

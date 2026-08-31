@@ -31,13 +31,14 @@ class TrackDispatcher:
 
         return key in _build_from_settings(self._settings)
 
-    async def stream(self, key: str, question: str) -> AsyncIterator[str]:
-        """单轨流式输出：真实 API 或风格化剧本。"""
+    async def stream(self, key: str, question: str, history: list[dict] | None = None) -> AsyncIterator[str]:
+        """单轨流式输出：真实 API（含多轮历史）或风格化剧本。"""
         if self.has_real(key):
             from app.services.llm.provider import _build_from_settings
 
             provider = _build_from_settings(self._settings)[key]
-            async for piece in provider.stream_chat([{"role": "user", "content": question}]):
+            messages = (history or []) + [{"role": "user", "content": question}]
+            async for piece in provider.stream_chat(messages):
                 yield piece
             return
         script = COMPARE_TRACK_TEXTS.get(self.SCRIPT_KEY.get(key, ""), SOLVE_MARKDOWN)

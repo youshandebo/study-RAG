@@ -30,6 +30,7 @@ _cache_mtime: float = -1.0
 def _blank() -> dict:
     return {
         "admin_password_hash": "",
+        "admin_email": "",
         "llm": {"provider": "", "base_url": "", "api_key": "", "model": ""},
         "embedding": {"base_url": "", "api_key": "", "model": ""},
         "asr": {"base_url": "", "api_key": "", "model": ""},
@@ -52,6 +53,7 @@ def _normalize(raw: dict | None) -> dict:
     if not isinstance(raw, dict):
         return cfg
     cfg["admin_password_hash"] = str(raw.get("admin_password_hash") or "")
+    cfg["admin_email"] = str(raw.get("admin_email") or "").strip().lower()
     for section in ("llm", "embedding", "asr", "vlm"):
         src = raw.get(section)
         if isinstance(src, dict):
@@ -171,6 +173,20 @@ def set_admin_password(password: str) -> None:
         globals()["_cache_mtime"] = _CONFIG_PATH.stat().st_mtime
 
 
+def set_admin_email(email: str) -> None:
+    """初始化向导写入平台管理员邮箱（用于 /auth/me 判定 is_admin，控制
+    工作台"管理后台"入口仅对管理员可见）。"""
+    with _lock:
+        current = _load_from_disk()
+        current["admin_email"] = email.strip().lower()
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _CONFIG_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(_CONFIG_PATH)
+        globals()["_cache"] = current
+        globals()["_cache_mtime"] = _CONFIG_PATH.stat().st_mtime
+
+
 def verify_admin_password(password: str) -> bool:
     stored = get_runtime_config().get("admin_password_hash", "")
     if not stored:
@@ -181,18 +197,6 @@ def verify_admin_password(password: str) -> bool:
         salt, _ = stored.split("$", 1)
         return hash_password(password, salt) == stored
     return password == stored  # 兼容环境变量直接写明文口令
-
-
-def set_admin_password(password: str) -> None:
-    with _lock:
-        current = _load_from_disk()
-        current["admin_password_hash"] = hash_password(password)
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = _CONFIG_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(_CONFIG_PATH)
-        globals()["_cache"] = current
-        globals()["_cache_mtime"] = _CONFIG_PATH.stat().st_mtime
 
 
 # ------------------------------------------------------------ effective view --

@@ -37,7 +37,7 @@ export default function WorkspacePage() {
   const openDrawer = useEvidenceStore((s) => s.openDrawer);
   const drawerOpen = useEvidenceStore((s) => s.open);
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
-  const [me, setMe] = useState<{ anonymous: boolean; email?: string; tier: string; plan: { label?: string } } | null>(null);
+  const [me, setMe] = useState<{ anonymous: boolean; email?: string; tier: string; is_admin?: boolean; plan: { label?: string } } | null>(null);
   const hydratedFor = useRef<Set<string>>(new Set());
 
   // 当前会员身份：有 token 时拉 /auth/me（失效自动清本地态）
@@ -177,14 +177,16 @@ export default function WorkspacePage() {
             >
               {modeUi.label}
             </button>
-            <a
-              href="/admin"
-              className="flex items-center gap-1.5 rounded-lg border border-rule/60 bg-white/70 px-3 py-1.5 text-[12.5px] text-ink-soft transition hover:border-rule hover:text-ink"
-              title="模型配置 · 知识库统计 · 管理员密码"
-            >
-              <Settings size={14} strokeWidth={1.5} />
-              管理后台
-            </a>
+            {me?.is_admin && (
+              <a
+                href="/admin"
+                className="flex items-center gap-1.5 rounded-lg border border-rule/60 bg-white/70 px-3 py-1.5 text-[12.5px] text-ink-soft transition hover:border-rule hover:text-ink"
+                title="模型配置 · 知识库统计 · 管理员密码"
+              >
+                <Settings size={14} strokeWidth={1.5} />
+                管理后台
+              </a>
+            )}
             <button
               onClick={() => openDrawer()}
               className="flex items-center gap-1.5 rounded-lg border border-rule/60 bg-white/70 px-3 py-1.5 text-[12.5px] text-ink-soft transition hover:border-rule hover:text-ink"
