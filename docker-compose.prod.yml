@@ -12,8 +12,10 @@ services:
   backend:
     image: ghcr.io/youshandebo/studay-rag-backend:latest
     restart: unless-stopped
+    # 只绑回环：公网访问走前端 /api/proxy 同源转发，backend 不暴露公网
+    # 端口被占？.env 里改 BACKEND_PORT=18000 即可
     ports:
-      - "8000:8000"
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     environment:
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
       - ADMIN_JWT_SECRET=${ADMIN_JWT_SECRET:-}
@@ -41,8 +43,9 @@ services:
   frontend:
     image: ghcr.io/youshandebo/studay-rag-frontend:latest
     restart: unless-stopped
+    # 端口被占？.env 里改 FRONTEND_PORT=8080 即可（容器内仍是 3000）
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT:-3000}:3000"
     environment:
       # 代理目标必须含 /api/v1：前端请求 /api/proxy/sessions → 转发 /api/v1/sessions
       - BACKEND_ORIGIN=http://backend:8000/api/v1
