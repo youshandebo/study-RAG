@@ -68,10 +68,10 @@ export default function WorkspacePage() {
       .catch(() => setBackendOk(false));
   }, []);
 
-  // 安装版首次部署检测：无用户且未设管理密码时，自动进入网页初始化向导
-  // （向导页 /setup 一直存在，但此前无人指路——用户直接落在匿名演示工作台）
+  // 安装版首次部署检测：无用户且未设管理密码时，自动进入网页初始化向导。
+  // 注意不能因本地残留 token 而跳过——502 时期浏览器可能存过早已失效的
+  // token，而 needs_setup=true 意味着系统里根本没有用户，跳向导永远正确。
   useEffect(() => {
-    if (getSassToken()) return; // 已登录用户不打扰
     fetch(`${API_BASE}/auth/setup/status`)
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
