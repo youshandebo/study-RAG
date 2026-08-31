@@ -58,9 +58,10 @@ docker compose -f docker-compose.prod.yml up -d
 ```
 
 - 访问 `http://<服务器IP>:3000`；API 经前端 `/api/proxy` 同源转发，无 CORS 问题
-- **端口冲突**：3000/8000 被服务器上其他项目占用时，在 `.env` 改
-  `FRONTEND_PORT=8080` / `BACKEND_PORT=18000` 后重启即可（backend 只绑
-  127.0.0.1 回环，不对公网暴露；要绑域名 + HTTPS 建议前面加一层 Caddy/Nginx）
+- **端口冲突**：对外端口完全由你定——`.env` 里 `FRONTEND_PORT=任意空闲端口`
+  后重启即可（容器内固定 3000，外面随你换）。backend 只绑 127.0.0.1 回环
+  不对公网暴露。建议流程：`ss -tlnp | grep -E ':3000|:8080'` 先确认空闲再定；
+  要绑域名 + HTTPS 建议前面加一层 Caddy/Nginx，让 80/443 归它管
 - 数据持久化：Postgres/Redis/Qdrant/MinIO 各自具名卷；`backend-data` 卷保存
   runtime_config 与 JWT 密钥（勿删，否则已签发登录态失效）
 - GHCR 包默认私有：仓库 Settings → Packages 可改 Public，或在服务器
