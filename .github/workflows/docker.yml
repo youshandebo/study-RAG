@@ -28,9 +28,11 @@ jobs:
         include:
           - name: backend
             context: ./backend
+            dockerfile: backend/Dockerfile
             image: studay-rag-backend
           - name: frontend
             context: ./frontend
+            dockerfile: frontend/Dockerfile
             image: studay-rag-frontend
             build-args: |
               NEXT_PUBLIC_API_BASE=/api/proxy
@@ -60,7 +62,7 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile || 'Dockerfile' }}
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
