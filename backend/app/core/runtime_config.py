@@ -8,10 +8,10 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import pathlib
-import secrets
 import threading
 import time
 
@@ -152,12 +152,6 @@ def save_runtime_config(patch: dict) -> dict:
 
 
 # ------------------------------------------------------------------ hashing --
-def hash_password(password: str, salt: str | None = None) -> str:
-    salt = salt or secrets.token_hex(8)
-    digest = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
-    return f"{salt}${digest}"
-
-
 def set_admin_password(password: str) -> None:
     """网页初始化/后台改密：写入加盐哈希（同 admin.py change_password 通道）。"""
     from app.core.security import hash_password
@@ -188,15 +182,21 @@ def set_admin_email(email: str) -> None:
 
 
 def verify_admin_password(password: str) -> bool:
+    from app.core.security import verify_password
+
     stored = get_runtime_config().get("admin_password_hash", "")
     if not stored:
         stored = os.getenv("ADMIN_PASSWORD", "").strip()
     if not stored:
         return password == "admin123"  # 首次部署默认口令，登录后请修改
-    if "$" in stored:
-        salt, _ = stored.split("$", 1)
-        return hash_password(password, salt) == stored
-    return password == stored  # 兼容环境变量直接写明文口令
+    if "$" not in stored:
+        return password == stored  # 兼容环境变量直接写明文口令
+    # 主路径：PBKDF2（security.hash_password 写入）；兼容存量 SHA256(salt+pwd) 哈希
+    if verify_password(password, stored):
+        return True
+    salt, digest = stored.split("$", 1)
+    legacy = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return hmac.compare_digest(digest, legacy)
 
 
 # ------------------------------------------------------------ effective view --
