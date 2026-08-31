@@ -28,7 +28,7 @@ docker compose up -d                 # 基础版（backend + frontend + redis）
 docker compose --profile full up -d  # 全量版（含向量库/关系库/对象存储）
 ```
 
-### 🚀 单容器部署（最简，New API 式体验）
+### 🚀 单容器部署
 
 ```bash
 docker run -d --name studay-rag --restart always   -p 3000:3000 -v studay-data:/app/data   ghcr.io/youshandebo/studay-rag:latest
