@@ -4,6 +4,7 @@
 
 /** 统一主工作台：左会话栏 + 中全能对话画布 + 右证据抽屉 */
 import { useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { BookMarked, BookOpen, ChevronRight, LogIn, LogOut, Settings, User } from 'lucide-react';
 import { fetchMe, getSassToken, setSassToken, setSassUser } from '@/lib/api';
 import SessionSidebar from '@/components/chat/SessionSidebar';
@@ -16,6 +17,7 @@ import { hydrateMessages } from '@/db';
 import { API_BASE } from '@/lib/api';
 
 export default function WorkspacePage() {
+  const router = useRouter();
   const { sessions, activeSessionId, updateSessionMeta, init, appendMessage, messagesBySession } = useSessionStore();
   const activeSession = sessions.find((s) => s.id === activeSessionId);
   const mode = activeSession?.retrievalMode ?? 'lecture';
@@ -65,6 +67,18 @@ export default function WorkspacePage() {
       .then((r) => (r.ok ? setBackendOk(true) : setBackendOk(false)))
       .catch(() => setBackendOk(false));
   }, []);
+
+  // 安装版首次部署检测：无用户且未设管理密码时，自动进入网页初始化向导
+  // （向导页 /setup 一直存在，但此前无人指路——用户直接落在匿名演示工作台）
+  useEffect(() => {
+    if (getSassToken()) return; // 已登录用户不打扰
+    fetch(`${API_BASE}/auth/setup/status`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d?.needs_setup) router.replace('/setup');
+      })
+      .catch(() => undefined); // 后端未起/探测失败：留在工作台，不打断
+  }, [router]);
 
   // 会话切换时从 Dexie 恢复历史（严格按 sessionId 隔离）
   useEffect(() => {
