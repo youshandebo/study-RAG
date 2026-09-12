@@ -39,6 +39,8 @@ def _blank() -> dict:
         "media": {"image_quality": "", "image_max_edge": "", "audio_bitrate": "", "audio_max_mb": ""},
         # 检索调权：预设档位 + 可选的原始系数覆盖（留空=跟随预设）
         "retrieval": {"profile": "", "vector": "", "lexical": "", "bm25": "", "canonical_bonus": "", "time_alpha": ""},
+        # 二阶段精排（Cross-Encoder）：默认关闭，走 NoopReranker 零依赖兜底
+        "rerank": {"enabled": "", "model_path": "", "tokenizer_dir": "", "tau": "", "beta": "", "recall_pool": ""},
         # 会员档位：按 tier 覆盖 storage_mb/model/chat_per_min/max_upload_mb
         "plans": {},
     }
@@ -81,6 +83,12 @@ def _normalize(raw: dict | None) -> dict:
             val = retrieval_src.get(key)
             if val is not None and str(val).strip() != "":
                 cfg["retrieval"][key] = str(float(val))
+    rerank_src = raw.get("rerank")
+    if isinstance(rerank_src, dict):
+        for key in ("enabled", "model_path", "tokenizer_dir", "tau", "beta", "recall_pool"):
+            val = rerank_src.get(key)
+            if val is not None and str(val).strip() != "":
+                cfg["rerank"][key] = str(val).strip()
     return cfg
 
 
@@ -117,7 +125,7 @@ def save_runtime_config(patch: dict) -> dict:
     patch = patch if isinstance(patch, dict) else {}
     if isinstance(patch.get("plans"), dict):
         current["plans"] = _normalize({"plans": patch["plans"]}).get("plans", {})
-    for section in ("llm", "embedding", "asr", "vlm", "media", "retrieval"):
+    for section in ("llm", "embedding", "asr", "vlm", "media", "retrieval", "rerank"):
         src = patch.get(section)
         if not isinstance(src, dict):
             continue
@@ -131,6 +139,12 @@ def save_runtime_config(patch: dict) -> dict:
                     float(val)
                 except (TypeError, ValueError):
                     continue
+                target[key] = str(float(val))
+            elif section == "rerank" and key in ("tau", "beta", "recall_pool"):
+                try:
+                    float(val)
+                except (TypeError, ValueError):
+                    continue  # 非法数值直接忽略，保持现值
                 target[key] = str(float(val))
             elif section == "media":
                 try:
@@ -239,6 +253,34 @@ def effective(kind: str):
                 except (TypeError, ValueError):
                     pass
         return out
+
+    if kind == "rerank":
+        from app.services.rag.reranker import (
+            DEFAULT_BETA,
+            DEFAULT_RECALL_POOL,
+            DEFAULT_TAU,
+        )
+
+        section = rc.get("rerank", {})
+        enabled = str(section.get("enabled") or "").strip().lower() in ("1", "true", "yes", "on")
+
+        def _num(key: str, default: float, lo: float, hi: float) -> float:
+            raw = str(section.get(key) or "").strip()
+            if not raw:
+                return default
+            try:
+                return max(lo, min(hi, float(raw)))
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            "enabled": enabled,
+            "model_path": str(section.get("model_path") or "").strip(),
+            "tokenizer_dir": str(section.get("tokenizer_dir") or "").strip(),
+            "tau": _num("tau", DEFAULT_TAU, 0.0, 1.0),
+            "beta": _num("beta", DEFAULT_BETA, 0.0, 5.0),
+            "recall_pool": int(_num("recall_pool", DEFAULT_RECALL_POOL, 1, 100)),
+        }
 
     if kind == "media":
         # 媒体压缩参数：面板值 > 内置默认（compressor.DEFAULTS 再兜底）

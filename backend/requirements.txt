@@ -15,3 +15,5 @@ sqlalchemy[asyncio]>=2.0  # 关系库引擎：SQLite(默认)与 Postgres 共用�
 # redis>=5.0
 # minio>=7.2
 # faster-whisper>=1.0
+# onnxruntime>=1.17         # 启用二阶段精排（rerank.enabled=true）时必须
+# transformers>=4.40        # 精排 tokenizer；与 onnxruntime 配套

@@ -663,3 +663,145 @@ class TestContextPacker:
 
         c = self._chunk("ut-s-c001", "抓大头判别法。")
         assert _token_of(c) == estimate_tokens(serialize([c]))
+
+
+# ------------------------------------------------ 精排与门控权威加权 ----
+class TestRerankAuthorityGate:
+    """核心约束：Cross-Encoder 只定"相关度"，canonical 定"可信度"，两者解耦。
+
+    门控 S_final = S_sem*(1+beta) if is_canonical 且 S_sem>=tau else S_sem
+    """
+
+    @staticmethod
+    def _chunk(cid: str, canonical: bool = False, text: str = "内容"):
+        from app.services.rag.chunker import Chunk
+
+        return Chunk(
+            id=cid, audio_id="ut", start="00:00", end="00:10", text=text,
+            is_canonical=canonical, course_id="ut-rr",
+        )
+
+    def test_sigmoid_monotonic_and_bounded(self):
+        from app.services.rag.reranker import sigmoid
+
+        assert 0.0 < sigmoid(-10) < 0.01
+        assert 0.99 < sigmoid(10) < 1.0
+        assert abs(sigmoid(0) - 0.5) < 1e-9
+        assert sigmoid(-3) < sigmoid(0) < sigmoid(3)
+
+    def test_sigmoid_no_overflow(self):
+        """极端 logit 不得抛 OverflowError（朴素 exp 实现在此会炸）。"""
+        from app.services.rag.reranker import sigmoid
+
+        assert sigmoid(-1000) >= 0.0
+        assert sigmoid(1000) <= 1.0
+
+    def test_canonical_boosted_only_above_tau(self):
+        from app.services.rag.reranker import apply_authority_gate
+
+        tau, beta = 0.42, 0.30
+        high = self._chunk("ut-c-high", canonical=True)   # 语义达标
+        low = self._chunk("ut-c-low", canonical=True)     # 语义不达标
+        plain = self._chunk("ut-plain")
+
+        out = apply_authority_gate([(0.80, high), (0.10, low), (0.70, plain)], tau, beta)
+        got = {c.id: s for s, c in out}
+
+        assert abs(got["ut-c-high"] - 0.80 * 1.30) < 1e-9, "达标定版应获提振"
+        assert got["ut-c-low"] == 0.10, "语义不达标时定版**不得**被强行置顶"
+        assert got["ut-plain"] == 0.70, "普通切片不加成"
+
+    def test_irrelevant_canonical_not_top_ranked(self):
+        """本项目要防的核心场景：无关定版切片不能被捧到首位。"""
+        from app.services.rag.reranker import apply_authority_gate
+
+        irrelevant_canonical = self._chunk("ut-irr-canon", canonical=True, text="完全无关")
+        relevant_plain = self._chunk("ut-rel-plain", text="正解")
+
+        out = apply_authority_gate([(0.05, irrelevant_canonical), (0.90, relevant_plain)], 0.42, 0.30)
+
+        assert out[0][1].id == "ut-rel-plain", "无关定版被门控挡住后，高相关切片仍应在首位"
+
+    def test_boost_cannot_overtake_wildly_better_chunk(self):
+        """提振幅度有界：0.5 分定版不该越过 0.9 分的强相关切片。"""
+        from app.services.rag.reranker import apply_authority_gate
+
+        canon = self._chunk("ut-weak-canon", canonical=True)
+        strong = self._chunk("ut-strong")
+
+        out = apply_authority_gate([(0.50, canon), (0.90, strong)], 0.42, 0.30)
+
+        assert out[0][1].id == "ut-strong"
+
+    def test_beta_zero_is_pure_semantic(self):
+        from app.services.rag.reranker import apply_authority_gate
+
+        canon = self._chunk("ut-b0", canonical=True)
+        out = apply_authority_gate([(0.9, canon)], 0.42, 0.0)
+        assert abs(out[0][0] - 0.9) < 1e-9
+
+    @pytest.mark.asyncio
+    async def test_noop_reranker_passthrough(self):
+        """零依赖默认路径：不重排、不改分，与引入精排前完全一致。"""
+        from app.services.rag.reranker import NoopReranker, RerankConfig, RerankPipeline
+
+        scored = [(0.9, self._chunk("ut-n1")), (0.5, self._chunk("ut-n2", canonical=True))]
+        pipe = RerankPipeline(NoopReranker(), RerankConfig(enabled=False))
+
+        assert pipe.active is False
+        assert await pipe.run("q", scored) == scored
+
+    @pytest.mark.asyncio
+    async def test_pipeline_disabled_even_with_model(self):
+        """配了模型但 enabled=False 时也必须透传，防止误开。"""
+        from app.services.rag.reranker import NoopReranker, RerankConfig, RerankPipeline
+
+        scored = [(0.9, self._chunk("ut-d1"))]
+        pipe = RerankPipeline(NoopReranker(), RerankConfig(enabled=True))
+
+        assert pipe.active is False, "Noop 实现下 active 必须为 False"
+        assert await pipe.run("q", scored) == scored
+
+    @pytest.mark.asyncio
+    async def test_pipeline_reranks_and_truncates_pool(self):
+        """候选池按 recall_pool 截断后才送精排；门控加成在精排分上进行。"""
+        from app.services.rag.reranker import BaseReranker, RerankConfig, RerankPipeline
+
+        seen: list[str] = []
+
+        class _R(BaseReranker):
+            name = "fake"
+
+            async def rerank(self, _q, scored):
+                seen.extend(c.id for _, c in scored)
+                return [(0.9, c) for _, c in scored]  # 全部打同分
+
+        chunks = [self._chunk(f"ut-pool{i}") for i in range(10)]
+        chunks[0] = self._chunk("ut-pool0", canonical=True)
+        scored = [(1.0 - i * 0.01, c) for i, c in enumerate(chunks)]
+
+        pipe = RerankPipeline(_R(), RerankConfig(enabled=True, recall_pool=3, tau=0.42, beta=0.30))
+        out = await pipe.run("q", scored)
+
+        assert len(seen) == 3, f"送入精排的数量应受 recall_pool 约束，实为 {len(seen)}"
+        assert out[0][1].id == "ut-pool0", "同分时定版切片应因门控加成排首位"
+        assert abs(out[0][0] - 0.9 * 1.30) < 1e-9
+
+    def test_get_reranker_defaults_to_noop(self):
+        """未配置时必须是 Noop，保证零依赖环境主干测试全通。"""
+        from app.services.rag.reranker import NoopReranker, get_reranker, reset_reranker
+
+        reset_reranker()
+        try:
+            assert isinstance(get_reranker(), NoopReranker)
+        finally:
+            reset_reranker()
+
+    def test_rerank_config_defaults(self):
+        from app.core.runtime_config import effective
+
+        cfg = effective("rerank")
+        assert cfg["enabled"] is False
+        assert cfg["tau"] == pytest.approx(0.42)
+        assert cfg["beta"] == pytest.approx(0.30)
+        assert cfg["recall_pool"] == 18

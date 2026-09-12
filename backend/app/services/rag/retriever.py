@@ -320,6 +320,29 @@ class HybridRetriever:
             scored.append((base, chunk))
 
         scored.sort(key=lambda pair: pair[0], reverse=True)
+
+        # 二阶段精排：粗排候选池交给 Cross-Encoder 重打分 + 门控权威加权。
+        # 未配置模型时 RerankPipeline.active 为 False，此处零开销直接返回粗排结果。
+        try:
+            from app.services.rag.reranker import RerankConfig, RerankPipeline, get_reranker
+            from app.core.runtime_config import effective as rc_effective
+
+            rc = rc_effective("rerank")
+            pipeline = RerankPipeline(
+                get_reranker(),
+                RerankConfig(
+                    enabled=bool(rc.get("enabled")),
+                    tau=float(rc.get("tau", 0.42)),
+                    beta=float(rc.get("beta", 0.30)),
+                    recall_pool=int(rc.get("recall_pool", 18)),
+                ),
+            )
+            if pipeline.active:
+                # 精排需要更宽的候选池：先把粗排放宽到 recall_pool，再交给精排收敛
+                scored = await pipeline.run(query, scored[: pipeline.recall_pool])
+        except Exception as exc:
+            _logger.warning("精排失败，沿用粗排结果: %s", exc)
+
         return scored[:top_k]
 
     @staticmethod
