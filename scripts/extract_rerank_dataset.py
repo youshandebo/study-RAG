@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
-"""真实 Cross-Encoder Logit 抽取管线：给离线标定脚本喂**真实分布**的数据。
+"""真实 Rerank 打分抽取管线：给离线标定脚本喂**真实分布**的数据。
 
 为什么需要它
 ------------
-`scripts/eval_rerank_params.py` 用的是内置合成黄金集，它的 logit 是人为捏的。
+`scripts/eval_rerank_params.py` 用的是内置合成黄金集，它的分值是人为捏的。
 合成数据只能证明"网格搜索 + 门控公式 + 平价测试"这套**机制自洽**，
-无法给 (tau, beta) 提供物理依据——真实 Cross-Encoder 的 logit 尺度、
+无法给 (tau, beta) 提供物理依据——真实 Rerank 模型的分值尺度、
 领域内负样本的长尾抬升，都不是合成值能替代的。
 
 本脚本做的是"零人工低成本"取证：
-    真实查询池 → 真实粗排召回 → 真实 ONNX 推理出原始 logit → 弱标注 → 喂入标定脚本
+    真实查询池 → 真实粗排召回 → 真实 Rerank API 打分 → 弱标注 → 喂入标定脚本
 
 职责边界（重要）
 ----------------
@@ -28,19 +28,14 @@
    任一路命中即判相关。这是"弱"标签——它会有噪声，但**噪声是可度量的**：
    脚本会输出标注统计与对角线自检，让你知道这份标签有多可靠再决定是否采信。
 3. 硬对抗负样本 —— 带 canonical 属性、但既非本考点也非本查询所属章节的切片。
-   这类样本是标定的关键：它们与查询共享领域词汇，真实 logit 会被抬到
-   0.4~0.6 的模糊带，正是 tau 需要拦截的对象。
+   这类样本是标定的关键：它们与查询共享领域词汇，是 tau 需要拦截的对象。
 
 用法
 ----
-    # 1) 真实 ONNX 模型（推荐）
-    python scripts/extract_rerank_dataset.py \\
-        --queries data/queries.jsonl \\
-        --model-path models/bge-reranker-base.onnx \\
-        --tokenizer-dir models/bge-reranker-base \\
-        --out data/eval_golden_real.json
+    # 1) 真实 Rerank API（推荐；api_base/api_key 也可写在管理后台或环境变量）
+    python scripts/extract_rerank_dataset.py --queries data/queries.jsonl --out data/eval_golden_real.json
 
-    # 2) 无模型时的自检（logit 由确定性哈希生成，仅用于验证管线连通性，
+    # 2) 无 API 时的自检（分数由确定性哈希生成，仅用于验证管线连通性，
     #    **产出的数据不可用于标定**，会被显式标记）
     python scripts/extract_rerank_dataset.py --queries data/queries.jsonl \\
         --out data/eval_golden_smoke.json --allow-stub
@@ -51,9 +46,9 @@
 
 约束自检（`--report` 输出）
 ---------------------------
-脚本会打出真实分布的两个物理特征，用来判断"这份数据到底是不是真实模型产出的"：
-    * logit 带宽  —— 真实 Cross-Encoder 在领域内冲突样本上通常压缩在窄带内
-    * 模糊带占比  —— sigmoid 落在 [0.40, 0.60] 的候选比例（真实数据里这个比例不低）
+脚本会打出真实分布的特征，用来判断"这份数据到底是不是真实模型产出的"：
+    * 分值带宽    —— 真实 Rerank 在领域内冲突样本上通常压缩在窄带内
+    * 模糊带占比  —— 分数落在 [0.40, 0.60] 的候选比例
 """
 from __future__ import annotations
 
@@ -67,7 +62,7 @@ import sys
 from dataclasses import dataclass, field
 
 # 复用生产检索器与精排器，保证候选池与打分口径和线上一致。
-# 放在模块级（而非仅在 OnnxBackend 内）——stub 路径同样需要 import app.services.rag。
+# 放在模块级（而非仅在 ApiBackend 内）——stub 路径同样需要 import app.services.rag。
 _BACKEND_ROOT = pathlib.Path(__file__).resolve().parents[1] / "backend"
 if str(_BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(_BACKEND_ROOT))
@@ -147,7 +142,7 @@ def is_adversarial(chunk: Recalled, relevant: bool) -> bool:
 
 
 class LogitBackend:
-    """logit 推理后端抽象。真实实现走 ONNX，stub 实现仅供管线连通性自检。"""
+    """打分后端抽象。真实实现走远程 Rerank API，stub 实现仅供管线连通性自检。"""
 
     name = "base"
 
@@ -158,20 +153,90 @@ class LogitBackend:
         return None
 
 
-class OnnxBackend(LogitBackend):
-    """生产同源：复用 backend 的 OnnxReranker，保证打分口径与线上完全一致。"""
+class ApiBackend(LogitBackend):
+    """生产同源：复用 backend 的 ApiReranker，保证打分口径与线上完全一致。
 
-    name = "onnx"
+    `ApiReranker.rerank()` 是异步的且需要 Chunk 对象；标定只需"query × text"
+    的相关分，故这里复用它的请求组装与响应解析两个纯函数，自己发一次同步
+    请求——避免为标定脚本引入 asyncio 与 Chunk 构造开销。
 
-    def __init__(self, model_path: str, tokenizer_dir: str = "") -> None:
-        from app.services.rag.reranker import OnnxReranker
+    返回值语义：远程 API 的 relevance_score 已在 [0,1]，**不再是 logit**。
+    数据集里的 `logit` 字段名保留为与 eval 脚本的对接契约，数值口径由
+    `provenance` 标记区分（"api" = 相关分；"onnx" 为历史值，已不再产生）。
+    """
 
-        self._impl = OnnxReranker(model_path, tokenizer_dir)
+    name = "api"
+
+    def __init__(
+        self,
+        api_base: str,
+        api_key: str,
+        model: str = "",
+        protocol: str = "",
+        timeout: float = 15.0,
+    ) -> None:
+        import httpx
+
+        from app.services.rag.reranker import (
+            DEFAULT_PROTOCOL,
+            DEFAULT_TIMEOUT_S,
+            default_api_base,
+            default_api_model,
+        )
+
+        self._protocol = (protocol or DEFAULT_PROTOCOL).strip().lower()
+        self._api_base = (api_base or "").strip() or default_api_base(self._protocol)
+        if not self._api_base:
+            raise ValueError("ApiBackend 需要 api_base")
+        self._api_key = (api_key or "").strip()
+        self._model = (model or "").strip() or default_api_model(self._protocol)
+        self._timeout = float(timeout or DEFAULT_TIMEOUT_S)
+        self._client = httpx.Client(timeout=self._timeout)
 
     def score_batch(self, query: str, texts: list[str]) -> list[float]:
-        # 直接调 _logit，拿**未经 sigmoid 的原始值**——标定需要的是物理 logit，
-        # sigmoid 留给离线脚本按同一公式复算，避免两处各转一次导致口径漂移。
-        return [self._impl._logit(query, t) for t in texts]
+        if not texts:
+            return []
+        from app.services.rag.reranker import build_payload, parse_rerank_response
+
+        payload = build_payload(self._protocol, self._model, query, texts, len(texts))
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        resp = self._client.post(self._api_base, json=payload, headers=headers)
+        resp.raise_for_status()
+        pairs = parse_rerank_response(resp.json())
+        by_idx = {i: s for i, s in pairs}
+        return [float(by_idx.get(i, 0.0)) for i in range(len(texts))]
+
+    def close(self) -> None:
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
+
+def build_api_backend_from_config() -> LogitBackend:
+    """从 runtime_config / 环境变量装配 API 后端（标定脚本的推荐入口）。"""
+    import os
+
+    from app.core.runtime_config import effective as cfg_effective
+
+    cfg = cfg_effective("rerank")
+    api_base = str(cfg.get("api_base") or os.getenv("RERANK_API_BASE", "")).strip()
+    if not api_base:
+        raise SystemExit(
+            "[错误] 未配置重排 API。请任选其一：\n"
+            "        a) 管理后台 → 检索设置 → 填写 Rerank API（推荐）\n"
+            "        b) 环境变量 RERANK_API_BASE / RERANK_API_KEY\n"
+            "        c) 命令行 --api-base / --api-key\n"
+            "       若要只验证管线连通性，请加 --allow-stub。"
+        )
+    return ApiBackend(
+        api_base=api_base,
+        api_key=str(cfg.get("api_key") or os.getenv("RERANK_API_KEY", "")).strip(),
+        model=str(cfg.get("api_model") or "").strip(),
+        protocol=str(cfg.get("protocol") or "").strip(),
+    )
 
 
 class StubBackend(LogitBackend):
@@ -362,20 +427,34 @@ def build_golden(
     return dataset
 
 
+def _semantic_scores(values: list[float]) -> list[float]:
+    """把后端口径归一到 [0,1] 的语义相关分。
+
+    API 后端返回的 relevance_score 已在 [0,1]，**不能再走 sigmoid**（会把
+    0.9 压成 0.71，让模糊带统计完全失真）。仅当出现负值或 >1 时才判定为
+    原始 logit 并逐条 sigmoid——这是给自建端点留的兼容分支。
+    """
+    if not values:
+        return []
+    if all(0.0 <= v <= 1.0 for v in values):
+        return list(values)
+    return [stable_sigmoid(v) for v in values]
+
+
 def distribution_report(stats: ExtractStats) -> dict:
     """真实分布自检：把"物理模型支撑"从形容词变成可打印的数字。"""
     if not stats.logits:
         return {}
     logits = sorted(stats.logits)
     n = len(logits)
-    sig = [stable_sigmoid(z) for z in logits]
-    fuzzy = sum(1 for s in sig if FUZZY_LO <= s <= FUZZY_HI)
+    sem = _semantic_scores(logits)
+    fuzzy = sum(1 for s in sem if FUZZY_LO <= s <= FUZZY_HI)
     return {
         "logit_min": round(logits[0], 4),
         "logit_max": round(logits[-1], 4),
         "logit_band": round(logits[-1] - logits[0], 4),
         "logit_median": round(logits[n // 2], 4),
-        "sig_range": [round(min(sig), 4), round(max(sig), 4)],
+        "sig_range": [round(min(sem), 4), round(max(sem), 4)],
         "fuzzy_ratio": round(fuzzy / n, 4),
         "fuzzy_band": [FUZZY_LO, FUZZY_HI],
     }
@@ -394,13 +473,13 @@ def print_report(stats: ExtractStats, depth: int) -> None:
     if rep:
         print("-" * 62)
         print("真实分布自检（判断这份数据是否具备物理意义）")
-        print(f"  logit 值域          : [{rep['logit_min']}, {rep['logit_max']}]")
-        print(f"  logit 带宽          : {rep['logit_band']}")
-        print(f"  sigmoid 值域        : {rep['sig_range']}")
+        print(f"  分值值域            : [{rep['logit_min']}, {rep['logit_max']}]")
+        print(f"  分值带宽            : {rep['logit_band']}")
+        print(f"  归一后值域          : {rep['sig_range']}")
         print(f"  模糊带 [0.40,0.60]  : {rep['fuzzy_ratio'] * 100:.1f}% 的候选落在其中")
     print("=" * 62)
     if stats.stub_used:
-        print("!! 本次使用 stub 后端，logit 无物理意义，**禁止用于参数标定**")
+        print("!! 本次使用 stub 后端，分数无物理意义，**禁止用于参数标定**")
         print("=" * 62)
     elif stats.relevant_canonical == 0:
         print("!! 未抽到【相关且为定版】的样本 → activation_rate 恒 0，")
@@ -422,13 +501,15 @@ def print_report(stats: ExtractStats, depth: int) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="真实 Cross-Encoder Logit 抽取管线")
+    ap = argparse.ArgumentParser(description="真实 Rerank 打分抽取管线")
     ap.add_argument("--queries", default="", help="查询池 JSONL 路径")
     ap.add_argument("--out", required=True, help="输出黄金集 JSON 路径")
-    ap.add_argument("--model-path", default="", help="ONNX 模型路径（缺省走 stub 自检）")
-    ap.add_argument("--tokenizer-dir", default="", help="tokenizer 目录")
+    ap.add_argument("--api-base", default="", help="Rerank API 地址（缺省读 runtime_config / env）")
+    ap.add_argument("--api-key", default="", help="Rerank API Key（缺省读 runtime_config / env）")
+    ap.add_argument("--api-model", default="", help="Rerank 模型名（缺省按协议取内置名）")
+    ap.add_argument("--protocol", default="", help="接口协议：jina / siliconflow / cohere")
     ap.add_argument("--recall-depth", type=int, default=15, help="每查询召回候选数，默认 15")
-    ap.add_argument("--allow-stub", action="store_true", help="允许无模型时用 stub 后端跑通管线")
+    ap.add_argument("--allow-stub", action="store_true", help="允许无 API 时用 stub 后端跑通管线")
     ap.add_argument("--fixture", action="store_true",
                     help="用微型多章节夹具作为语料（免真实视频库，真值由夹具给定）")
     ap.add_argument("--report", action="store_true", help="只打印分布自检，不写文件")
@@ -445,18 +526,19 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     stats = ExtractStats()
-    if args.model_path:
-        backend: LogitBackend = OnnxBackend(args.model_path, args.tokenizer_dir)
+    if args.api_base:
+        backend: LogitBackend = ApiBackend(
+            api_base=args.api_base,
+            api_key=args.api_key,
+            model=args.api_model,
+            protocol=args.protocol,
+        )
     elif args.allow_stub:
         backend = StubBackend()
-        print("[警告] 未提供 --model-path，使用 stub 后端。产出的 logit 无物理意义。", file=sys.stderr)
+        print("[警告] 未提供 --api-base，使用 stub 后端。产出的分数无物理意义。", file=sys.stderr)
     else:
-        print(
-            "[错误] 未提供 --model-path。真实标定必须有真实模型；\n"
-            "       若只想验证管线连通性，请显式加 --allow-stub（产出数据不可用于标定）。",
-            file=sys.stderr,
-        )
-        return 2
+        # 未显式给参数 → 从 runtime_config / env 装配（配置缺失时给可操作提示）
+        backend = build_api_backend_from_config()
 
     # 单一事实源：后端身份决定 stub 标记，不从命令行参数二次推导
     stats.stub_used = backend.name == "stub"

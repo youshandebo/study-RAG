@@ -22,6 +22,7 @@ from fastapi.responses import StreamingResponse
 
 import app.db.relational as repo
 from app.api.v1.auth import AuthUser, current_user_optional
+from app.core.billing import account_key, get_ledger
 from app.core.membership import plan_for
 from app.core.security import SlidingWindowLimiter
 from app.services.llm.provider import get_tier_provider
@@ -57,8 +58,16 @@ from app.services.tokens import estimate_tokens
 router = APIRouter()
 _logger = logging.getLogger("app.api.chat_stream")
 
-# 流式对话限流：按会员档位分配速率（SSE 单次连接计数一次），key=IP+会话
+# 流式对话限流：按会员档位分配速率（SSE 单次连接计数一次）。
+#
+# key 用 IP + 用户身份，**不能用 req.session_id**——session_id 由客户端
+# 自由生成，攻击者每次换一个 id 就能把限流窗口刷成全新计数，限流形同虚设。
+# 匿名用户无 id 时退化为纯 IP 键（与计费账户口径一致）。
 _tier_limiters: dict[str, SlidingWindowLimiter] = {}
+
+
+def _limiter_key(ip: str, user_id: str | None) -> str:
+    return f"{ip}:{user_id}" if user_id else f"ip:{ip}"
 
 
 def _limiter_for(tier: str) -> SlidingWindowLimiter:
@@ -67,6 +76,10 @@ def _limiter_for(tier: str) -> SlidingWindowLimiter:
             max_events=int(plan_for(tier).get("chat_per_min", 10)), window_seconds=60
         )
     return _tier_limiters[tier]
+
+
+# 单次问答的预冻结额度上限（额度单位）。真实计价表接入后替换此常量即可。
+ASK_HOLD_AMOUNT = 4000
 
 SOLVE_SYSTEM = (
     "你是一位大学课堂的专属助教。请严格依据提供的课堂切片（老师原话与板书）所体现的解法和口吻来解题，"
@@ -234,23 +247,91 @@ async def chat_stream(req: ChatRequest, request: Request, user: AuthUser = Depen
         owner = await repo.get_session_owner(req.session_id)
         if owner and owner != user.id:
             raise HTTPException(status_code=403, detail="无权在该会话中提问")
-    # 档位限速
+    # 档位限速：key 必须绑定不可伪造的身份（IP + 用户 id），不能绑 session_id
+    key = _limiter_key(ip, None if user.anonymous else user.id)
     limiter = _limiter_for(user.tier)
-    if not limiter.check(f"{ip}:{req.session_id}"):
-        retry = limiter.retry_after(f"{ip}:{req.session_id}")
+    if not limiter.check(key):
+        retry = limiter.retry_after(key)
         raise HTTPException(
             status_code=429,
             detail=f"提问过于频繁（{user.tier} 档限 {limiter.max_events} 次/分钟），请 {retry} 秒后再试",
             headers={"Retry-After": str(retry)},
         )
+
+    # 额度预冻结：先占用上限，再在流结束时按实际产出结算/退回。
+    # 冻结失败（余额不足）直接 402，不进入生成——避免"先干活后收不到钱"。
+    ledger = get_ledger()
+    account = account_key(None if user.anonymous else user.id, ip)
+    hold = ledger.reserve(
+        account,
+        ASK_HOLD_AMOUNT,
+        request_id=req.request_id or "",
+        units=1,
+    )
+    if hold is None:
+        raise HTTPException(
+            status_code=402,
+            detail="额度不足，请充值或升级档位后再提问",
+        )
+
     # 档位模型：plan.model 非空时用主通道凭证换档位模型名（服务端注入，客户端不可选）
     tier_model = str(plan_for(user.tier).get("model") or "")
     return StreamingResponse(
-        _stream(req, tier_model, request), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
+        _stream(req, tier_model, request, hold=hold),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
     )
 
 
-async def _stream(req: ChatRequest, tier_model: str = "", request: Request | None = None):
+async def _stream(
+    req: ChatRequest,
+    tier_model: str = "",
+    request: Request | None = None,
+    hold=None,
+):
+    """结算外壳：把生成体包进 try/finally，保证**任何**退出路径都落终态。
+
+    为什么结算必须放在 finally
+    --------------------------
+    流式生成的退出路径有四条：正常跑完 / 客户端断开 break / 模型异常 /
+    生成器被 GC。把结算写在正常路径末尾，其余三条就会漏账——预冻结的额度
+    永远退不回来，用户莫名其妙被扣。finally 对这四条一视同仁。
+
+    有效产出取 `len(u_out)` 估算：只有真正吐给客户端的字符才算数，
+    中断时止步于中断点，天然符合"按交付量收费"。
+    """
+    produced = 0
+    try:
+        async for event in _stream_body(req, tier_model, request, hold=hold):
+            # 从 delta 事件里累计产出字符数，作为结算依据
+            if event.startswith("event: delta"):
+                try:
+                    payload = json.loads(event.split("data: ", 1)[1].split("\n\n", 1)[0])
+                    produced += len(str(payload.get("text") or ""))
+                except Exception:
+                    pass
+            yield event
+    finally:
+        if hold is not None:
+            ledger = get_ledger()
+            if produced > 0:
+                ledger.settle(
+                    hold,
+                    effective_tokens=estimate_tokens("x" * produced),
+                    request_id=req.request_id or "",
+                    reason=f"流结束，产出 {produced} 字符",
+                )
+            else:
+                # 零产出（未进入生成 / 立即异常）→ 全额退回
+                ledger.release(hold, reason="无任何产出")
+
+
+async def _stream_body(
+    req: ChatRequest,
+    tier_model: str = "",
+    request: Request | None = None,
+    hold=None,
+):
     """流式生成。request 用于连接存活检测——客户端关页面/点停止后必须中断生成，
     否则 LLM 会在后台跑完全文，白烧 token 且占住连接（Ghost Generation）。
     """

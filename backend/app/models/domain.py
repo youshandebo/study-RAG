@@ -112,6 +112,7 @@ class ChatRequest(BaseModel):
     retrieval_mode: str = "lecture"  # lecture/review_narrow/review_broad/review/explore
     time_alpha_override: float | None = None   # 时间偏好强度覆盖（优先于模式默认）
     canonical_bonus_override: float | None = None  # 定版权重覆盖
+    request_id: str = ""     # 客户端幂等键：同 id 重复提交不重复扣额度（空=不启用幂等）
 
 
 class IngestRequest(BaseModel):

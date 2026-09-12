@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -805,6 +806,25 @@ class TestRerankAuthorityGate:
         assert cfg["tau"] == pytest.approx(0.42)
         assert cfg["beta"] == pytest.approx(0.30)
         assert cfg["recall_pool"] == 18
+        assert cfg["protocol"] == "jina", "未配置协议时必须回落默认协议"
+        assert cfg["api_base"] == ""
+        assert cfg["api_model"] == ""
+        assert cfg["timeout"] == pytest.approx(8.0)
+        # 本地 ONNX 路径字段已随实现移除，防回归
+        assert "model_path" not in cfg
+        assert "tokenizer_dir" not in cfg
+
+    def test_rerank_protocol_falls_back_on_invalid_value(self):
+        """非法协议名不得进到 ApiReranker（会造成请求体形状错配）。"""
+        from app.core import runtime_config as rc
+
+        original = rc.get_runtime_config()
+        try:
+            rc.save_runtime_config({"rerank": {"enabled": "true", "protocol": "not-a-vendor"}})
+            assert rc.effective("rerank")["protocol"] == "jina"
+        finally:
+            rc.save_runtime_config({"rerank": {"enabled": "", "protocol": ""}})
+            assert original is not None
 
     def test_production_gate_matches_offline_eval(self):
         """离线标定脚本与生产门控必须同源，否则标定结果对生产无效。"""
@@ -837,6 +857,292 @@ class TestRerankAuthorityGate:
                     f"生产与离线标定结果不一致: logit={logit} canon={canon} "
                     f"prod={prod} offline={offline}"
                 )
+
+
+# ------------------------------------- 远程 Rerank API 精排器 ----
+class TestApiReranker:
+    """纯 API 驱动的重排器：协议组装 / 响应解析 / 失败降级。
+
+    这些测试**不发真实网络请求**——注入伪造的 httpx 传输层，只验证契约。
+    """
+
+    def _chunk(self, cid: str, text: str, canonical: bool = False, exam_point: str = ""):
+        from app.services.rag.chunker import Chunk
+
+        return Chunk(
+            id=cid, audio_id="ut", start="00:00", end="00:10", text=text,
+            is_canonical=canonical, course_id="ut-api", exam_point=exam_point,
+        )
+
+    # ---- 纯函数：请求体契约 ----
+
+    def test_build_payload_jina_shape(self):
+        from app.services.rag.reranker import build_payload
+
+        payload = build_payload("jina", "m", "问题", ["a", "b"], 2)
+        assert payload["model"] == "m"
+        assert payload["query"] == "问题"
+        assert payload["documents"] == [{"text": "a"}, {"text": "b"}], "Jina/SiliconFlow 用对象数组"
+        assert payload["top_n"] == 2
+
+    def test_build_payload_cohere_shape(self):
+        from app.services.rag.reranker import build_payload
+
+        payload = build_payload("cohere", "m", "问题", ["a", "b"], 2)
+        assert payload["documents"] == ["a", "b"], "Cohere v2 用裸字符串数组"
+
+    # ---- 纯函数：响应解析契约 ----
+
+    def test_parse_standard_results(self):
+        from app.services.rag.reranker import parse_rerank_response
+
+        data = {"results": [{"index": 2, "relevance_score": 0.9}, {"index": 0, "relevance_score": 0.1}]}
+        assert parse_rerank_response(data) == [(2, 0.9), (0, 0.1)]
+
+    def test_parse_tolerates_field_aliases(self):
+        """不同网关把 relevance_score 叫成 score / similarity，不能因此炸掉。"""
+        from app.services.rag.reranker import parse_rerank_response
+
+        assert parse_rerank_response({"results": [{"index": 0, "score": 0.5}]}) == [(0, 0.5)]
+        assert parse_rerank_response(
+            {"data": [{"document_index": 1, "similarity": 0.7}]}
+        ) == [(1, 0.7)]
+
+    def test_parse_rejects_garbage(self):
+        from app.services.rag.reranker import parse_rerank_response
+
+        for bad in ({}, {"results": "nope"}, {"results": [{"index": 0}]}):
+            with pytest.raises(ValueError):
+                parse_rerank_response(bad)
+
+    # ---- 纯函数：量纲归一 ----
+
+    def test_normalize_scores_passthrough_for_unit_range(self):
+        from app.services.rag.reranker import _normalize_scores
+
+        assert _normalize_scores([0.9, 0.1, 0.0, 1.0]) == [0.9, 0.1, 0.0, 1.0]
+
+    def test_normalize_scores_sigmoids_raw_logits(self):
+        """若端点返回的是 logit（负值或 >1），必须压回 [0,1] 而非原样透出。"""
+        from app.services.rag.reranker import _normalize_scores
+
+        out = _normalize_scores([-8.0, 0.0, 3.0])
+        assert all(0.0 <= s <= 1.0 for s in out)
+        assert abs(out[1] - 0.5) < 1e-9
+        assert out[0] < 0.01 < out[2]
+
+    # ---- 端到端：伪造传输层 ----
+
+    @pytest.mark.asyncio
+    async def test_rerank_reorders_by_api_scores(self):
+        import httpx
+
+        from app.services.rag.reranker import ApiReranker
+
+        chunks = [self._chunk("ut-a", "甲"), self._chunk("ut-b", "乙"), self._chunk("ut-c", "丙")]
+        scored = [(0.9, chunks[0]), (0.8, chunks[1]), (0.7, chunks[2])]
+
+        def handler(_req: httpx.Request) -> httpx.Response:
+            # 故意把最后一条排到第一
+            return httpx.Response(
+                200,
+                json={"results": [
+                    {"index": 2, "relevance_score": 0.95},
+                    {"index": 0, "relevance_score": 0.30},
+                    {"index": 1, "relevance_score": 0.10},
+                ]},
+            )
+
+        r = ApiReranker("https://x/v1/rerank", "k", "m")
+        transport = httpx.MockTransport(handler)
+        original = httpx.AsyncClient
+
+        class _Patched(original):  # type: ignore[misc,valid-type]
+            def __init__(self, *a, **kw):
+                kw["transport"] = transport
+                super().__init__(*a, **kw)
+
+        httpx.AsyncClient = _Patched  # type: ignore[misc]
+        try:
+            out = await r.rerank("q", scored)
+        finally:
+            httpx.AsyncClient = original  # type: ignore[misc]
+
+        assert [c.id for _, c in out] == ["ut-c", "ut-a", "ut-b"]
+        assert abs(out[0][0] - 0.95) < 1e-9
+
+    @pytest.mark.asyncio
+    async def test_missing_index_in_response_gets_zero(self):
+        """API 只回 top_n 条时，未出现的候选补 0 分并沉底——不得丢候选。"""
+        import httpx
+
+        from app.services.rag.reranker import ApiReranker
+
+        chunks = [self._chunk(f"ut-m{i}", "x") for i in range(4)]
+        scored = [(1.0 - i * 0.1, c) for i, c in enumerate(chunks)]
+
+        transport = httpx.MockTransport(
+            lambda _req: httpx.Response(
+                200, json={"results": [{"index": 2, "relevance_score": 0.8}]}
+            )
+        )
+        r = ApiReranker("https://x/r", "k", "m")
+        original = httpx.AsyncClient
+
+        class _Patched(original):  # type: ignore[misc,valid-type]
+            def __init__(self, *a, **kw):
+                kw["transport"] = transport
+                super().__init__(*a, **kw)
+
+        httpx.AsyncClient = _Patched  # type: ignore[misc]
+        try:
+            out = await r.rerank("q", scored)
+        finally:
+            httpx.AsyncClient = original  # type: ignore[misc]
+
+        assert len(out) == 4, "候选不得因 API 截断而丢失"
+        assert out[0][1].id == "ut-m2"
+        assert sum(1 for s, _ in out if s == 0.0) == 3
+
+    @pytest.mark.asyncio
+    async def test_api_failure_falls_back_to_coarse_order(self):
+        """网络故障必须静默回退粗排顺序，绝不能让整条问答链挂掉。"""
+        import httpx
+
+        from app.services.rag.reranker import ApiReranker, RerankConfig, RerankPipeline
+
+        chunks = [self._chunk(f"ut-f{i}", "x") for i in range(3)]
+        scored = [(0.9 - i * 0.1, c) for i, c in enumerate(chunks)]
+
+        transport = httpx.MockTransport(lambda _req: httpx.Response(503, text="busy"))
+        r = ApiReranker("https://x/r", "k", "m")
+        original = httpx.AsyncClient
+
+        class _Patched(original):  # type: ignore[misc,valid-type]
+            def __init__(self, *a, **kw):
+                kw["transport"] = transport
+                super().__init__(*a, **kw)
+
+        httpx.AsyncClient = _Patched  # type: ignore[misc]
+        try:
+            out = await RerankPipeline(r, RerankConfig(enabled=True)).run("q", scored)
+        finally:
+            httpx.AsyncClient = original  # type: ignore[misc]
+
+        assert out == scored, "失败时须原样返回粗排结果"
+
+    @pytest.mark.asyncio
+    async def test_api_timeout_falls_back(self):
+        import httpx
+
+        from app.services.rag.reranker import ApiReranker, RerankConfig, RerankPipeline
+
+        chunks = [self._chunk("ut-t0", "x")]
+        scored = [(0.5, chunks[0])]
+
+        def handler(_req: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("too slow")
+
+        transport = httpx.MockTransport(handler)
+        r = ApiReranker("https://x/r", "k", "m", timeout=0.01)
+        original = httpx.AsyncClient
+
+        class _Patched(original):  # type: ignore[misc,valid-type]
+            def __init__(self, *a, **kw):
+                kw["transport"] = transport
+                super().__init__(*a, **kw)
+
+        httpx.AsyncClient = _Patched  # type: ignore[misc]
+        try:
+            out = await RerankPipeline(r, RerankConfig(enabled=True)).run("q", scored)
+        finally:
+            httpx.AsyncClient = original  # type: ignore[misc]
+
+        assert out == scored
+
+    def test_api_reranker_requires_base(self):
+        from app.services.rag.reranker import ApiReranker
+
+        with pytest.raises(ValueError):
+            ApiReranker("", "k", "m")
+
+    def test_defaults_cover_three_vendors(self):
+        from app.services.rag.reranker import DEFAULT_API_BASE, DEFAULT_API_MODEL, default_api_base
+
+        for vendor in ("jina", "siliconflow", "cohere"):
+            assert vendor in DEFAULT_API_MODEL
+            assert vendor in DEFAULT_API_BASE
+            assert default_api_base(vendor).startswith("https://")
+
+    # ---- 装配：enabled + api_base 才构造 ApiReranker ----
+
+    def test_get_reranker_noop_when_enabled_without_api_base(self):
+        """启用但没填 api_base 必须降级 Noop，不能抛异常打断检索。"""
+        from app.core import runtime_config as rc
+        from app.services.rag.reranker import NoopReranker, get_reranker, reset_reranker
+
+        reset_reranker()
+        try:
+            rc.save_runtime_config({"rerank": {"enabled": "true", "api_base": ""}})
+            assert isinstance(get_reranker(), NoopReranker)
+        finally:
+            rc.save_runtime_config({"rerank": {"enabled": "", "api_base": ""}})
+            reset_reranker()
+
+    def test_get_reranker_builds_api_when_configured(self):
+        from app.core import runtime_config as rc
+        from app.services.rag.reranker import ApiReranker, get_reranker, reset_reranker
+
+        reset_reranker()
+        try:
+            rc.save_runtime_config({
+                "rerank": {
+                    "enabled": "true",
+                    "protocol": "siliconflow",
+                    "api_base": "https://api.siliconflow.cn/v1/rerank",
+                    "api_key": "sk-test",
+                }
+            })
+            r = get_reranker()
+            assert isinstance(r, ApiReranker)
+            assert r.name == "api"
+            assert r._protocol == "siliconflow"
+            # 未填 api_model 时按协议回落内置模型名
+            assert r._model == "BAAI/bge-reranker-v2-m3"
+        finally:
+            rc.save_runtime_config({"rerank": {"enabled": "", "api_base": "", "api_key": "", "protocol": ""}})
+            reset_reranker()
+
+    def test_api_key_is_masked_in_view(self):
+        """rerank.api_key 绝不能明文下发到前端。"""
+        from app.core import runtime_config as rc
+
+        try:
+            rc.save_runtime_config({"rerank": {"enabled": "true", "api_base": "https://x/r", "api_key": "sk-secret-1234"}})
+            view = rc.masked_view()
+            assert "rerank" in view
+            assert view["rerank"]["api_key"].startswith("******")
+            assert "sk-secret-1234" not in json.dumps(view, ensure_ascii=False)
+        finally:
+            rc.save_runtime_config({"rerank": {"enabled": "", "api_base": "", "api_key": ""}})
+
+    def test_ontology_no_local_inference_dependency(self):
+        """回归闸门：生产代码里不得再出现本地推理依赖的 import。
+
+        用户明确要求小型 VPS 上不加载本地 ONNX/PyTorch——这条测试把这个
+        约束钉死在 CI 里，防止未来有人"顺手"把本地 Cross-Encoder 加回来。
+        """
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parent.parent / "app"
+        banned = ("import onnxruntime", "from onnxruntime", "import transformers", "from transformers")
+        offenders: list[str] = []
+        for path in root.rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            for needle in banned:
+                if needle in text:
+                    offenders.append(f"{path.relative_to(root)}: {needle}")
+        assert not offenders, f"生产代码残留本地推理依赖: {offenders}"
 
 
 # --------------------------------------------- 离线标定脚本自身行为 ----
@@ -1511,3 +1817,249 @@ class TestMultiGroundTruth:
 
         for q in fx.FIXTURE_QUERIES:
             assert q.get("expect_relevant_chunk"), q["query_id"]
+
+
+# --------------------------------------------- 额度计费（预冻结 + 终态结算）----
+class TestBillingLedger:
+    """计费账本：把「计费暗坑」逐条钉成回归测试。
+
+    这组测试对应四类真实事故：
+      ① 流式中断：预扣未退 / 后扣被白嫖  → 预冻结 + 终态结算
+      ② compare 多轨道：多倍成本单倍扣费  → units 放大冻结
+      ③ 一问多题：只按 1 次扣费           → units 可表意多单位
+      ④ 无幂等/无锁：重放重复扣、崩溃悬挂  → request_id + 超时兜底
+    """
+
+    @staticmethod
+    def _ledger():
+        from app.core.billing import BillingLedger
+
+        lg = BillingLedger()
+        lg.reset()
+        return lg
+
+    # ---- ① 流式中断：两种错误做法都必须被排除 ----
+
+    def test_interrupt_after_substantial_output_is_charged(self):
+        """用户看到大半答案后主动停止 → 模型成本已发生，必须收费。"""
+        from app.core.billing import DEFAULT_MIN_BILLABLE_TOKENS, HoldState
+
+        lg = self._ledger()
+        lg.grant("u:1", 10000)
+        hold = lg.reserve("u:1", 4000, request_id="r1")
+
+        res = lg.settle(hold, effective_tokens=DEFAULT_MIN_BILLABLE_TOKENS + 500, request_id="r1")
+
+        assert res.state == HoldState.settled
+        assert res.charged > 0
+        assert lg.balance("u:1") == 10000 - res.charged
+
+    def test_interrupt_before_threshold_is_fully_refunded(self):
+        """刚吐 10 个 token 就断 → 未成功交付，必须全额退回（防"预扣不退"）。"""
+        from app.core.billing import DEFAULT_MIN_BILLABLE_TOKENS, HoldState
+
+        lg = self._ledger()
+        lg.grant("u:1", 10000)
+        hold = lg.reserve("u:1", 4000, request_id="r2")
+
+        res = lg.settle(
+            hold, effective_tokens=DEFAULT_MIN_BILLABLE_TOKENS - 1, request_id="r2"
+        )
+
+        assert res.state == HoldState.released
+        assert res.charged == 0
+        assert res.refunded == 4000
+        assert lg.balance("u:1") == 10000, "低于阈值必须分文不取"
+
+    def test_zero_output_release_never_charges(self):
+        """连生成都没开始（异常早退）→ 全额退回，防"预扣未退"。"""
+        from app.core.billing import HoldState
+
+        lg = self._ledger()
+        lg.grant("u:1", 10000)
+        hold = lg.reserve("u:1", 4000)
+
+        res = lg.release(hold, reason="异常早退")
+
+        assert res.state == HoldState.released
+        assert lg.balance("u:1") == 10000
+
+    def test_hold_actually_freezes_balance(self):
+        """冻结必须真的减少可用余额——否则"后扣"会被白嫖（余额够随便刷）。"""
+        lg = self._ledger()
+        lg.grant("u:1", 10000)
+
+        hold = lg.reserve("u:1", 4000)
+
+        assert hold is not None
+        assert lg.balance("u:1") == 6000, "冻结期间可用余额必须下降"
+
+    def test_reserve_rejects_when_insufficient(self):
+        """余额不足必须拒绝冻结（上层据此回 402），不能放行后收不到钱。"""
+        lg = self._ledger()
+        lg.grant("u:1", 100)
+
+        assert lg.reserve("u:1", 4000) is None
+        assert lg.balance("u:1") == 100, "被拒绝的冻结不得改动余额"
+
+    # ---- ② compare：多倍成本必须多倍占用 ----
+
+    def test_units_multiply_the_hold(self):
+        """compare 并发 N 条轨道 = N 倍成本，冻结额度必须同倍放大。"""
+        lg = self._ledger()
+        lg.grant("u:1", 20000)
+
+        hold = lg.reserve("u:1", 4000, units=4)
+
+        assert hold.amount == 16000, "4 条轨道应冻结 4 倍额度"
+        assert lg.balance("u:1") == 4000
+
+    def test_multi_unit_hold_cannot_be_covered_by_single_unit_balance(self):
+        """只有 1 份额度时不能开 4 条轨道——这正是"多倍成本单倍扣费"的反例。"""
+        lg = self._ledger()
+        lg.grant("u:1", 5000)   # 够 1 条（4000），不够 4 条（16000）
+
+        assert lg.reserve("u:1", 4000, units=1) is not None
+        lg.grant("u:2", 5000)
+        assert lg.reserve("u:2", 4000, units=4) is None
+
+    # ---- ④ 幂等 ----
+
+    def test_duplicate_request_does_not_double_charge(self):
+        """同一 request_id 重放不得重复扣费（网络重试的常见场景）。"""
+        lg = self._ledger()
+        lg.grant("u:1", 10000)
+
+        first = lg.reserve("u:1", 4000, request_id="same-id")
+        lg.settle(first, effective_tokens=3000, request_id="same-id")
+        after_first = lg.balance("u:1")
+
+        second = lg.reserve("u:1", 4000, request_id="same-id")
+
+        assert second is not None
+        assert second.amount == 0, "重复请求不得再次冻结"
+        assert lg.balance("u:1") == after_first, "重复请求不得二次扣费"
+
+    def test_double_settle_is_idempotent(self):
+        """同一凭证被结算两次（重复回调 / 竞态）只生效一次。"""
+        lg = self._ledger()
+        lg.grant("u:1", 10000)
+        hold = lg.reserve("u:1", 4000, request_id="r3")
+
+        first = lg.settle(hold, effective_tokens=3000, request_id="r3")
+        balance_after = lg.balance("u:1")
+        second = lg.settle(hold, effective_tokens=3000, request_id="r3")
+
+        assert second.idempotent is True
+        assert second.charged == first.charged
+        assert lg.balance("u:1") == balance_after, "二次结算不得重复扣费"
+
+    def test_release_after_settle_is_noop(self):
+        """已结算的凭证再 release 不得退款（否则可"结算后又全额退回"刷额度）。"""
+        lg = self._ledger()
+        lg.grant("u:1", 10000)
+        hold = lg.reserve("u:1", 4000, request_id="r4")
+        lg.settle(hold, effective_tokens=3000, request_id="r4")
+        balance_after = lg.balance("u:1")
+
+        res = lg.release(hold)
+
+        assert res.idempotent is True
+        assert lg.balance("u:1") == balance_after
+
+    # ---- ④ 崩溃兜底：不能留下悬空扣费 ----
+
+    def test_sweep_expired_refunds_stale_holds(self):
+        """进程崩溃导致既没 settle 也没 release → 超时后必须自动全额退回。"""
+        from app.core.billing import HoldState
+
+        lg = self._ledger()
+        lg.grant("u:1", 10000)
+        hold = lg.reserve("u:1", 4000, ttl_s=0.01)
+        assert lg.balance("u:1") == 6000
+
+        swept = lg.sweep_expired(now=hold.expires_at + 1)
+
+        assert len(swept) == 1
+        assert swept[0].state == HoldState.expired
+        assert lg.balance("u:1") == 10000, "悬挂冻结必须兜底退回，不得吞掉用户额度"
+
+    def test_sweep_ignores_live_holds(self):
+        """未超时的冻结不得被误退。"""
+        lg = self._ledger()
+        lg.grant("u:1", 10000)
+        lg.reserve("u:1", 4000, ttl_s=9999)
+
+        assert lg.sweep_expired() == []
+        assert lg.balance("u:1") == 6000
+
+    # ---- 账户口径 ----
+
+    def test_account_key_isolates_users_and_anonymous(self):
+        from app.core.billing import account_key
+
+        assert account_key("alice") != account_key("bob")
+        assert account_key(None, "1.2.3.4") == account_key(None, "1.2.3.4")
+        assert account_key("alice") != account_key(None, "1.2.3.4")
+
+    def test_balances_are_per_account(self):
+        """A 的消费不得影响 B 的余额。"""
+        lg = self._ledger()
+        lg.grant("u:1", 10000)
+        lg.grant("u:2", 10000)
+
+        hold = lg.reserve("u:1", 4000)
+        lg.settle(hold, effective_tokens=3500)
+
+        assert lg.balance("u:2") == 10000
+
+
+class TestBillingIntegration:
+    """接口层接入：限流 key 不可伪造 + 预冻结在生成前生效。"""
+
+    def test_limiter_key_ignores_client_controlled_session_id(self):
+        """限流 key 必须绑不可伪造的身份。
+
+        原实现用 req.session_id 作 key，客户端每次换一个 id 就能重置窗口，
+        限流完全失效。此处把修正钉死：同一 IP 的不同"会话"共享同一个键。
+        """
+        from app.api.v1.chat_stream import _limiter_key
+
+        a = _limiter_key("1.2.3.4", None)
+        b = _limiter_key("1.2.3.4", None)
+        assert a == b
+        # 登录后按用户区分
+        assert _limiter_key("1.2.3.4", "u1") != _limiter_key("1.2.3.4", "u2")
+
+    def test_compare_counts_units_per_track(self):
+        """compare 一次请求按轨道数计费——防"多倍成本单倍计数"。"""
+        import inspect
+
+        from app.api.v1 import compare
+
+        src = inspect.getsource(compare.compare_stream)
+        assert "for _ in range(units)" in src, "限流必须按轨道数逐次计数"
+        assert "units=units" in src, "预冻结必须按轨道数放大"
+
+    def test_chat_stream_settles_in_finally(self):
+        """结算必须在 finally——正常结束/客户端断开/异常三条路径都要落终态。"""
+        import inspect
+
+        from app.api.v1 import chat_stream
+
+        src = inspect.getsource(chat_stream._stream)
+        assert "finally:" in src, "结算外壳必须有 finally"
+        assert "settle(" in src and "release(" in src
+        # 结算依据是实际产出，不是"发起过请求"
+        assert "produced" in src
+
+    def test_request_id_field_exists_for_idempotency(self):
+        """幂等键必须在请求模型上——否则重试必然重复扣费。"""
+        from app.models.domain import ChatRequest
+
+        assert "request_id" in ChatRequest.model_fields
+
+    def test_compare_body_has_request_id(self):
+        from app.api.v1.compare import CompareBody
+
+        assert "request_id" in CompareBody.model_fields

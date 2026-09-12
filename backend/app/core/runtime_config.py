@@ -39,8 +39,18 @@ def _blank() -> dict:
         "media": {"image_quality": "", "image_max_edge": "", "audio_bitrate": "", "audio_max_mb": ""},
         # 检索调权：预设档位 + 可选的原始系数覆盖（留空=跟随预设）
         "retrieval": {"profile": "", "vector": "", "lexical": "", "bm25": "", "canonical_bonus": "", "time_alpha": ""},
-        # 二阶段精排（Cross-Encoder）：默认关闭，走 NoopReranker 零依赖兜底
-        "rerank": {"enabled": "", "model_path": "", "tokenizer_dir": "", "tau": "", "beta": "", "recall_pool": ""},
+        # 二阶段精排（远程 Rerank API）：默认关闭，走 NoopReranker 零依赖兜底
+        "rerank": {
+            "enabled": "",
+            "protocol": "",
+            "api_base": "",
+            "api_key": "",
+            "api_model": "",
+            "timeout": "",
+            "tau": "",
+            "beta": "",
+            "recall_pool": "",
+        },
         # 会员档位：按 tier 覆盖 storage_mb/model/chat_per_min/max_upload_mb
         "plans": {},
     }
@@ -85,7 +95,17 @@ def _normalize(raw: dict | None) -> dict:
                 cfg["retrieval"][key] = str(float(val))
     rerank_src = raw.get("rerank")
     if isinstance(rerank_src, dict):
-        for key in ("enabled", "model_path", "tokenizer_dir", "tau", "beta", "recall_pool"):
+        for key in (
+            "enabled",
+            "protocol",
+            "api_base",
+            "api_key",
+            "api_model",
+            "timeout",
+            "tau",
+            "beta",
+            "recall_pool",
+        ):
             val = rerank_src.get(key)
             if val is not None and str(val).strip() != "":
                 cfg["rerank"][key] = str(val).strip()
@@ -140,7 +160,7 @@ def save_runtime_config(patch: dict) -> dict:
                 except (TypeError, ValueError):
                     continue
                 target[key] = str(float(val))
-            elif section == "rerank" and key in ("tau", "beta", "recall_pool"):
+            elif section == "rerank" and key in ("tau", "beta", "recall_pool", "timeout"):
                 try:
                     float(val)
                 except (TypeError, ValueError):
@@ -256,13 +276,19 @@ def effective(kind: str):
 
     if kind == "rerank":
         from app.services.rag.reranker import (
+            DEFAULT_API_MODEL,
             DEFAULT_BETA,
+            DEFAULT_PROTOCOL,
             DEFAULT_RECALL_POOL,
             DEFAULT_TAU,
+            DEFAULT_TIMEOUT_S,
         )
 
         section = rc.get("rerank", {})
         enabled = str(section.get("enabled") or "").strip().lower() in ("1", "true", "yes", "on")
+        protocol = str(section.get("protocol") or "").strip().lower()
+        if protocol not in DEFAULT_API_MODEL:
+            protocol = DEFAULT_PROTOCOL
 
         def _num(key: str, default: float, lo: float, hi: float) -> float:
             raw = str(section.get(key) or "").strip()
@@ -275,8 +301,11 @@ def effective(kind: str):
 
         return {
             "enabled": enabled,
-            "model_path": str(section.get("model_path") or "").strip(),
-            "tokenizer_dir": str(section.get("tokenizer_dir") or "").strip(),
+            "protocol": protocol,
+            "api_base": str(section.get("api_base") or "").strip(),
+            "api_key": str(section.get("api_key") or "").strip(),
+            "api_model": str(section.get("api_model") or "").strip(),
+            "timeout": _num("timeout", DEFAULT_TIMEOUT_S, 1.0, 60.0),
             "tau": _num("tau", DEFAULT_TAU, 0.0, 1.0),
             "beta": _num("beta", DEFAULT_BETA, 0.0, 5.0),
             "recall_pool": int(_num("recall_pool", DEFAULT_RECALL_POOL, 1, 100)),
@@ -350,6 +379,10 @@ def masked_view() -> dict:
         "retrieval": effective("retrieval"),
         "plans": rc.get("plans") or {},
     }
+    # rerank 段含 api_key，同样必须打码后再下发前端
+    rr = effective("rerank")
+    rr["api_key"] = mask_key(rr.get("api_key", ""))
+    view["rerank"] = rr
     for kind in ("llm", "embedding", "asr", "vlm"):
         eff = effective(kind)
         eff["api_key"] = mask_key(eff["api_key"])

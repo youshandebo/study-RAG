@@ -70,7 +70,7 @@ docker compose -f docker-compose.prod.yml up -d
 
 ## 模型接入
 
-**方式一：管理后台（推荐）** —— 访问 `http://localhost:3000/admin`（或点击工作台右上角 ⚙️ 管理后台），登录后在面板中在线配置以下四类模型，保存即时热生效、无需重启，配置持久化于 `backend/data/runtime_config.json`：
+**方式一：管理后台（推荐）** —— 访问 `http://localhost:3000/admin`（或点击工作台右上角 ⚙️ 管理后台），登录后在面板中在线配置以下五类模型，保存即时热生效、无需重启，配置持久化于 `backend/data/runtime_config.json`：
 
 | 配置分区 | 用途 | 协议 |
 | --- | --- | --- |
@@ -78,6 +78,7 @@ docker compose -f docker-compose.prod.yml up -d
 | 嵌入模型 | 切片与提问向量化检索 | OpenAI 兼容 `/embeddings` |
 | 语音转文字模型 | 课堂录音转录 | OpenAI 兼容 `/audio/transcriptions` |
 | 多模态识图模型 | 板书/题目照片 OCR | OpenAI 兼容视觉端点 / Anthropic |
+| 重排模型（Rerank） | 二阶段精排，提升首屏命中率 | Jina / SiliconFlow / Cohere |
 
 - 默认管理员口令 `admin123`（可用环境变量 `ADMIN_PASSWORD` 覆盖），首次登录后请在「管理员密码」分区修改。
 - 面板内每类模型均有「测试连通性」按钮；提交掩码 Key = 保持不变，清空 = 回落 `.env` 环境变量默认。
@@ -91,7 +92,66 @@ docker compose -f docker-compose.prod.yml up -d
 | `ANTHROPIC_API_KEY` | Claude 系列 |
 | `DASHSCOPE_API_KEY` | 通义千问（含 Qwen-VL 板书识别） |
 | `DEEPSEEK_API_KEY` | DeepSeek |
+| `RERANK_API_BASE` / `RERANK_API_KEY` | 二阶段精排（可选，见下节） |
 | `ADMIN_PASSWORD` | 管理员初始口令（默认 admin123） |
+
+## 二阶段精排（Rerank）
+
+粗排（向量 + 词面 + BM25 + 元数据）先取出候选池，再由重排模型做交叉注意力打分，
+最后经**门控权威加权**决定最终顺序：
+
+```
+S_final = S_sem × (1 + β)   if  is_canonical 且 S_sem ≥ τ
+S_final = S_sem             否则
+```
+
+**为什么是门控而不是让重排模型直接决定排序**：教学场景学生提问口语化，未校准的
+交叉注意力会偏好口语重合词多的原始课堂切片，把措辞凝练的教师定版答案挤出首屏。
+因此"相关度判断"（重排模型）与"可信度赋权"（定版门控）严格解耦——重排只回答
+"有多相关"，永远不决定"哪条是权威解法"。
+
+**为什么走远程 API 而不是本地 ONNX**：本项目面向单机小内存 VPS 部署，本地
+Cross-Encoder 需要几百 MB 权重 + 常驻内存 + CPU 推理，与多租户运营目标冲突。
+重排是**可选增强**（不配也能跑），必须廉价、可关、可降级。
+
+| 项 | 说明 |
+| --- | --- |
+| 支持协议 | `jina`（默认）/ `siliconflow` / `cohere` |
+| 依赖 | 仅 `httpx`（已在基础依赖内），**无需** onnxruntime / transformers |
+| 超时 | 默认 8 秒，可在面板调整（1–60） |
+| 失败行为 | 网络异常/限流/超时 → **静默回退粗排顺序**，绝不阻断问答 |
+| 未配置时 | 走 `NoopReranker`，行为与引入精排前完全一致 |
+
+配置方式三选一：管理后台「检索设置」填写；或环境变量 `RERANK_API_BASE` /
+`RERANK_API_KEY`；或离线标定脚本用 `--api-base` / `--api-key` 一次性指定。
+
+> τ / β 不要凭感觉设。仓库提供真实打分取证 + 网格标定两段式工具链：
+> `scripts/extract_rerank_dataset.py`（真实召回 → 真实打分 → 弱标注）
+> → `scripts/eval_rerank_params.py`（网格搜索 + 可解性诊断）。
+> 标定脚本会检测 `τ` 是否**可辨识**——若对抗样本未落入模糊带，会明确
+> 报告"τ 不可标定"，而不是输出一个看似合理的假阈值。
+
+## 额度计费
+
+配额（`membership.py`）管"能存多少 / 能多快问"，计费（`core/billing.py`）管
+"这一次消耗多少额度"，两者正交。
+
+计费采用**预冻结 + 终态结算**，请求开始冻结上限额度，流结束后按**实际有效
+产出**结算；低于 50 token 视为未成功交付，全额退回。任何一次请求的额度只会
+落入三种终态之一且只落一次：`settled` / `released` / `expired`。
+
+这样设计是为了避开几类典型事故：
+
+| 风险 | 对策 |
+| --- | --- |
+| 流式中断：预扣未退 **或** 后扣被白嫖 | 结算写在 `finally`，四条退出路径一视同仁 |
+| 多模型比对：N 倍成本只扣 1 次 | 冻结与限流均按轨道数（`units`）放大 |
+| 一次提问含多道题 | 计费单位可表意多题，与意图解耦 |
+| 重试重复扣费 / 崩溃悬挂扣费 | `request_id` 幂等键 + 冻结 TTL 超时自动全额退回 |
+| 多副本并发下超额 | 配置 `REDIS_URL` 后走 Redis 原子扣减；未配置则进程内锁 |
+
+> 配额单位为抽象额度，`ASK_HOLD_AMOUNT` / `TRACK_HOLD_AMOUNT` 是当前保守口径。
+> 接入真实计价表时只需替换这两个常量与 `settle()` 里的折算公式。
 
 ## 🖼️ 界面预览
 
@@ -162,8 +222,10 @@ docker-compose.yml   一键编排
 - 无 Qdrant → 进程内余弦向量索引
 - 无 Postgres → 内存仓储
 - 无 Whisper → 内置带毫秒时间戳的演示转录
+- **无 Rerank API → 跳过精排，直接沿用粗排顺序**（零外部依赖，且不含任何本地模型推理）
 - **持久化为真实可选**：`POSTGRES_DSN` 需先 `pip install asyncpg "sqlalchemy[asyncio]>=2.0"`，`QDRANT_URL` 需先 `pip install qdrant-client`；未安装驱动/未配置时自动降级进程内存储（重启即失，部署多副本必须配置）
 - 无 MinIO → 本地静态目录托管
+- 无 Redis → 限流与计费走进程内实现（单副本正确；多副本需配置 `REDIS_URL` 以共享窗口与账本）
 
 ---
 
