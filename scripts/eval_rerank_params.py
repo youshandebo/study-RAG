@@ -274,6 +274,37 @@ BUILTIN_GOLDEN: list[dict] = [
 # ---------------------------------------------------------------- 载入/输出 --
 
 
+def _guard_provenance(raw, path: pathlib.Path) -> bool:
+    """数据来源闸门：拒绝把无物理意义的 logit 标定结果写进生产。
+
+    `scripts/extract_rerank_dataset.py --allow-stub` 产出的黄金集带 `stub`
+    标记，其 logit 是哈希派生的，标出来的 (tau, beta) 与真实模型无关。
+    这里硬拦一道，避免"管线跑通了"被误读成"参数标定完成了"。
+
+    抽取脚本把 `stub` 标记写进**每一条 query**，而不是文件头——黄金集文件
+    经常被当作"一个候选数组"在人和脚本之间搬运，头部元信息容易在搬运中
+    丢失；写进每条里，这份数据就永久自证来源。
+
+    返回 True 表示数据不可采信，调用方必须直接终止——**连推荐参数都不能打印**。
+    之前的版本只警告不终止，退化标定仍会吐出 `tau=0.30 beta=0.00` 这种
+    看似合法的结果，一旦被复制进 runtime_config 就是静默事故。
+    """
+    if isinstance(raw, list) and any(
+        isinstance(item, dict) and item.get("stub") for item in raw
+    ):
+        print(
+            f"[拒绝] {path.name} 由 stub 后端产出，logit 无物理意义。\n"
+            "       本次仅可验证管线连通性，不输出任何推荐参数。\n"
+            "       真实标定请用 --model-path 指定 Cross-Encoder 后重新抽取。",
+            file=sys.stderr,
+        )
+        return True
+    if isinstance(raw, dict) and raw.get("stub"):
+        print(f"[拒绝] {path.name} 含 stub 标记，结果不可采信。", file=sys.stderr)
+        return True
+    return False
+
+
 def load_dataset(path: str | None) -> list[EvalQuery]:
     if not path:
         raw = BUILTIN_GOLDEN
@@ -283,6 +314,8 @@ def load_dataset(path: str | None) -> list[EvalQuery]:
             print(f"[错误] 黄金集不存在: {p}", file=sys.stderr)
             raise SystemExit(2)
         raw = json.loads(p.read_text(encoding="utf-8"))
+        if _guard_provenance(raw, p):
+            raise SystemExit(3)
 
     dataset: list[EvalQuery] = []
     for item in raw or []:

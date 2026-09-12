@@ -32,3 +32,9 @@ nohup.out
 
 # ---- 本地工作台数据（评审记录/会话记忆，非项目产物）----
 .workbuddy/
+
+# ---- 标定用的本地数据（查询池与抽取产物）----
+# 查询池来自真实课堂日志、抽取产物是模型 logit dump，两者都与具体部署的
+# 语料/模型绑定，不该进仓库。目录约定见 scripts/extract_rerank_dataset.py。
+data/queries*.jsonl
+data/eval_golden*.json

@@ -23,7 +23,7 @@ class TestPaperSplitter:
         from app.services.extractor.paper_splitter import split_paper
 
         paper = (
-            "1.\n判断 $\int_1^{\\infty} x^{-2} dx$ 的敛散性。\n解：收敛，因为 p=2>1。\n"
+            "1.\n判断 $\\int_1^{\\infty} x^{-2} dx$ 的敛散性。\n解：收敛，因为 p=2>1。\n"
             "2.\n质能方程是什么？\n答：E=mc²。\n"
         )
         qs = split_paper(paper)
@@ -914,3 +914,151 @@ class TestRerankEvalScript:
         second = [c.chunk_id for c, _ in ev.rank_candidates([c2, c1], 0.4, 0.3)]
 
         assert first == second, "同分排序不得依赖输入顺序，否则标定结果不可复现"
+
+
+# --------------------------------------------- 真实 logit 抽取管线 ----
+class TestLogitExtraction:
+    """抽取管线的核心风险不是「跑不通」，而是「跑通了但数据是假的、
+    却被当成真实标定用掉」。因此测试重点压在溯源标记与弱标注语义上。"""
+
+    @staticmethod
+    def _load():
+        scripts = str(Path(__file__).resolve().parent.parent.parent / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import extract_rerank_dataset as ex
+
+        return ex
+
+    def test_stub_logits_are_deterministic(self):
+        """stub 必须可复现，否则管线自检本身都不稳定。"""
+        ex = self._load()
+        b = ex.StubBackend()
+        a1 = b.score_batch("抓大头能丢 ln x 吗", ["切片甲", "切片乙"])
+        a2 = b.score_batch("抓大头能丢 ln x 吗", ["切片甲", "切片乙"])
+
+        assert a1 == a2
+
+    def test_stub_logits_stay_in_physical_band(self):
+        """stub 只为模拟真实 Cross-Encoder 的窄带，不得产生离谱量级。"""
+        ex = self._load()
+        b = ex.StubBackend()
+        vals = b.score_batch("q", [f"文本{i}" for i in range(200)])
+
+        assert all(-2.0 <= v <= 1.5 for v in vals)
+
+    def test_relevance_by_exam_point(self):
+        ex = self._load()
+        q = ex.QuerySpec(query="q", course_id="c1", exam_point="ep-a")
+        hit = ex.Recalled("k1", "t", "ep-a", "ch1", "c1", False, True)
+        miss = ex.Recalled("k2", "t", "ep-b", "ch2", "c1", False, True)
+
+        assert ex.judge_relevance(q, hit)[0] is True
+        assert ex.judge_relevance(q, miss)[0] is False
+
+    def test_relevance_by_chapter_when_exam_point_absent(self):
+        """考点缺失时按章节兜底——这是弱标注「弱」的来源，必须有测试钉住。"""
+        ex = self._load()
+        q = ex.QuerySpec(query="q", course_id="c1", chapter="5.3 反常积分")
+        c = ex.Recalled("k1", "t", "别的考点", "5.3 反常积分", "c1", False, True)
+
+        assert ex.judge_relevance(q, c)[0] is True
+
+    def test_canonical_alone_is_not_relevant_outside_scope(self):
+        """跨课程切片即使带 canonical 也不能票成相关，否则对抗样本消失。"""
+        ex = self._load()
+        q = ex.QuerySpec(query="q", course_id="c1")
+        foreign = ex.Recalled("k9", "t", "ep-x", "ch-x", "c2", True, False)
+
+        assert ex.judge_relevance(q, foreign)[0] is False
+
+    def test_adversarial_definition(self):
+        ex = self._load()
+        adv = ex.Recalled("k1", "t", "ep-b", "ch2", "c1", True, True)
+
+        assert ex.is_adversarial(adv, relevant=False) is True
+        assert ex.is_adversarial(adv, relevant=True) is False
+
+    def test_dataset_carries_provenance_marker(self):
+        """每条 query 必须自带来源标记——黄金集会被单独搬运，头部信息会丢。"""
+        ex = self._load()
+        specs = [ex.QuerySpec(query="q", course_id="math", query_id="q1")]
+        stats = ex.ExtractStats()
+
+        # 直接喂空文本，绕开真实召回：本测试只验证标记落入输出结构
+        import asyncio
+
+        orig = ex.recall_for_query
+
+        async def _fake(_q, _depth):
+            return [ex.Recalled("k1", "text", "ep", "ch", "math", True, True)]
+
+        ex.recall_for_query = _fake
+        try:
+            ds = ex.build_golden(specs, ex.StubBackend(), 15, stats)
+        finally:
+            ex.recall_for_query = orig
+
+        assert ds and ds[0]["stub"] is True
+        assert ds[0]["provenance"] == "stub"
+
+    def test_backend_defaults_to_stub_flag_off(self):
+        """真实后端产出不得带 stub 标记，否则闸门会误杀真实标定。"""
+        ex = self._load()
+        stats = ex.ExtractStats()
+
+        assert stats.stub_used is False
+
+    def test_validator_rejects_stub_dataset(self):
+        """闸门：标定脚本读到 stub 数据必须硬终止，绝不输出推荐参数。"""
+        import json
+        import tempfile
+
+        ev = self._load_eval()
+
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as fh:
+            json.dump(
+                [{"query_id": "q1", "query": "q", "stub": True,
+                  "candidates": [{"chunk_id": "k", "logit": 0.5,
+                                  "is_canonical": True, "is_relevant": True}]}],
+                fh, ensure_ascii=False,
+            )
+            path = fh.name
+
+        with pytest.raises(SystemExit) as ei:
+            ev.load_dataset(path)
+
+        assert ei.value.code == 3, "应以退出码 3 拒绝，便于流水线识别"
+
+    def test_validator_accepts_real_dataset(self):
+        """真实（非 stub）数据必须放行，否则闸门会挡死正常标定。"""
+        import json
+        import tempfile
+
+        ev = self._load_eval()
+
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as fh:
+            json.dump(
+                [{"query_id": "q1", "query": "q", "provenance": "onnx",
+                  "candidates": [{"chunk_id": "k", "logit": 0.5,
+                                  "is_canonical": True, "is_relevant": True}]}],
+                fh, ensure_ascii=False,
+            )
+            path = fh.name
+
+        ds = ev.load_dataset(path)
+
+        assert len(ds) == 1 and ds[0].candidates[0].logit == 0.5
+
+    @staticmethod
+    def _load_eval():
+        scripts = str(Path(__file__).resolve().parent.parent.parent / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import eval_rerank_params as ev
+
+        return ev
