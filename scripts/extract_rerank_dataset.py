@@ -228,16 +228,19 @@ def load_queries(path: str) -> list[QuerySpec]:
 
 
 async def recall_for_query(
-    q: QuerySpec, recall_depth: int
+    q: QuerySpec, recall_depth: int, retriever=None
 ) -> list[Recalled]:
     """真实粗排召回。直接复用生产 HybridRetriever，保证候选池口径一致。
 
     注意用 `with_context_window=False`：抽取阶段要的是**离散候选**，
     带邻近窗口会把整段连续切片灌进来，污染候选集合与标注。
-    """
-    from app.services.rag.retriever import get_retriever
 
-    retriever = await get_retriever()
+    retriever 显式传入时用于夹具模式（测试夹具注入的实例），否则取全局单例。
+    """
+    if retriever is None:
+        from app.services.rag.retriever import get_retriever
+
+        retriever = await get_retriever()
     course_id = q.course_id or None
     scored = await retriever.retrieve_scored(
         q.query,
@@ -262,16 +265,40 @@ async def recall_for_query(
     return out
 
 
+async def build_fixture_retriever():
+    """构造注入了微型多章节夹具的检索器（不依赖真实视频库）。
+
+    夹具位于 backend/tests/fixtures，是测试资产，不进生产种子语料。
+    这里显式关闭演示种子，保证候选池里只有夹具切片，标定数据干净。
+    """
+    import os
+
+    os.environ.setdefault("SEED_DEMO_CORPUS", "0")
+    from app.services.rag.retriever import HybridRetriever
+    from tests.fixtures import multichapter as fx
+
+    retriever = HybridRetriever()
+    await retriever.register_chunks(fx.FIXTURE_CHUNKS)
+    return retriever, fx
+
+
 def build_golden(
     specs: list[QuerySpec],
     backend: LogitBackend,
     recall_depth: int,
     stats: ExtractStats,
+    retriever=None,
+    ground_truth: dict[str, str] | None = None,
 ) -> list[dict]:
-    """逐查询召回 → 打分 → 弱标注，产出与标定脚本对齐的黄金集结构。"""
+    """逐查询召回 → 打分 → 弱标注，产出与标定脚本对齐的黄金集结构。
+
+    ground_truth: {query_id: relevant_chunk_id}。夹具自带精确真值，
+    有此映射时优先采用它而非多路号票的弱标签——夹具的正确答案是刻意设计的
+    （跨章节错配），弱标注的 chapter 通道在夹具场景下不适用（查询不带 chapter）。
+    """
     dataset: list[dict] = []
     for q in specs:
-        recalled = asyncio.run(recall_for_query(q, recall_depth))
+        recalled = asyncio.run(recall_for_query(q, recall_depth, retriever))
         if not recalled:
             print(f"[跳过] {q.query_id} 召回为空：{q.query[:30]}")
             continue
@@ -280,9 +307,15 @@ def build_golden(
         stats.add_logits(logits)
         stats.queries += 1
 
+        gt_id = (ground_truth or {}).get(q.query_id)
         cands: list[dict] = []
         for r, z in zip(recalled, logits):
-            relevant, why = judge_relevance(q, r)
+            if gt_id:
+                # 夹具模式：真值直接给定，弱标注不参与
+                relevant = r.chunk_id == gt_id
+                why = "ground_truth" if relevant else "ground_truth_negative"
+            else:
+                relevant, why = judge_relevance(q, r)
             if relevant:
                 stats.relevant += 1
                 if r.is_canonical:
@@ -379,17 +412,24 @@ def print_report(stats: ExtractStats, depth: int) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="真实 Cross-Encoder Logit 抽取管线")
-    ap.add_argument("--queries", required=True, help="查询池 JSONL 路径")
+    ap.add_argument("--queries", default="", help="查询池 JSONL 路径")
     ap.add_argument("--out", required=True, help="输出黄金集 JSON 路径")
     ap.add_argument("--model-path", default="", help="ONNX 模型路径（缺省走 stub 自检）")
     ap.add_argument("--tokenizer-dir", default="", help="tokenizer 目录")
     ap.add_argument("--recall-depth", type=int, default=15, help="每查询召回候选数，默认 15")
     ap.add_argument("--allow-stub", action="store_true", help="允许无模型时用 stub 后端跑通管线")
+    ap.add_argument("--fixture", action="store_true",
+                    help="用微型多章节夹具作为语料（免真实视频库，真值由夹具给定）")
     ap.add_argument("--report", action="store_true", help="只打印分布自检，不写文件")
     args = ap.parse_args(argv)
 
-    specs = load_queries(args.queries)
-    if not specs:
+    # 夹具模式可省略 --queries（直接用夹具内置查询）；两者都不给则报错
+    if not args.queries and not args.fixture:
+        print("[错误] 需提供 --queries，或使用 --fixture 走内置夹具", file=sys.stderr)
+        return 2
+
+    specs = load_queries(args.queries) if args.queries else []
+    if not specs and not args.fixture:
         print("[错误] 查询池为空", file=sys.stderr)
         return 2
 
@@ -410,8 +450,33 @@ def main(argv: list[str] | None = None) -> int:
     # 单一事实源：后端身份决定 stub 标记，不从命令行参数二次推导
     stats.stub_used = backend.name == "stub"
 
+    # 夹具模式：候选池来自 backend/tests/fixtures 的微型多章节语料，
+    # 不依赖真实视频库；真值由夹具直接给定（弱标注在夹具场景不适用，
+    # 因为查询刻意不带 chapter/exam_point）。
+    retriever = None
+    ground_truth = None
+    if args.fixture:
+        retriever, fx = asyncio.run(build_fixture_retriever())
+        ground_truth = {
+            q["query_id"]: q["expect_relevant_chunk"] for q in fx.FIXTURE_QUERIES
+        }
+        if not args.queries:
+            specs = [
+                QuerySpec(
+                    query=q["query"],
+                    course_id=q.get("course_id", ""),
+                    query_id=q["query_id"],
+                )
+                for q in fx.FIXTURE_QUERIES
+            ]
+        print(f"[夹具] 注入 {len(fx.FIXTURE_CHUNKS)} 条切片 / "
+              f"{len(ground_truth)} 条查询真值")
+
     try:
-        dataset = build_golden(specs, backend, args.recall_depth, stats)
+        dataset = build_golden(
+            specs, backend, args.recall_depth, stats,
+            retriever=retriever, ground_truth=ground_truth,
+        )
     finally:
         backend.close()
 

@@ -990,7 +990,7 @@ class TestLogitExtraction:
 
         orig = ex.recall_for_query
 
-        async def _fake(_q, _depth):
+        async def _fake(_q, _depth, _retriever=None):
             return [ex.Recalled("k1", "text", "ep", "ch", "math", True, True)]
 
         ex.recall_for_query = _fake
@@ -1062,3 +1062,289 @@ class TestLogitExtraction:
         import eval_rerank_params as ev
 
         return ev
+
+
+# --------------------------------------------- 多章节基准夹具 ----
+class TestMultiChapterFixture:
+    """夹具的核心价值：在真实检索器上构造出**真实存在**的跨章节对抗候选。
+
+    内置语料只有单章节，chapter 通道会把同章切片全部票成正样本，硬对抗样本
+    物理不存在 → 标定必然退化。夹具用「同词异章」解决这个问题，且这些样本
+    是检索器真实召回出来的，不是手捏的 logit。
+    """
+
+    @staticmethod
+    def _fixture():
+        from tests.fixtures import multichapter as fx
+
+        return fx
+
+    @staticmethod
+    async def _retriever_with_fixture():
+        import os
+
+        os.environ.setdefault("SEED_DEMO_CORPUS", "0")
+        fx = TestMultiChapterFixture._fixture()
+        from app.services.rag.retriever import HybridRetriever
+
+        r = HybridRetriever()
+        await r.register_chunks(fx.FIXTURE_CHUNKS)
+        return r
+
+    def test_fixture_shape(self):
+        """夹具规模必须够小（跑得快）又够立体（多章节 + 多定版）。"""
+        fx = self._fixture()
+
+        assert len(fx.FIXTURE_CHUNKS) <= 20, "夹具要保持轻量，否则测试变慢"
+        chapters = {c.chapter for c in fx.FIXTURE_CHUNKS}
+        assert len(chapters) >= 3, "至少三个章节才谈得上跨章节冲突"
+        canon = fx.fixture_canonical_ids()
+        assert len(canon) >= 3, "每条讲座都要有定版，否则对抗样本凑不出来"
+
+    def test_fixture_chunk_ids_unique(self):
+        fx = self._fixture()
+        ids = [c.id for c in fx.FIXTURE_CHUNKS]
+
+        assert len(ids) == len(set(ids))
+
+    def test_fixture_queries_declare_expectations(self):
+        """每条查询都要显式声明它期待的正确答案与对抗定版。"""
+        fx = self._fixture()
+        all_ids = {c.id for c in fx.FIXTURE_CHUNKS}
+
+        for q in fx.FIXTURE_QUERIES:
+            assert q["expect_relevant_chunk"] in all_ids, q["query_id"]
+            assert q["expect_adversarial_chunk"] in all_ids, q["query_id"]
+            assert q["expect_relevant_chunk"] != q["expect_adversarial_chunk"]
+
+    def test_fixture_queries_omit_exam_point(self):
+        """查询必须不带 exam_point——否则考点硬过滤会在打分前丢掉跨考点切片，
+        对抗样本根本进不了候选池，夹具就失去意义了。"""
+        fx = self._fixture()
+
+        for q in fx.FIXTURE_QUERIES:
+            assert not q.get("exam_point"), (
+                f"{q['query_id']} 携带了 exam_point，会让对抗样本被提前过滤掉"
+            )
+
+    def test_adversarial_chunks_are_canonical(self):
+        """对抗项必须是定版——否则它们不会触发门控，测不到误提权。"""
+        fx = self._fixture()
+        by_id = {c.id: c for c in fx.FIXTURE_CHUNKS}
+
+        for q in fx.FIXTURE_QUERIES:
+            adv = by_id[q["expect_adversarial_chunk"]]
+            assert adv.is_canonical, f"{adv.id} 不是定版，无法构成对抗定版"
+
+    def test_relevant_chunks_are_canonical(self):
+        """正确答案也必须是定版，否则 beta 提权对它无效，收益测不出来。"""
+        fx = self._fixture()
+        by_id = {c.id: c for c in fx.FIXTURE_CHUNKS}
+
+        for q in fx.FIXTURE_QUERIES:
+            rel = by_id[q["expect_relevant_chunk"]]
+            assert rel.is_canonical, f"{rel.id} 不是定版，吃不到 beta 红利"
+
+    def test_fixture_covers_multiple_domains(self):
+        """三个讲座应该讨论不同主题，仅共享领域词汇而非同一考点。"""
+        fx = self._fixture()
+        points = {c.exam_point for c in fx.FIXTURE_CHUNKS}
+
+        assert len(points) >= 4, "考点太少说明三讲其实是同一件事"
+
+    def test_real_recall_brings_adversarial_into_pool(self):
+        """端到端核心断言：真实检索器必须把该查询的对抗定版召进候选池。
+
+        这是整套标定方案成立的**物理前提**。如果这条挂了，说明检索器
+        的过滤/召回逻辑让对抗样本无法出现，标定就只能靠造假数据。
+        """
+        import asyncio
+
+        fx = self._fixture()
+
+        async def _run():
+            r = await self._retriever_with_fixture()
+            out = {}
+            for q in fx.FIXTURE_QUERIES:
+                scored = await r.retrieve_scored(
+                    q["query"], top_k=15, course_id=q["course_id"]
+                )
+                out[q["query_id"]] = {c.id for _s, c in scored}
+            return out
+
+        pools = asyncio.run(_run())
+
+        for q in fx.FIXTURE_QUERIES:
+            pool = pools[q["query_id"]]
+            assert q["expect_relevant_chunk"] in pool, (
+                f"{q['query_id']}: 正确答案未召回"
+            )
+            assert q["expect_adversarial_chunk"] in pool, (
+                f"{q['query_id']}: 对抗定版未进入候选池，标定前提不成立"
+            )
+
+    def test_real_recall_has_multiple_candidates_per_query(self):
+        """候选池要够深，否则排序无从谈起（内置语料就是每查询仅 1 条的退化态）。"""
+        import asyncio
+
+        fx = self._fixture()
+
+        async def _run():
+            r = await self._retriever_with_fixture()
+            sizes = []
+            for q in fx.FIXTURE_QUERIES:
+                scored = await r.retrieve_scored(
+                    q["query"], top_k=15, course_id=q["course_id"]
+                )
+                sizes.append(len(scored))
+            return sizes
+
+        sizes = asyncio.run(_run())
+
+        assert all(n >= 5 for n in sizes), f"候选池过浅: {sizes}"
+
+    def test_canonical_bonus_flattens_coarse_scores(self):
+        """记录一个真实缺陷:粗排的 canonical_bonus 是**固定加分**,不区分彼此。
+
+        三条定版会拿到完全相同的融合分,粗排阶段根本无法排序——跨章节的
+        错误定版可以和正确答案并列甚至靠前。门控之所以必需,根因在这里。
+        本测试把这个事实钉住,防止将来有人误以为粗排已经够用。
+        """
+        import asyncio
+
+        fx = self._fixture()
+        q = fx.FIXTURE_QUERIES[0]
+
+        async def _run():
+            r = await self._retriever_with_fixture()
+            return await r.retrieve_scored(
+                q["query"], top_k=15, course_id=q["course_id"]
+            )
+
+        scored = asyncio.run(_run())
+        by_id = {c.id: s for s, c in scored}
+
+        rel, adv = q["expect_relevant_chunk"], q["expect_adversarial_chunk"]
+        if rel in by_id and adv in by_id:
+            # 二者都是 canonical、都加了同一个 bonus，粗排分必然相同
+            assert by_id[rel] == pytest.approx(by_id[adv], abs=1e-9), (
+                "若此断言失败，说明粗排已能区分定版优劣，"
+                "那么重排的门控设计需要重新评估"
+            )
+
+    def test_fixture_dataset_feeds_calibration_script(self):
+        """夹具产出的候选必须能被标定脚本消费（结构对齐 = 闭环可用）。"""
+        import asyncio
+        import json
+        import tempfile
+
+        fx = self._fixture()
+        scripts = str(Path(__file__).resolve().parent.parent.parent / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import eval_rerank_params as ev
+
+        async def _run():
+            r = await self._retriever_with_fixture()
+            rows = []
+            for q in fx.FIXTURE_QUERIES:
+                scored = await r.retrieve_scored(
+                    q["query"], top_k=15, course_id=q["course_id"]
+                )
+                cands = []
+                for _s, c in scored:
+                    is_rel = c.id == q["expect_relevant_chunk"]
+                    cands.append(
+                        {
+                            "chunk_id": c.id,
+                            "logit": 1.0 if is_rel else 0.0,
+                            "is_canonical": bool(c.is_canonical),
+                            "is_relevant": bool(is_rel),
+                        }
+                    )
+                rows.append(
+                    {"query_id": q["query_id"], "query": q["query"],
+                     "candidates": cands}
+                )
+            return rows
+
+        rows = asyncio.run(_run())
+
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as fh:
+            json.dump(rows, fh, ensure_ascii=False)
+            path = fh.name
+
+        ds = ev.load_dataset(path)
+
+        assert len(ds) == len(fx.FIXTURE_QUERIES)
+        assert all(q.candidates for q in ds), "夹具喂出的候选不得为空"
+
+    def test_fixture_not_wired_into_production_corpus(self):
+        """夹具绝不能进生产语料——否则会污染真实部署的检索结果。"""
+        from app.services.rag import corpus
+
+        production_ids = {c["id"] for c in corpus.SEED_CHUNKS}
+        fx = self._fixture()
+        fixture_ids = {c.id for c in fx.FIXTURE_CHUNKS}
+
+        assert not (production_ids & fixture_ids), "夹具切片混进了生产演示语料"
+
+    def test_fixture_mode_produces_adversarial_samples(self):
+        """--fixture 模式必须真的产出硬对抗负样本。
+
+        这是本轮的核心修复目标：内置语料下对抗样本恒为 0，标定退化成常量。
+        夹具模式下必须 > 0，否则等于白做。
+        """
+        scripts = str(Path(__file__).resolve().parent.parent.parent / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import extract_rerank_dataset as ex
+
+        import asyncio
+
+        fx = self._fixture()
+        retriever, _fx = asyncio.run(ex.build_fixture_retriever())
+        specs = [
+            ex.QuerySpec(query=q["query"], course_id=q["course_id"], query_id=q["query_id"])
+            for q in fx.FIXTURE_QUERIES
+        ]
+        gt = {q["query_id"]: q["expect_relevant_chunk"] for q in fx.FIXTURE_QUERIES}
+        stats = ex.ExtractStats()
+
+        ds = ex.build_golden(
+            specs, ex.StubBackend(), 15, stats,
+            retriever=retriever, ground_truth=gt,
+        )
+
+        assert stats.adversarial > 0, "夹具模式下仍未产出对抗样本，标定必然退化"
+        assert stats.relevant_canonical > 0, "相关定版为 0 时 activation 无法度量"
+        assert stats.candidates >= 5 * 5, f"候选池过浅: {stats.candidates}"
+
+    def test_ground_truth_overrides_weak_label(self):
+        """夹具真值必须覆盖弱标注——弱标注的 chapter 通道在夹具场景不适用。"""
+        import asyncio
+
+        scripts = str(Path(__file__).resolve().parent.parent.parent / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import extract_rerank_dataset as ex
+
+        fx = self._fixture()
+        retriever, _ = asyncio.run(ex.build_fixture_retriever())
+        q = fx.FIXTURE_QUERIES[0]
+        specs = [ex.QuerySpec(query=q["query"], course_id=q["course_id"],
+                              query_id=q["query_id"])]
+        gt = {q["query_id"]: q["expect_relevant_chunk"]}
+        stats = ex.ExtractStats()
+
+        ds = ex.build_golden(
+            specs, ex.StubBackend(), 15, stats,
+            retriever=retriever, ground_truth=gt,
+        )
+
+        marked = [c for c in ds[0]["candidates"] if c["is_relevant"]]
+        assert len(marked) == 1, "夹具真值应恰好标出一条相关切片"
+        assert marked[0]["chunk_id"] == q["expect_relevant_chunk"]
+        assert marked[0]["label_reason"] == "ground_truth"
