@@ -183,3 +183,74 @@ class TestRetrievalScoring:
         hits = await retriever.retrieve_scored("ut 考点", course_id="ut-course", retrieval_mode="review")
         ids = [c.id for _, c in hits]
         assert "ut-old" not in ids and "ut-new" in ids
+
+
+# ---------------------------------------------------- 自测题判分链路 ----
+@pytest.mark.asyncio
+class TestQuizGradePipeline:
+    """回归：判分必须依据出题时落库的真实答案，而不是写死的演示结论。
+
+    历史 bug：/quiz/grade 只认"选项 A 正确"并复述演示题解析，配了真实模型
+    后每次自测都给出与题目无关的对错。这里覆盖"出题 → 落库 → 判分"整条链路。
+    """
+
+    @staticmethod
+    def _quiz_message(session_id: str, answer: str, options: list[str]) -> dict:
+        from app.models.domain import MessageType, PolymorphicMessage, QuizPayload
+
+        msg = PolymorphicMessage(
+            session_id=session_id, role="assistant", type=MessageType.quiz_card,
+            content="下列哪一项正确？",
+        )
+        msg.quiz_payload = QuizPayload(
+            question_text="下列哪一项正确？", options=options, target_pitfall="ut 陷阱",
+            explanation="ut 解析", answer=answer,
+        )
+        return msg.to_client()
+
+    @staticmethod
+    async def _session() -> str:
+        import app.db.relational as repo
+
+        return (await repo.create_session("ut-quiz"))["id"]
+
+    async def test_grades_against_real_answer_not_first_option(self):
+        """正确答案不是 A 时，选 A 必须判错、选 C 必须判对。"""
+        from app.api.v1 import chat_stream
+        from app.services.agent.quiz_generator import correct_option_index, grade_objective
+        import app.db.relational as repo
+
+        sid = await self._session()
+        await repo.append_message(sid, self._quiz_message(sid, "C", ["甲", "乙", "丙", "丁"]))
+
+        payload = await chat_stream._last_quiz_payload(sid)
+        assert payload is not None and payload.answer == "C"
+        assert correct_option_index(payload) == 2
+        assert grade_objective(payload, "A")[0] is False
+        assert grade_objective(payload, "C")[0] is True
+
+    async def test_no_quiz_in_session_returns_none(self):
+        """会话中没有自测题时不臆造结论，交回前端走"需复核"。"""
+        from app.api.v1 import chat_stream
+
+        sid = await self._session()
+        assert await chat_stream._last_quiz_payload(sid) is None
+        assert await chat_stream._last_quiz_payload("") is None
+
+    async def test_text_answer_and_missing_answer(self):
+        """答案为选项原文 / 填空题无标准答案两种边界。"""
+        from app.services.agent.quiz_generator import correct_option_index, grade_objective
+        from app.models.domain import QuizPayload
+
+        by_text = QuizPayload(
+            question_text="q", options=["收敛", "发散"], target_pitfall="t",
+            explanation="e", answer="发散",
+        )
+        assert correct_option_index(by_text) == 1
+        assert grade_objective(by_text, "发散")[0] is True
+
+        no_answer = QuizPayload(
+            question_text="求极限", options=None, target_pitfall="t", explanation="e", answer=None,
+        )
+        assert correct_option_index(no_answer) is None
+        assert grade_objective(no_answer, "A")[0] is None

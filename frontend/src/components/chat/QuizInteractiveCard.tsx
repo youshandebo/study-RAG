@@ -5,15 +5,8 @@
 /** 靶向测验卡片：选项作答 + 即时诊断反馈 */
 import { useState } from 'react';
 import Markdown from './Markdown';
-import { gradeQuiz } from '@/lib/api';
+import { gradeQuiz, type GradeResult } from '@/lib/api';
 import type { PolymorphicMessage } from '@/types/message';
-
-interface GradeInfo {
-  correct: boolean;
-  chosen: string;
-  attribution: string;
-  suggestion: string;
-}
 
 export default function QuizInteractiveCard({
   message,
@@ -24,15 +17,14 @@ export default function QuizInteractiveCard({
 }) {
   const payload = message.quizPayload;
   const [selected, setSelected] = useState<number | null>(null);
-  const [grade, setGrade] = useState<GradeInfo | null>(null);
+  const [grade, setGrade] = useState<GradeResult | null>(null);
   const [grading, setGrading] = useState(false);
 
   const answer = async (index: number) => {
     if (grade || grading) return;
     setSelected(index);
     setGrading(true);
-    const g = await gradeQuiz(index);
-    setGrade(g);
+    setGrade(await gradeQuiz(message.sessionId, index));
     setGrading(false);
   };
 
@@ -53,12 +45,16 @@ export default function QuizInteractiveCard({
         <div className="mt-3 space-y-2" role="radiogroup" aria-label="选项">
           {payload.options.map((opt, i) => {
             const isChosen = selected === i;
+            // 正确项由后端返回的下标决定（不再假定第一个选项是对的）；
+            // correct_index 为 null 表示本题无法定位标准答案，不高亮任何选项
             const state = !grade
               ? 'idle'
-              : i === 0
+              : grade.correct_index === i
                 ? 'correct'
                 : isChosen
-                  ? 'wrong'
+                  ? grade.correct_index === null
+                    ? 'chosen'
+                    : 'wrong'
                   : 'idle';
             return (
               <button
@@ -72,7 +68,9 @@ export default function QuizInteractiveCard({
                     ? 'border-chalk bg-chalk-soft text-chalk'
                     : state === 'wrong'
                       ? 'border-cinnabar bg-cinnabar-soft text-cinnabar'
-                      : 'border-rule bg-white hover:border-warn hover:bg-warn-soft/50'
+                      : state === 'chosen'
+                        ? 'border-warn bg-warn-soft/60'
+                        : 'border-rule bg-white hover:border-warn hover:bg-warn-soft/50'
                 }`}
               >
                 <Markdown text={opt} />
@@ -87,11 +85,23 @@ export default function QuizInteractiveCard({
       {grade && (
         <div
           className={`mt-3 rounded-lg border px-4 py-3 ${
-            grade.correct ? 'border-chalk/50 bg-chalk-soft/60' : 'border-cinnabar/50 bg-cinnabar-soft/60'
+            grade.correct === null
+              ? 'border-rule bg-warn-soft/40'
+              : grade.correct
+                ? 'border-chalk/50 bg-chalk-soft/60'
+                : 'border-cinnabar/50 bg-cinnabar-soft/60'
           }`}
         >
-          <div className={`font-display text-[13px] font-bold ${grade.correct ? 'text-chalk' : 'text-cinnabar'}`}>
-            {grade.correct ? '✅ 回答正确' : '❌ 回答有误'} · 选择了 {grade.chosen}
+          <div
+            className={`font-display text-[13px] font-bold ${
+              grade.correct === null ? 'text-ink-soft' : grade.correct ? 'text-chalk' : 'text-cinnabar'
+            }`}
+          >
+            {grade.correct === null
+              ? `⚠️ 需复核 · 选择了 ${grade.chosen}`
+              : grade.correct
+                ? `✅ 回答正确 · 选择了 ${grade.chosen}`
+                : `❌ 回答有误 · 选择了 ${grade.chosen}`}
           </div>
           <div className="mt-1.5 text-[13px] text-ink-soft">
             <Markdown text={grade.attribution} />

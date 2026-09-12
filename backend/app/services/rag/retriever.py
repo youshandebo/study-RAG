@@ -120,7 +120,15 @@ class HybridRetriever:
         self._seeded = False
 
     async def _ensure_seeded(self) -> None:
+        """首次检索前决定是否灌入内置演示语料（每个进程只做一次）。
+
+        真实部署（配了真实模型 Key）默认不再灌入，避免演示数据混进生产知识库；
+        需要时可用 SEED_DEMO_CORPUS=1 显式开启，或用 =0 在演示模式下也关闭。
+        """
         if self._seeded:
+            return
+        self._seeded = True
+        if not get_settings().seed_demo_corpus_effective:
             return
         for item in corpus.SEED_CHUNKS:
             chunk = Chunk(**item)
@@ -129,7 +137,6 @@ class HybridRetriever:
             self._vectors[chunk.id] = vec
             await self._store.upsert(chunk.id, vec, chunk.to_payload())
             self._bm25.add(chunk.id, embedder._tokenize(f"{chunk.exam_point} {chunk.text}"))
-        self._seeded = True
 
     @staticmethod
     def _lexical_overlap(query_tokens: set[str], text: str) -> float:

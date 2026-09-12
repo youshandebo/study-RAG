@@ -107,6 +107,21 @@ class QuizGenerator:
         return fallback
 
 
+def correct_option_index(payload: QuizPayload) -> int | None:
+    """标准答案对应的选项下标；填空题 / 无法定位时返回 None（前端不高亮）。"""
+    options = payload.options or []
+    if not options or not payload.answer:
+        return None
+    ans = payload.answer.strip()
+    by_letter = {chr(ord("A") + i): i for i in range(len(options))}
+    if ans.upper() in by_letter:
+        return by_letter[ans.upper()]
+    for i, opt in enumerate(options):
+        if str(opt).strip() == ans:
+            return i
+    return None
+
+
 def grade_objective(payload: QuizPayload, student_answer: str | None) -> tuple[bool | None, str]:
     """客观题判分：与 payload.answer 比对（选项字母或文本等价）。
 

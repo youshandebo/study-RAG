@@ -36,8 +36,8 @@ from app.models.domain import (
     SolvePayload,
     UsageInfo,
 )
-from app.services.agent.evaluator import Evaluator
-from app.services.agent.quiz_generator import QuizGenerator
+from app.core.config import get_settings
+from app.services.agent.quiz_generator import QuizGenerator, correct_option_index, grade_objective
 from app.services.agent.socratic_tutor import SocraticTutor
 from app.services.extractor import difficulty as difficulty_svc
 from app.services.extractor.pitfall import extract_from_chunks
@@ -157,7 +157,12 @@ def _user_query(req: ChatRequest, ocr_text: str | None, history: list[dict]) -> 
     return "反常积分收敛性判定"
 
 
-_CONTEXT_LIMIT = 131072  # 演示口径：128K
+def _context_limit() -> int:
+    """上下文容量上限：读 CONTEXT_LIMIT 配置（默认 128K），换模型时同步调整即可。"""
+    try:
+        return max(1024, int(get_settings().context_limit))
+    except (TypeError, ValueError):
+        return 131072
 
 
 async def _build_usage(session_id: str, system_text: str, retrieval_text: str, output: str, duration_ms: int) -> UsageInfo:
@@ -180,7 +185,7 @@ async def _build_usage(session_id: str, system_text: str, retrieval_text: str, o
         duration_ms=max(1, duration_ms),
         cache_hit_rate=cache_rate,
         context_used=inp,
-        context_limit=_CONTEXT_LIMIT,
+        context_limit=_context_limit(),
         context_breakdown=[
             {"label": "消息", "tokens": hist},
             {"label": "系统提示词", "tokens": sys_t},
@@ -432,21 +437,104 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
     yield _sse("done", {})
 
 
-_evaluator = Evaluator()
+async def _last_quiz_payload(session_id: str) -> QuizPayload | None:
+    """取该会话最近一道自测题（含出題时落库的真实答案），作为判分依据。"""
+    if not session_id:
+        return None
+    try:
+        messages = await repo.list_messages(session_id)
+    except Exception:
+        return None
+    for m in reversed(messages or []):
+        if m.get("role") != "assistant" or m.get("type") != MessageType.quiz_card.value:
+            continue
+        raw = m.get("quiz_payload")
+        if not raw:
+            continue
+        try:
+            return QuizPayload(**raw)
+        except Exception:
+            continue  # 脏数据/旧结构，继续往前找
+    return None
 
 
 @router.post("/quiz/grade")
-async def grade_quiz(option_index: int, session_id: str = ""):
-    result = _evaluator.grade_option(option_index)
+async def grade_quiz(
+    option_index: int,
+    session_id: str = "",
+    user: AuthUser = Depends(current_user_optional),
+):
+    """按本次真实生成的题目判分。
+
+    判分依据取自出题时随消息落库的 QuizPayload（含 answer），与演示内容无关。
+    会话归属校验同 /chat/stream；找不到题目或本题无标准答案时 correct=None，
+    前端按"需复核"处理，不再给出可能错误的对错结论。
+    """
+    if session_id and not user.anonymous:
+        owner = await repo.get_session_owner(session_id)
+        if owner and owner != user.id:
+            raise HTTPException(status_code=403, detail="无权作答该会话的题目")
+
+    chosen = chr(ord("A") + option_index) if 0 <= option_index < 26 else "?"
+    payload = await _last_quiz_payload(session_id)
+    if payload is None:
+        return {
+            "correct": None,
+            "chosen": chosen,
+            "correct_index": None,
+            "attribution": "未能定位本题的标准答案，请重新出一道自测题。",
+            "suggestion": "当前会话没有可判分的自测题，或消息存储暂不可用。",
+        }
+
+    correct, msg = grade_objective(payload, chosen)
+    if correct is None:
+        attribution = msg
+        suggestion = "本题需结合解析人工复核。"
+    else:
+        attribution = payload.explanation or msg
+        if not correct:
+            attribution = f"{msg}。{attribution}"
+        suggestion = (
+            f"本题针对易错点「{payload.target_pitfall}」，难度 {payload.difficulty}/5。"
+            + ("答对了，可换同型变式再巩固一次。" if correct else "建议回看解析后重做同型变式。")
+        )
     return {
-        "correct": result.correct,
-        "chosen": result.chosen,
-        "attribution": result.attribution,
-        "suggestion": result.suggestion,
+        "correct": correct,
+        "chosen": chosen,
+        "correct_index": correct_option_index(payload),
+        "attribution": attribution,
+        "suggestion": suggestion,
     }
 
 
 @router.post("/socratic/reply")
-async def socratic_reply(session_id: str, reply: str):
-    payload = await SocraticTutor().start_or_advance(session_id, reply)
+async def socratic_reply(
+    session_id: str,
+    reply: str,
+    user: AuthUser = Depends(current_user_optional),
+):
+    """学生作答后推进引导：与首轮一样带上最近对话与课堂检索上下文，避免引导脱题。"""
+    if not user.anonymous:
+        owner = await repo.get_session_owner(session_id)
+        if owner and owner != user.id:
+            raise HTTPException(status_code=403, detail="无权在该会话中继续")
+
+    history = await _history_messages(session_id)
+    topic = ""
+    for m in reversed(history):
+        if m.get("role") == "user":
+            topic = str(m.get("content") or "")
+            break
+    context = ""
+    if topic:
+        try:
+            _refs, _chunks = await _retrieve_evidence(topic, top_k=3)
+            context = "\n---\n".join(
+                f"[{_c.board_caption or _c.exam_point}] {_c.text[:200]}" for _c in _chunks[:3]
+            )
+        except Exception:
+            context = ""
+    payload = await SocraticTutor().start_or_advance(
+        session_id, reply, topic=topic or reply, context=context, history=history,
+    )
     return payload

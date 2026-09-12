@@ -263,9 +263,19 @@ export async function fetchMessages(sessionId: string) {
 }
 
 // ----------------------------------------------------------------- quiz ----
-export async function gradeQuiz(optionIndex: number) {
-  const resp = await fetch(`${API_BASE}/quiz/grade?option_index=${optionIndex}`, { method: 'POST' });
-  return resp.json() as Promise<{ correct: boolean; chosen: string; attribution: string; suggestion: string }>;
+export interface GradeResult {
+  correct: boolean | null;
+  chosen: string;
+  correct_index: number | null;
+  attribution: string;
+  suggestion: string;
+}
+
+export async function gradeQuiz(sessionId: string, optionIndex: number): Promise<GradeResult> {
+  const qs = new URLSearchParams({ option_index: String(optionIndex), session_id: sessionId });
+  const resp = await fetch(`${API_BASE}/quiz/grade?${qs}`, authInit({ method: 'POST' }));
+  handleAuthError(resp.status);
+  return resp.json();
 }
 
 // ----------------------------------------------------------------- evidence ---

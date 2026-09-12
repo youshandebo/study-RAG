@@ -14,6 +14,16 @@ def _has(key: str) -> bool:
     return bool(os.getenv(key, "").strip())
 
 
+def _tri_bool(key: str) -> bool | None:
+    """三态布尔：显式 1/0 生效，未配置返回 None（交由业务按场景推导）。"""
+    raw = os.getenv(key, "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")
 
@@ -52,6 +62,13 @@ class Settings(BaseSettings):
         default_factory=lambda: "openai" if _has("OPENAI_API_KEY") else "hash"
     )
 
+    # ---- 演示内容与展示口径 ----
+    # 是否把内置演示语料灌入知识库。未显式配置时：仅在演示模式（无任何真实 Key）
+    # 下灌入，配了真实模型即视为真实部署，不再用演示语料污染知识库。
+    seed_demo_corpus: bool | None = Field(default_factory=lambda: _tri_bool("SEED_DEMO_CORPUS"))
+    # 上下文容量上限（tokens）：前端容量条按此换算，换模型时改成对应窗口大小
+    context_limit: int = Field(default_factory=lambda: int(os.getenv("CONTEXT_LIMIT", "131072") or 131072))
+
     @property
     def mock_mode(self) -> bool:
         """无任何真实 Key 时自动进入内置演示引擎模式。"""
@@ -63,6 +80,11 @@ class Settings(BaseSettings):
                 self.deepseek_api_key,
             ]
         )
+
+    @property
+    def seed_demo_corpus_effective(self) -> bool:
+        """演示语料是否入库：显式配置优先，未配置时跟随演示模式。"""
+        return self.mock_mode if self.seed_demo_corpus is None else self.seed_demo_corpus
 
 
 @lru_cache

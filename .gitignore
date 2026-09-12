@@ -29,3 +29,6 @@ backend/app/static/boards/*
 .DS_Store
 *.log
 nohup.out
+
+# ---- 本地工作台数据（评审记录/会话记忆，非项目产物）----
+.workbuddy/
