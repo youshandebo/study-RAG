@@ -184,6 +184,50 @@ class TestRetrievalScoring:
         ids = [c.id for _, c in hits]
         assert "ut-old" not in ids and "ut-new" in ids
 
+    async def test_missing_date_not_treated_as_today(self, retriever):
+        """回归：无时间戳切片不得被当作"今天"从而白拿最大衰减提权。
+
+        历史 bug：ingest 的 _tag_scope 用 `lecture_date or today` 兜底，
+        导致 dt=0 → 衰减系数取到 1+α（最大值），越是没日期的资料越靠前，
+        与"随堂提权近讲"的设计意图完全相反。
+        """
+        from app.services.rag.chunker import Chunk
+
+        undated = Chunk(
+            id="ut-undated", audio_id="ut", start="00:00", end="00:10",
+            text="反常积分 抓大头 判别法", course_id="ut-date-course",
+            exam_point="ut 日期考点", lecture_date="",
+        )
+        await retriever.register_chunks([undated])
+        hits = await retriever.retrieve_scored(
+            "反常积分 抓大头", course_id="ut-date-course", retrieval_mode="lecture"
+        )
+        # 空 lecture_date 不参与衰减，但也不该被吞掉——仍可被正常召回
+        assert any(c.id == "ut-undated" for _, c in hits)
+
+    async def test_dated_chunk_boosted_over_undated(self, retriever):
+        """同样相关的两份切片，有近期日期的应当排在无日期的前面。"""
+        from app.services.rag.chunker import Chunk
+
+        token = "utscale"
+        stale = Chunk(
+            id=f"ut-stale-{token}", audio_id="ut", start="00:00", end="00:10",
+            text=f"反常积分 抓大头 {token}", course_id="ut-scale-course",
+            exam_point=f"ut 尺度考点 {token}", lecture_date="2000-01-01",
+        )
+        fresh = Chunk(
+            id=f"ut-fresh-{token}", audio_id="ut", start="00:00", end="00:10",
+            text=f"反常积分 抓大头 {token}", course_id="ut-scale-course",
+            exam_point=f"ut 尺度考点 {token}", lecture_date=date.today().isoformat(),
+        )
+        await retriever.register_chunks([stale, fresh])
+        hits = await retriever.retrieve_scored(
+            f"反常积分 抓大头 {token}", course_id="ut-scale-course", retrieval_mode="lecture"
+        )
+        ids = [c.id for _, c in hits]
+        assert f"ut-fresh-{token}" in ids and f"ut-stale-{token}" in ids
+        assert ids.index(f"ut-fresh-{token}") < ids.index(f"ut-stale-{token}")
+
 
 # ---------------------------------------------------- 自测题判分链路 ----
 @pytest.mark.asyncio
@@ -406,3 +450,103 @@ class TestPutObject:
         url = await minio_client.put_object("boards", "note.png", base64.b64encode(b"png").decode())
 
         assert url.startswith("/static/boards/")
+
+
+# ------------------------------------------ 客户端断开后停止空转生成 ----
+@pytest.mark.asyncio
+class TestGhostGeneration:
+    """回归：客户端断开必须中断 LLM 流，否则后台跑完全文白烧 token。
+
+    历史 bug：/chat/stream 的 _stream 生成器从不检查 request.is_disconnected()，
+    关页面 / 点停止后后端仍把整段生成跑完。
+    """
+
+    async def test_disconnect_stops_solve_generation(self, monkeypatch):
+        from app.api.v1 import chat_stream as cs
+
+        produced: list[str] = []
+
+        class _FakeProvider:
+            async def stream_chat(self, _messages):
+                for i in range(50):
+                    produced.append(f"chunk{i}")
+                    yield f"chunk{i}"
+
+        class _FakeRequest:
+            def __init__(self) -> None:
+                self.polls = 0
+
+            async def is_disconnected(self) -> bool:
+                self.polls += 1
+                return self.polls > 3  # 第 4 次探测时"客户端已断开"
+
+        req = _FakeRequest()
+
+        async def _fake_retrieve(*_a, **_kw):
+            return [], []
+
+        monkeypatch.setattr(cs, "_retrieve_evidence", _fake_retrieve)
+        monkeypatch.setattr(cs, "get_tier_provider", lambda _m: _FakeProvider())
+
+        chat_req = cs.ChatRequest(session_id="ut-ghost", text="讲讲反常积分", force_intent="solve")
+        out = [frame async for frame in cs._stream(chat_req, "", req)]
+
+        # 断开后不应把 50 个 chunk 全跑完
+        assert len(produced) < 50, f"断开后仍生成完 {len(produced)} 个 chunk，未中断"
+        assert any("delta" in f for f in out)
+
+    async def test_no_request_degrades_gracefully(self, monkeypatch):
+        """未传 request（旧调用方）时不得抛错，按'未断开'处理。"""
+        from app.api.v1 import chat_stream as cs
+
+        async def _fake_retrieve(*_a, **_kw):
+            return [], []
+
+        monkeypatch.setattr(cs, "_retrieve_evidence", _fake_retrieve)
+
+        chat_req = cs.ChatRequest(session_id="ut-ghost2", text="你好", force_intent="general")
+        frames = [f async for f in cs._stream(chat_req, "")]
+        assert frames, "无 request 时仍应正常产出事件"
+
+
+# ------------------------------------------------------ 空切片不入库 ----
+class TestEmptyChunkFiltering:
+    """回归：空白 / 纯符号切片不得进入向量库（会霸占 top_k 有效名额）。"""
+
+    def test_chunker_drops_blank_and_symbol_chunks(self):
+        from app.services.rag.chunker import chunk_transcript
+        from app.services.rag.chunker import TranscriptSegment
+
+        segments = [
+            TranscriptSegment(start_ms=0, end_ms=1000, text="   "),
+            TranscriptSegment(start_ms=1000, end_ms=2000, text="\n\t"),
+            TranscriptSegment(start_ms=2000, end_ms=3000, text="抓大头判别法。"),
+        ]
+        chunks = chunk_transcript("ut-blank", segments)
+        assert len(chunks) == 1
+        assert chunks[0].text == "抓大头判别法。"
+
+    def test_chunker_keeps_normal_text(self):
+        from app.services.rag.chunker import chunk_transcript, TranscriptSegment
+
+        segments = [
+            TranscriptSegment(start_ms=0, end_ms=1000, text="同学们看这道题。"),
+            TranscriptSegment(start_ms=1000, end_ms=2000, text="抓大头是关键。"),
+        ]
+        chunks = chunk_transcript("ut-keep", segments)
+        assert len(chunks) >= 1
+        assert all(c.text.strip() for c in chunks)
+
+    @pytest.mark.asyncio
+    async def test_register_chunks_skips_blank(self):
+        from app.services.rag.chunker import Chunk
+        from app.services.rag.retriever import get_retriever
+
+        retriever = await get_retriever()
+        blank = Chunk(
+            id="ut-blank-reg", audio_id="ut", start="00:00", end="00:10",
+            text="   \n  ", course_id="ut-blank-course",
+        )
+        added = await retriever.register_chunks([blank])
+        assert added == 0
+        assert "ut-blank-reg" not in retriever._chunks

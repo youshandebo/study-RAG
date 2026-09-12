@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -52,6 +53,7 @@ from app.services.rag.retriever import get_retriever
 from app.services.tokens import estimate_tokens
 
 router = APIRouter()
+_logger = logging.getLogger("app.api.chat_stream")
 
 # 流式对话限流：按会员档位分配速率（SSE 单次连接计数一次），key=IP+会话
 _tier_limiters: dict[str, SlidingWindowLimiter] = {}
@@ -216,11 +218,23 @@ async def chat_stream(req: ChatRequest, request: Request, user: AuthUser = Depen
     # 档位模型：plan.model 非空时用主通道凭证换档位模型名（服务端注入，客户端不可选）
     tier_model = str(plan_for(user.tier).get("model") or "")
     return StreamingResponse(
-        _stream(req, tier_model), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
+        _stream(req, tier_model, request), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
     )
 
 
-async def _stream(req: ChatRequest, tier_model: str = ""):
+async def _stream(req: ChatRequest, tier_model: str = "", request: Request | None = None):
+    """流式生成。request 用于连接存活检测——客户端关页面/点停止后必须中断生成，
+    否则 LLM 会在后台跑完全文，白烧 token 且占住连接（Ghost Generation）。
+    """
+
+    async def _aborted() -> bool:
+        if request is None:
+            return False
+        try:
+            return await request.is_disconnected()
+        except Exception:  # 连接对象已销毁等，一律按未断开处理，不打断正常流程
+            return False
+
     t0 = time.time()
     u_sys = u_ret = u_out = ""
     intent = classify(req.text, has_image=bool(req.image_b64), force=req.force_intent)
@@ -275,6 +289,9 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
         full = ""
         try:
             async for piece in provider.stream_chat(messages):
+                if await _aborted():
+                    _logger.info("客户端断开，中断 solve 生成（已产出 %d 字）", len(full))
+                    break
                 full += piece
                 yield _sse("delta", {"text": piece})
         except Exception:
@@ -378,6 +395,9 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
             )
         try:
             async for piece in provider.stream_chat([*history, {"role": "user", "content": user_content}]):
+                if await _aborted():
+                    _logger.info("客户端断开，中断 general 生成（已产出 %d 字）", len(full))
+                    break
                 full += piece
                 yield _sse("delta", {"text": piece})
         except Exception:
@@ -405,6 +425,8 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
         async def pump(index: int, key: str, display: str) -> None:
             try:
                 async for piece in dispatcher.stream(key, req.text or query, history):
+                    if await _aborted():
+                        break
                     await queue.put((index, display, piece))
             except Exception:
                 pass
@@ -419,6 +441,9 @@ async def _stream(req: ChatRequest, tier_model: str = ""):
                 finished += 1
                 tracks[index].status = "done"
                 continue
+            if await _aborted():
+                _logger.info("客户端断开，中断对比生成（%d/%d 轨完成）", finished, len(tasks))
+                break
             tracks[index].content += piece
             yield _sse("track_delta", {"index": index, "model_name": display, "text": piece})
         for t in tasks:

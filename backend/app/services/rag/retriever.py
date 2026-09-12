@@ -340,6 +340,8 @@ class HybridRetriever:
         for chunk in new_chunks:
             if chunk.id in self._chunks:
                 continue
+            if not (chunk.text or "").strip():
+                continue  # 兜底：任何来源的空切片都不入向量库（占位 top_k 且拉低检索信噪比）
             vec = await embedder.embed(f"{chunk.exam_point} {chunk.text}")
             self._chunks[chunk.id] = chunk
             self._vectors[chunk.id] = vec

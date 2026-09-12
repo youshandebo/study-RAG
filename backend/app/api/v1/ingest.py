@@ -180,15 +180,17 @@ async def ingest(
             archive_raw = raw
 
     def _tag_scope(chunk_list: list[Chunk]) -> None:
-        """为切片补齐课程作用域元数据（检索强隔离与时间衰减的数据基础）。"""
-        from datetime import date as _date
+        """为切片补齐课程作用域元数据（检索强隔离与时间衰减的数据基础）。
 
-        effective_date = lecture_date or _date.today().isoformat()
+        未提供授课日期时**不补今天**：衰减项要求 lecture_date 非空才生效，
+        若填今天则 dt=0、衰减系数取最大值，无时间戳的资料反而被当成"最新"
+        获得提权，信号完全反向。留空即不参与衰减（中性）。
+        """
         for c in chunk_list:
             c.subject = subject
             c.course_id = course_id or "default"
             c.chapter = chapter
-            c.lecture_date = effective_date
+            c.lecture_date = lecture_date or ""
 
     if media_type == "text":
         note_text = (text_content or "").strip()

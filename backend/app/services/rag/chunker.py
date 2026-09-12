@@ -25,7 +25,7 @@ class Chunk:
     subject: str = "未分类"       # 学科：数学 / 物理 / …
     course_id: str = "default"    # 课程唯一标识，检索强制同作用域
     chapter: str = ""             # 章节
-    lecture_date: str = ""        # 授课日期 ISO（YYYY-MM-DD），空=今天
+    lecture_date: str = ""        # 授课日期 ISO（YYYY-MM-DD）；空=未提供，不参与时间衰减
     # 解法定版权威信号：显式声明取代时间衰减的隐式推断
     is_canonical: bool = False    # 该考点的"标准解法"定版切片
     method_version: int = 1       # 解法版本号，老师改进讲法时递增
@@ -73,6 +73,12 @@ def chunk_transcript(audio_id: str, segments: list[TranscriptSegment], window_ch
         nonlocal seq, buf_text
         if not buf_text:
             return
+        text = "".join(buf_text).strip()
+        buf_text = []
+        # 空白 / 纯符号切片不入库：ASR 静音段与 OCR 噪点会产出这类 chunk，
+        # 它们同样占 top_k 名额，会挤掉真正有内容的切片。
+        if not text:
+            return
         seq += 1
         chunks.append(
             Chunk(
@@ -80,10 +86,9 @@ def chunk_transcript(audio_id: str, segments: list[TranscriptSegment], window_ch
                 audio_id=audio_id,
                 start=_ms_to_clock(buf_start),
                 end=_ms_to_clock(buf_end),
-                text="".join(buf_text),
+                text=text,
             )
         )
-        buf_text = []
 
     for seg in segments:
         if not buf_text:
