@@ -254,3 +254,60 @@ class TestQuizGradePipeline:
         )
         assert correct_option_index(no_answer) is None
         assert grade_objective(no_answer, "A")[0] is None
+
+
+# ------------------------------------------------------- 音频证据定位 ----
+class TestAudioSourceResolution:
+    """回归：切片回听必须放对录音文件。
+
+    历史 bug：遍历全部资产"存在即覆盖"取最后一份，多份录音共存时任何切片
+    都播放最后上传的那份（串台）。
+    """
+
+    @staticmethod
+    def _touch(tmp_path, *names: str) -> None:
+        for n in names:
+            (tmp_path / n).write_bytes(b"x")
+
+    def test_picks_matching_not_last(self, tmp_path, monkeypatch):
+        from app.api.v1 import evidence
+
+        self._touch(tmp_path, "a.opus", "b.opus")
+        monkeypatch.setattr(evidence, "AUDIO_DIR", tmp_path)
+        assets = [
+            {"kind": "audio", "audio_id": "ing-1", "uri": "/static/audio/a.opus"},
+            {"kind": "audio", "audio_id": "ing-2", "uri": "/static/audio/b.opus"},
+        ]
+        assert evidence._resolve_audio_source(assets, "ing-1") == tmp_path / "a.opus"
+
+    def test_multiple_without_match_refuses_to_guess(self, tmp_path, monkeypatch):
+        from app.api.v1 import evidence
+
+        self._touch(tmp_path, "a.opus", "b.opus")
+        monkeypatch.setattr(evidence, "AUDIO_DIR", tmp_path)
+        assets = [
+            {"kind": "audio", "audio_id": "ing-1", "uri": "/static/audio/a.opus"},
+            {"kind": "audio", "audio_id": "ing-2", "uri": "/static/audio/b.opus"},
+        ]
+        assert evidence._resolve_audio_source(assets, "ing-9") is None
+
+    def test_legacy_single_audio_falls_back(self, tmp_path, monkeypatch):
+        """旧数据没有 audio_id 字段，但库内只有一份录音时无歧义，可以放行。"""
+        from app.api.v1 import evidence
+
+        self._touch(tmp_path, "only.opus")
+        monkeypatch.setattr(evidence, "AUDIO_DIR", tmp_path)
+        assert evidence._resolve_audio_source(
+            [{"kind": "audio", "uri": "/static/audio/only.opus"}], "ing-1"
+        ) == tmp_path / "only.opus"
+
+    def test_missing_file_skipped(self, tmp_path, monkeypatch):
+        from app.api.v1 import evidence
+
+        self._touch(tmp_path, "a.opus")  # b.opus 未落盘
+        monkeypatch.setattr(evidence, "AUDIO_DIR", tmp_path)
+        assets = [
+            {"kind": "audio", "audio_id": "ing-2", "uri": "/static/audio/b.opus"},
+            {"kind": "audio", "audio_id": "ing-1", "uri": "/static/audio/a.opus"},
+        ]
+        assert evidence._resolve_audio_source(assets, "ing-1") == tmp_path / "a.opus"

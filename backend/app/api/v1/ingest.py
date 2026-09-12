@@ -281,6 +281,9 @@ async def ingest(
             "kind": media_type,
             "uri": url,
             "filename": file.filename or "",
+            # 音频与切片组的关联键：切片回听时据此精确定位录音文件，
+            # 否则多份录音共存时无法判断该放哪一份（历史 bug）
+            "audio_id": audio_id,
             "lecture_date": lecture_date,
             "chunk_count": added,
             "pitfalls": pitfalls[:3],
