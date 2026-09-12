@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 
+from app.services.tokens import estimate_tokens
+
 
 # ---------------------------------------------------------------- 拆题 ----
 class TestPaperSplitter:
@@ -550,3 +552,114 @@ class TestEmptyChunkFiltering:
         added = await retriever.register_chunks([blank])
         assert added == 0
         assert "ut-blank-reg" not in retriever._chunks
+
+
+# --------------------------------------------------- 上下文装箱与预算 ----
+class TestContextPacker:
+    """Token 预算贪心装箱 + 邻近切片动态扩展。
+
+    背景：原先按静态 top_k 取前 N 条直接拼 prompt——密集长切片会顶爆模型
+    上下文窗口（API 400），零碎短句又白白浪费预算。
+    """
+
+    @staticmethod
+    def _chunk(cid: str, text: str, start: str = "00:00", end: str = "00:10"):
+        from app.services.rag.chunker import Chunk
+
+        return Chunk(id=cid, audio_id="ut", start=start, end=end, text=text)
+
+    def test_budget_accounts_for_system_query_history(self):
+        from app.services.rag.packer import compute_budget
+        from app.services.tokens import estimate_tokens
+
+        sys_p, q = "系统提示" * 50, "用户问题"
+        hist = [{"role": "user", "content": "上一轮提问"}, {"role": "assistant", "content": "上一轮回答"}]
+
+        budget = compute_budget(8192, sys_p, q, hist, generation_buffer=1024)
+
+        expect_used = (
+            estimate_tokens(sys_p) + estimate_tokens(q)
+            + sum(estimate_tokens(m["content"]) for m in hist)
+        )
+        assert budget == 8192 - expect_used - 1024
+
+    def test_budget_never_negative(self):
+        from app.services.rag.packer import compute_budget
+
+        # 系统提示已超窗口：预算必须钳到 0，不能出负数
+        assert compute_budget(100, "长" * 5000, "问题", None, generation_buffer=1024) == 0
+
+    def test_long_chunk_truncated_not_dropped(self):
+        from app.services.rag.packer import pack_context
+
+        huge = self._chunk("ut-huge", "超" * 5000)
+        res = pack_context([(1.0, huge)], budget=100000, max_chunk_tokens=100)
+
+        assert len(res.chunks) == 1, "超长切片应截断保留，而不是整条丢弃"
+        assert len(res.chunks[0].text) < 5000
+        assert res.used_tokens <= 100000
+
+    def test_low_score_dropped_when_budget_tight(self):
+        from app.services.rag.packer import pack_context
+
+        cands = [(1.0 - i * 0.01, self._chunk(f"ut-p{i}", "内容" * 200)) for i in range(20)]
+        res = pack_context(cands, budget=600, max_chunk_tokens=10000)
+
+        assert res.dropped > 0, "预算不足时必须有候选被丢弃"
+        assert res.used_tokens <= 600
+        assert res.chunks[0].id == "ut-p0", "高分切片必须优先入选（贪心）"
+
+    def test_neighbors_expanded_when_budget_allows(self):
+        """核心切片入选后，预算有余应补 c002 / c004，修复 ASR 单句缺前后语义。"""
+        from app.services.rag.packer import pack_context
+
+        chunks = [
+            self._chunk("ut-x-c001", "第一句。"),
+            self._chunk("ut-x-c002", "第二句。"),
+            self._chunk("ut-x-c003", "第三句是核心。"),
+            self._chunk("ut-x-c004", "第四句。"),
+            self._chunk("ut-x-c005", "第五句。"),
+        ]
+        skeleton = {c.id: c for c in chunks}
+        core = chunks[2]  # c003
+        res = pack_context([(1.0, core)], budget=100000, skeleton=skeleton)
+
+        ids = {c.id for c in res.chunks}
+        assert ids == {"ut-x-c002", "ut-x-c003", "ut-x-c004"}, f"邻居扩展不完整: {ids}"
+        assert set(res.expanded) == {"ut-x-c002", "ut-x-c004"}
+
+    def test_neighbors_respect_budget(self):
+        """预算只够一条时，不得硬塞邻居撑爆窗口。"""
+        from app.services.rag.packer import pack_context
+
+        chunks = [
+            self._chunk("ut-y-c001", "前文" * 300),
+            self._chunk("ut-y-c002", "核心" * 300),
+            self._chunk("ut-y-c003", "后文" * 300),
+        ]
+        skeleton = {c.id: c for c in chunks}
+        core = chunks[1]
+        one = pack_context([(1.0, core)], budget=100000, max_chunk_tokens=10000)
+        core_cost = one.used_tokens
+
+        res = pack_context([(1.0, core)], budget=core_cost, skeleton=skeleton)
+
+        assert [c.id for c in res.chunks] == ["ut-y-c002"]
+        assert res.expanded == []
+        assert res.used_tokens <= core_cost
+
+    def test_non_sequential_id_skips_expansion(self):
+        """无 `-cNNN` 顺序血缘的切片不做扩展，也不能因此报错。"""
+        from app.services.rag.packer import pack_context
+
+        odd = self._chunk("plain-id", "没有顺序后缀。")
+        res = pack_context([(1.0, odd)], budget=100000, skeleton={"plain-id": odd})
+
+        assert res.expanded == []
+        assert len(res.chunks) == 1
+
+    def test_serialize_matches_token_accounting(self):
+        from app.services.rag.packer import _token_of, serialize
+
+        c = self._chunk("ut-s-c001", "抓大头判别法。")
+        assert _token_of(c) == estimate_tokens(serialize([c]))

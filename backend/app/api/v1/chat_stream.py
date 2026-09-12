@@ -42,6 +42,9 @@ from app.services.agent.quiz_generator import QuizGenerator, correct_option_inde
 from app.services.agent.socratic_tutor import SocraticTutor
 from app.services.extractor import difficulty as difficulty_svc
 from app.services.extractor.pitfall import extract_from_chunks
+from app.services.rag import packer
+from app.services.rag.chunker import Chunk
+from app.services.rag.retriever import get_retriever
 from app.services.llm.mock_engine import (
     SOLVE_MARKDOWN,
     SOLVE_PITFALLS,
@@ -49,7 +52,6 @@ from app.services.llm.mock_engine import (
 )
 from app.services.llm.provider import get_provider
 from app.services.router.intent_classifier import classify
-from app.services.rag.retriever import get_retriever
 from app.services.tokens import estimate_tokens
 
 router = APIRouter()
@@ -145,6 +147,32 @@ async def _history_messages(session_id: str, max_turns: int = 6) -> list[dict]:
         turns.append({"role": role, "content": content[:2000]})
     turns.reverse()
     return turns
+
+
+async def _pack_for_prompt(
+    chunks: list[Chunk], system_prompt: str, query: str, history: list[dict]
+) -> list[Chunk]:
+    """按模型上下文预算装箱切片；失败时原样返回（装箱是优化，不该拖垮主链路）。"""
+    if not chunks:
+        return chunks
+    try:
+        limit = _context_limit()
+        budget = packer.compute_budget(limit, system_prompt, query, history)
+        skeleton = {c.id: c for c in await (await get_retriever()).all_chunks()}
+        result = packer.pack_context(
+            [(1.0 - i * 1e-6, c) for i, c in enumerate(chunks)],  # 保留检索顺序作为优先级
+            budget,
+            skeleton=skeleton,
+        )
+        if result.dropped:
+            _logger.info(
+                "上下文装箱：预算 %d token，入选 %d 条（扩展 %d 条），丢弃 %d 条",
+                result.budget, len(result.chunks), len(result.expanded), result.dropped,
+            )
+        return result.chunks
+    except Exception as exc:
+        _logger.warning("上下文装箱失败，回退原始切片列表: %s", exc)
+        return chunks
 
 
 def _user_query(req: ChatRequest, ocr_text: str | None, history: list[dict]) -> str:
@@ -278,7 +306,10 @@ async def _stream(req: ChatRequest, tier_model: str = "", request: Request | Non
         )
         yield _sse("evidence", {"list": [r.model_dump(mode="json") for r in refs]})
 
-        context = "\n---\n".join(f"[{c.start}-{c.end}] {c.text}" for c in chunks)
+        # Token 预算装箱：按可用窗口贪心选片，并在预算允许时补前后邻近切片，
+        # 替代原先"取前 N 条直接拼"——避免长切片顶爆窗口、短句浪费空间。
+        chunks = await _pack_for_prompt(chunks, SOLVE_SYSTEM, query, history)
+        context = packer.serialize(chunks)
         u_sys, u_ret = SOLVE_SYSTEM, context
         provider = get_tier_provider(tier_model)
         messages = [
@@ -385,9 +416,10 @@ async def _stream(req: ChatRequest, tier_model: str = "", request: Request | Non
         user_content = req.text or "你好"
         ret_ctx = ""
         if relevant:
-            ret_ctx = "\n---\n".join(
-                f"[{c.board_caption or '课堂切片'}·{c.start}-{c.end}] {c.text}" for c in relevant
-            )
+            # 同上：general 是长文档问答最容易被顶爆窗口的路径。
+            # 该分支没有独立 system prompt（通识问答直出），预算给空串即可。
+            relevant = await _pack_for_prompt(relevant, "", req.text or "", history)
+            ret_ctx = packer.serialize(relevant)
             u_ret = ret_ctx
             user_content = (
                 f"{user_content}\n\n【知识库命中的课堂资料，请优先依据这些内容回答；"
