@@ -805,3 +805,112 @@ class TestRerankAuthorityGate:
         assert cfg["tau"] == pytest.approx(0.42)
         assert cfg["beta"] == pytest.approx(0.30)
         assert cfg["recall_pool"] == 18
+
+    def test_production_gate_matches_offline_eval(self):
+        """离线标定脚本与生产门控必须同源，否则标定结果对生产无效。"""
+        from app.services.rag.reranker import (
+            apply_authority_gate,
+            sigmoid,
+        )
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
+        from eval_rerank_params import final_score as eval_final_score
+
+        for logit in (-3.0, -0.5, 0.0, 0.8, 1.4, 2.5):
+            from app.services.rag.chunker import Chunk
+
+            for canon in (True, False):
+                chunk = Chunk(
+                    id="ut-parity", audio_id="ut", start="00:00", end="00:10",
+                    text="x", is_canonical=canon,
+                )
+                prod = apply_authority_gate([(sigmoid(logit), chunk)], 0.42, 0.30)[0][0]
+
+                class _C:
+                    pass
+
+                c = _C()
+                c.logit, c.is_canonical = logit, canon
+                offline = eval_final_score(c, 0.42, 0.30)
+
+                assert abs(prod - offline) < 1e-9, (
+                    f"生产与离线标定结果不一致: logit={logit} canon={canon} "
+                    f"prod={prod} offline={offline}"
+                )
+
+
+# --------------------------------------------- 离线标定脚本自身行为 ----
+class TestRerankEvalScript:
+    """标定脚本必须真的做网格搜索，且选优逻辑正确。"""
+
+    @staticmethod
+    def _load():
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
+        import eval_rerank_params as ev
+
+        return ev
+
+    def test_builtin_golden_has_adversarial_samples(self):
+        """黄金集必须含对抗负样本，否则网格搜索没有可区分的信号。"""
+        ev = self._load()
+        ds = ev.load_dataset(None)
+
+        assert len(ds) >= 8
+        per_query = [sum(1 for c in q.candidates if c.is_canonical and not c.is_relevant) for q in ds]
+        assert all(n >= 1 for n in per_query), "每条 query 都要有无关定版作为对抗样本"
+
+    def test_golden_produces_nonzero_mrr_gain(self):
+        """黄金集要能产生可测收益——全 1.0 的 baseline 说明梯度消失。"""
+        ev = self._load()
+        ds = ev.load_dataset(None)
+        base = ev.evaluate_dataset(ds, tau=0.0, beta=0.0)
+
+        assert base["mrr"] < 1.0, "baseline 满分说明样本无区分度，标定将失效"
+
+    def test_gate_blocks_irrelevant_canonical_at_calibrated_tau(self):
+        """标定出的阈值必须能拦住全部无关定版，同时放行全部相关定版。"""
+        ev = self._load()
+        ds = ev.load_dataset(None)
+        res = ev.grid_search(ds, [round(0.30 + i * 0.02, 2) for i in range(26)],
+                             [round(i * 0.02, 2) for i in range(31)])
+
+        assert res["passes"]["no_false_boosts"], "标定结果不应留下误提权"
+        assert res["passes"]["activation_ok"]
+
+    def test_grid_search_explores_full_space(self):
+        """回归：原参考实现的 min_false_boosts 单调收紧会让后续 tau 全被跳过。"""
+        ev = self._load()
+        ds = ev.load_dataset(None)
+        taus = [0.30, 0.50, 0.70, 0.74]
+        betas = [0.0, 0.10]
+        res = ev.grid_search(ds, taus, betas)
+
+        combos = {(c["tau"], c["beta"]) for c in res["candidates"]}
+        assert (0.74, 0.10) in combos or len(combos) >= 4, (
+            f"网格探索不完整，仅覆盖 {sorted(combos)}"
+        )
+
+    def test_baseline_is_beta_zero_not_tau_one(self):
+        """baseline 语义 = 不启用加成，故须 beta=0；用 tau=1.0 会让激活率恒为 0。"""
+        ev = self._load()
+        ds = ev.load_dataset(None)
+        res = ev.grid_search(ds, [0.30, 0.74], [0.0, 0.20])
+
+        assert res["baseline"]["canonical_activation_rate"] > 0.0
+
+    def test_stable_sigmoid_extremes(self):
+        ev = self._load()
+
+        assert ev.stable_sigmoid(-1000) >= 0.0
+        assert ev.stable_sigmoid(1000) <= 1.0
+        assert ev.stable_sigmoid(0) == pytest.approx(0.5)
+
+    def test_ranking_is_deterministic_on_ties(self):
+        ev = self._load()
+        c1 = ev.EvalCandidate("b", 1.0, False, True)
+        c2 = ev.EvalCandidate("a", 1.0, False, True)
+
+        first = [c.chunk_id for c, _ in ev.rank_candidates([c1, c2], 0.4, 0.3)]
+        second = [c.chunk_id for c, _ in ev.rank_candidates([c2, c1], 0.4, 0.3)]
+
+        assert first == second, "同分排序不得依赖输入顺序，否则标定结果不可复现"
