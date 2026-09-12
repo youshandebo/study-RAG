@@ -295,6 +295,11 @@ def build_golden(
     ground_truth: {query_id: relevant_chunk_id}。夹具自带精确真值，
     有此映射时优先采用它而非多路号票的弱标签——夹具的正确答案是刻意设计的
     （跨章节错配），弱标注的 chapter 通道在夹具场景下不适用（查询不带 chapter）。
+
+    ground_truth 的值可以是单个 chunk_id（str），也可以是**多个**（list/tuple
+    /set）。多正解是真实存在的：同一个问题往往有不止一条真正回答了它的切片。
+    真值经真实模型校准后我们发现，强行指定唯一正确答案会把模型的合理判断
+    当成错误——具体教训见 fixtures/multichapter.py 中 fx001 的注释。
     """
     dataset: list[dict] = []
     for q in specs:
@@ -307,12 +312,18 @@ def build_golden(
         stats.add_logits(logits)
         stats.queries += 1
 
-        gt_id = (ground_truth or {}).get(q.query_id)
+        gt = (ground_truth or {}).get(q.query_id)
+        gt_ids: set[str] = set()
+        if isinstance(gt, str):
+            gt_ids = {gt}
+        elif isinstance(gt, (list, tuple, set)):
+            gt_ids = set(gt)
+
         cands: list[dict] = []
         for r, z in zip(recalled, logits):
-            if gt_id:
+            if gt_ids:
                 # 夹具模式：真值直接给定，弱标注不参与
-                relevant = r.chunk_id == gt_id
+                relevant = r.chunk_id in gt_ids
                 why = "ground_truth" if relevant else "ground_truth_negative"
             else:
                 relevant, why = judge_relevance(q, r)
@@ -457,8 +468,12 @@ def main(argv: list[str] | None = None) -> int:
     ground_truth = None
     if args.fixture:
         retriever, fx = asyncio.run(build_fixture_retriever())
+        # 支持多正解：夹具可声明 expect_relevant_chunks 覆盖单值的
+        # expect_relevant_chunk。真实模型校准后发现同一问题常有多个合理答案，
+        # 强行只认一条会把模型的正确判断计为错误。
         ground_truth = {
-            q["query_id"]: q["expect_relevant_chunk"] for q in fx.FIXTURE_QUERIES
+            q["query_id"]: q.get("expect_relevant_chunks") or q["expect_relevant_chunk"]
+            for q in fx.FIXTURE_QUERIES
         }
         if not args.queries:
             specs = [

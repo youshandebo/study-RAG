@@ -1348,3 +1348,166 @@ class TestMultiChapterFixture:
         assert len(marked) == 1, "夹具真值应恰好标出一条相关切片"
         assert marked[0]["chunk_id"] == q["expect_relevant_chunk"]
         assert marked[0]["label_reason"] == "ground_truth"
+
+
+# --------------------------------------------- 可解性诊断（真实模型教训）----
+class TestTauIdentifiability:
+    """来自真实 bge-reranker 实测的教训：`tau` 可能根本不是敏感变量。
+
+    实测发现无关定版的 sigmoid 几乎全为 0.00x，`false_boosts` 在任何 tau 下
+    都是 0，此时「三条约束全 PASS」是**假阳性**——标定看似成功，实际 tau
+    是自由变量，取 0.30 还是 0.80 结果逐位相同。
+
+    本组测试把这个判据钉死，防止将来有人把这种不可辨识的 tau 写进生产配置。
+    """
+
+    @staticmethod
+    def _load_eval():
+        scripts = str(Path(__file__).resolve().parent.parent.parent / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import eval_rerank_params as ev
+
+        return ev
+
+    @staticmethod
+    def _mk_query(qid, canon_logit, adv_logit):
+        ev = TestTauIdentifiability._load_eval()
+        return ev.EvalQuery(
+            query_id=qid, query=qid,
+            candidates=[
+                ev.EvalCandidate("rel", canon_logit, True, True),
+                ev.EvalCandidate("adv", adv_logit, True, False),
+            ],
+        )
+
+    def test_fuzzy_band_detects_identifiable_tau(self):
+        """对抗样本落在模糊带内 → tau 可辨识。"""
+        ev = self._load_eval()
+        # sigmoid(0.5)≈0.62 略高，取 0.0 附近让对抗样本落在 0.4~0.6 内
+        ds = [self._mk_query("q1", canon_logit=3.0, adv_logit=0.2)]
+
+        sep = ev.theta_separability(ds)
+
+        assert sep["adversarial_total"] == 1
+        assert sep["tau_identifiable"] is True
+        assert sep["fuzzy_count"] == 1
+
+    def test_fuzzy_band_empty_means_tau_unidentifiable(self):
+        """对抗样本分数远低于模糊带 → tau 不可辨识（真实模型的实际情形）。"""
+        ev = self._load_eval()
+        ds = [self._mk_query("q1", canon_logit=4.0, adv_logit=-8.0)]
+
+        sep = ev.theta_separability(ds)
+
+        assert sep["adversarial_total"] == 1
+        assert sep["fuzzy_count"] == 0
+        assert sep["tau_identifiable"] is False
+
+    def test_grid_search_reports_tau_unidentifiable(self):
+        """不可辨识时 passes 必须为 False——否则会输出没有依据的阈值。"""
+        ev = self._load_eval()
+        ds = [self._mk_query(f"q{i}", 4.0, -8.0) for i in range(3)]
+
+        res = ev.grid_search(ds, [0.30, 0.42, 0.60], [0.0, 0.20])
+
+        assert res["separability"]["tau_identifiable"] is False
+        assert res["passes"]["tau_identifiable"] is False
+        assert all(res["passes"].values()) is False
+
+    def test_tau_insensitive_results_are_actually_identical(self):
+        """实证 tau 不敏感：两套差异极大的 tau 给出逐位相同的排序。
+
+        这是不可辨识的**行为定义**——不只是诊断说它不可辨识，
+        而是不同 tau 真的产生同样结果。
+        """
+        ev = self._load_eval()
+        ds = [self._mk_query(f"q{i}", 4.0, -8.0) for i in range(3)]
+
+        def order(tau, beta):
+            out = []
+            for q in ds:
+                ranked = ev.rank_candidates(q.candidates, tau, beta)
+                out.append([c.chunk_id for c, _ in ranked])
+            return out
+
+        assert order(0.30, 0.16) == order(0.80, 0.16)
+
+    def test_real_fixture_data_is_tau_unidentifiable(self):
+        """回归：真实 bge-reranker 在夹具语料上的实测结论。
+
+        若此测试失败，说明模型或夹具发生了实质变化（例如换了更强的模型、
+        或夹具的对抗样本被改得更"难"），那么 tau 的标定策略需要重新评估。
+
+        数据来源：models/bge-reranker（bge-reranker-base int8）+ 夹具语料。
+        不依赖模型文件——用实测得到的 logit 快照做断言。
+        """
+        ev = self._load_eval()
+        # 实测快照：9 条对抗定版的 sigmoid 全部 < 0.16
+        snapshot = [0.1567, 0.0000, 0.0039, 0.0288, 0.0024,
+                    0.0002, 0.0001, 0.0001, 0.0094]
+
+        assert all(s < ev.FUZZY_LO for s in snapshot), (
+            "实测对抗样本已进入模糊带，说明分布特征变化，需重新标定 tau"
+        )
+
+
+# --------------------------------------------- 多正解真值 ----
+class TestMultiGroundTruth:
+    """真值可声明多个正确答案——真实模型校准后的修正。
+
+    原先把 fx001 的唯一答案定为「梯度截断流程」，但 bge-reranker 给它
+    0.0618、给「学习率四步法」0.1567。复核后模型是对的：问"更新过大导致
+    发散"，第一顺位手段确实是调学习率。故改为双正解。
+    """
+
+    @staticmethod
+    def _load():
+        scripts = str(Path(__file__).resolve().parent.parent.parent / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import extract_rerank_dataset as ex
+
+        return ex
+
+    def test_fixture_declares_multi_relevant_for_fx001(self):
+        from tests.fixtures import multichapter as fx
+
+        by_id = {q["query_id"]: q for q in fx.FIXTURE_QUERIES}
+        q = by_id["fx001"]
+
+        assert "expect_relevant_chunks" in q, "fx001 应声明多正解"
+        assert len(q["expect_relevant_chunks"]) >= 2
+        assert q["expect_relevant_chunk"] in q["expect_relevant_chunks"], (
+            "单值字段必须包含在多正解里，避免两处真值不一致"
+        )
+
+    def test_ground_truth_accepts_list(self):
+        import asyncio
+
+        ex = self._load()
+        import os
+
+        os.environ.setdefault("SEED_DEMO_CORPUS", "0")
+
+        retriever, fx = asyncio.run(ex.build_fixture_retriever())
+        q = [x for x in fx.FIXTURE_QUERIES if x["query_id"] == "fx001"][0]
+        specs = [ex.QuerySpec(query=q["query"], course_id=q["course_id"],
+                              query_id=q["query_id"])]
+        gt = {"fx001": ["fx-a-c004", "fx-b-c005"]}
+        stats = ex.ExtractStats()
+
+        ds = ex.build_golden(
+            specs, ex.StubBackend(), 15, stats,
+            retriever=retriever, ground_truth=gt,
+        )
+
+        marked = {c["chunk_id"] for c in ds[0]["candidates"] if c["is_relevant"]}
+        assert marked == {"fx-a-c004", "fx-b-c005"}, f"多正解未生效: {marked}"
+
+    def test_fixture_queries_keep_single_value_field(self):
+        """单值字段仍需保留——很多外部工具只读 expect_relevant_chunk。"""
+        from tests.fixtures import multichapter as fx
+
+        for q in fx.FIXTURE_QUERIES:
+            assert q.get("expect_relevant_chunk"), q["query_id"]

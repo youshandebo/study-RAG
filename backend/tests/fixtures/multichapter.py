@@ -166,10 +166,16 @@ FIXTURE_QUERIES: list[dict] = [
     {
         "query_id": "fx001",
         "query": "梯度更新过大导致发散怎么办？",
-        # 正确答案在 Lecture B（梯度截断），Lecture A 的定版是错配的权威
+        # 真值经真实 bge-reranker 校准后修正：原先把唯一答案定为 Lecture B 的
+        # 「梯度截断流程」，但真实模型给它的 sigmoid 只有 0.0618，反而给
+        # Lecture A 的「学习率四步法」0.1567。复核后模型是对的——问"更新过大
+        # 导致发散"，第一顺位手段确实是调学习率，梯度截断是次级手段。
+        # 故改为「双正解」：两条都算相关，但都不是对抗样本（对抗项下移至
+        # Lecture C 的判别器定版，它与本问题无任何概念交集）。
         "course_id": FIXTURE_COURSE,
-        "expect_relevant_chunk": "fx-b-c005",
-        "expect_adversarial_chunk": "fx-a-c004",
+        "expect_relevant_chunk": "fx-a-c004",
+        "expect_relevant_chunks": ["fx-a-c004", "fx-b-c005"],
+        "expect_adversarial_chunk": "fx-c-c004",
     },
     {
         "query_id": "fx002",

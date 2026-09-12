@@ -38,3 +38,9 @@ nohup.out
 # 语料/模型绑定，不该进仓库。目录约定见 scripts/extract_rerank_dataset.py。
 data/queries*.jsonl
 data/eval_golden*.json
+
+# ---- 标定用的本地模型权重与隔离环境 ----
+# ONNX 权重 40~100MB 且随所选模型而异，不进仓库；
+# .venv-rerank 是仅用于标定的隔离环境（onnxruntime + transformers）。
+models/
+.venv-rerank/

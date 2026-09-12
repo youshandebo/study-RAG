@@ -29,6 +29,11 @@ from dataclasses import dataclass, field
 
 # ------------------------------------------------------------------ 数据结构 --
 
+# 模糊带上下界：对抗样本的 sigmoid 若落在此区间，才真正对 tau 形成约束。
+# 真实 bge-reranker 实测中这个区间是空的（无关定版分数几乎全为 0.00x），
+# 说明模型本身的区分力已足够，tau 在这类语料上不可辨识。
+FUZZY_LO, FUZZY_HI = 0.40, 0.60
+
 
 @dataclass
 class EvalCandidate:
@@ -114,6 +119,42 @@ def evaluate_dataset(
     }
 
 
+def theta_separability(dataset: list[EvalQuery]) -> dict:
+    """可解性诊断：`tau` 在这份数据上到底有没有约束力？
+
+    **为什么必须单独诊断**（来自真实模型实测的教训）：
+    在真实 bge-reranker 上跑夹具语料时发现，无关定版的 sigmoid 几乎全是
+    0.00x —— 它们天然排在末尾，`false_boosts` 在任何 tau 下都为 0。
+    此时「三条约束全部 PASS」是**假阳性**：标定看似成功，实际 tau 是自由变量，
+    取 0.30 还是 0.80 对结果没有任何区别。
+
+    合成数据里不存在这个问题（我按"负样本长尾抬升"的说法把对抗样本的
+    分数造到了 0.4~0.6），所以只有真实数据才会暴露。判据：
+
+      fuzzy_count == 0  →  tau 不可辨识。所谓"最优 tau"只是在 MRR 断点上
+                          随 beta 漂移，不具备物理含义。
+      fuzzy_count > 0   →  tau 有约束力，标定结果可采信。
+
+    返回 fuzzy 带内对抗定版的 sigmoid 值，供人工复核。
+    """
+    fuzzy: list[tuple[str, str, float]] = []
+    adversarial_total = 0
+    for item in dataset:
+        for c in item.candidates:
+            if not (c.is_canonical and not c.is_relevant):
+                continue
+            adversarial_total += 1
+            s = stable_sigmoid(c.logit)
+            if FUZZY_LO <= s <= FUZZY_HI:
+                fuzzy.append((item.query_id, c.chunk_id, round(s, 4)))
+    return {
+        "adversarial_total": adversarial_total,
+        "fuzzy_count": len(fuzzy),
+        "fuzzy_examples": fuzzy[:10],
+        "tau_identifiable": bool(fuzzy),
+    }
+
+
 def grid_search(
     dataset: list[EvalQuery],
     tau_range: list[float],
@@ -135,6 +176,7 @@ def grid_search(
     后续取值全部被跳过，实际只探索了极小一部分参数空间。
     """
     baseline = evaluate_dataset(dataset, tau=0.0, beta=0.0, top_k=top_k)
+    separability = theta_separability(dataset)
 
     grids: list[tuple] = []
     for tau in tau_range:
@@ -153,10 +195,14 @@ def grid_search(
         "baseline": baseline,
         "optimized": best_metrics,
         "mrr_gain": mrr_gain,
+        "separability": separability,
         "passes": {
             "no_false_boosts": best_metrics["false_boosts"] == 0,
             "mrr_gain_ok": mrr_gain >= min_mrr_gain,
             "activation_ok": best_metrics["canonical_activation_rate"] >= 0.90,
+            # tau 不可辨识时，即使前三条全过也不算通过——否则会输出一个
+            # 没有物理依据的阈值让人写进生产配置
+            "tau_identifiable": separability["tau_identifiable"],
         },
         "candidates": [
             {"tau": g[4], "beta": g[3], **g[5]} for g in grids[:10]
@@ -391,6 +437,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{'false_boosts':22s}{b['false_boosts']:>12d}{o['false_boosts']:>12d}")
     print(f"{'activation_rate':22s}{b['canonical_activation_rate']:>12.4f}{o['canonical_activation_rate']:>12.4f}")
     print("-" * 62)
+    sep = result["separability"]
+    print(f"可解性诊断：对抗定版 {sep['adversarial_total']} 条，"
+          f"其中落在模糊带 [{FUZZY_LO:g},{FUZZY_HI:g}] 的 {sep['fuzzy_count']} 条")
+    if not sep["tau_identifiable"]:
+        print("  [!] 模糊带为空 → tau 不可辨识。所有对抗定版的 sigmoid 都远离")
+        print("      阈值区间，false_boosts 在任何 tau 下都是 0。此时所谓")
+        print("      「最优 tau」只是在 MRR 断点上随 beta 漂移，没有物理依据，")
+        print("      **不要**把它写进 runtime_config。")
+    print("-" * 62)
     print(f"最优参数：tau = {result['best_tau']:g}   beta = {result['best_beta']:g}")
     print(f"MRR 收益：{result['mrr_gain']:+.4f}（门槛 {args.min_mrr_gain:+.2f}）")
     print("-" * 62)
@@ -404,6 +459,11 @@ def main(argv: list[str] | None = None) -> int:
         print("结论：参数可用。建议写入 runtime_config 的 rerank 段：")
         print(f'  "rerank": {{"enabled": "true", "tau": "{result["best_tau"]:g}", '
               f'"beta": "{result["best_beta"]:g}"}}')
+    elif not sep["tau_identifiable"]:
+        print("结论：beta 可用但 **tau 不可标定**——模型的区分力已经足够，")
+        print("      tau 在这份数据上是自由变量。建议：")
+        print(f"      1) beta 取 {result['best_beta']:g}（这部分是可靠的，MRR 收益 {result['mrr_gain']:+.4f} 有据）")
+        print("      2) tau 保持保守默认值，或改由更贴近真实分布的语料重标")
     else:
         print("结论：当前黄金集下未找到满足全部约束的参数，请检查阈值设置或补充样本。")
     return 0 if ok_all else 1
