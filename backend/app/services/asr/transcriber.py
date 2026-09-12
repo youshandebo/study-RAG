@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import math
 
 from app.core import runtime_config
@@ -36,7 +37,7 @@ class Transcriber:
                 return await self._transcribe_remote(audio_bytes, filename, cfg)
             except Exception:
                 pass
-        model = self._load_whisper()
+        model = await self._load_whisper()
         if model and audio_bytes:
             try:
                 return await self._transcribe_real(audio_bytes)
@@ -64,15 +65,20 @@ class Transcriber:
         text = await retry_async(_call, attempts=2, exceptions=(httpx.HTTPError,))
         return _segments_from_plain_text(text)
 
-    def _load_whisper(self):  # pragma: no cover - 重型依赖懒加载
-        if self._model is not None:
-            return self._model
+    @staticmethod
+    def _load_whisper_sync():  # pragma: no cover - 重型依赖懒加载
         try:
             from faster_whisper import WhisperModel
 
-            self._model = WhisperModel("small", compute_type="int8")
+            return WhisperModel("small", compute_type="int8")
         except Exception:
-            self._model = False
+            return False
+
+    async def _load_whisper(self):  # pragma: no cover - 重型依赖懒加载
+        """模型加载是同步阻塞的（首次还会下载权重），必须在线程里做。"""
+        if self._model is not None:
+            return self._model
+        self._model = await asyncio.to_thread(self._load_whisper_sync)
         return self._model
 
     async def _transcribe_real(self, audio_bytes: bytes) -> list[TranscriptSegment]:  # pragma: no cover
@@ -83,16 +89,24 @@ class Transcriber:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(audio_bytes)
             path = f.name
-        segments_iter, _info = self._model.transcribe(path, language="zh", vad_filter=True)
-        out: list[TranscriptSegment] = []
-        for seg in segments_iter:
-            out.append(
-                TranscriptSegment(
-                    start_ms=int(seg.start * 1000), end_ms=int(seg.end * 1000), text=seg.text.strip()
+
+        def _run() -> list[TranscriptSegment]:
+            segments_iter, _info = self._model.transcribe(path, language="zh", vad_filter=True)
+            out: list[TranscriptSegment] = []
+            for seg in segments_iter:
+                out.append(
+                    TranscriptSegment(
+                        start_ms=int(seg.start * 1000), end_ms=int(seg.end * 1000), text=seg.text.strip()
+                    )
                 )
-            )
-        pathlib.Path(path).unlink(missing_ok=True)
-        return out
+            return out
+
+        # faster-whisper 是同步 CPU 密集推理：放进线程，避免独占事件循环。
+        # 原实现异常时会跳过 unlink 泄漏临时文件，这里改 finally 兜底。
+        try:
+            return await asyncio.to_thread(_run)
+        finally:
+            pathlib.Path(path).unlink(missing_ok=True)
 
     @staticmethod
     def _transcribe_demo() -> list[TranscriptSegment]:

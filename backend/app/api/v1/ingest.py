@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import pathlib
 import re
@@ -160,16 +161,18 @@ async def ingest(
     recognize_b64 = base64.b64encode(raw).decode() if raw else ""
     compress_meta: dict | None = None
     if file is not None and raw:
+        # 压缩/转码是同步阻塞的（ffmpeg 子进程 + Pillow 图像运算），必须挪到线程里，
+        # 否则在 async 路由中直接调用会卡死整个事件循环——两人同时上传就集体假死。
         try:
             if media_type == "board":
-                normalized, up_meta = compressor.compress_image(raw)  # 上传期标准化（高质量）
-                archive_raw, ar_meta = compressor.archive_image(normalized)  # 归档期深压 Q75~80
+                normalized, up_meta = await asyncio.to_thread(compressor.compress_image, raw)  # 上传期标准化（高质量）
+                archive_raw, ar_meta = await asyncio.to_thread(compressor.archive_image, normalized)  # 归档期深压 Q75~80
                 recognize_b64 = base64.b64encode(normalized).decode()  # VLM 用标准化版识别
                 compress_meta = {"upload": up_meta, "archive": ar_meta}
             elif media_type == "audio":
                 suffix = pathlib.Path(file.filename or "a.wav").suffix or ".wav"
-                pcm, up_meta = compressor.normalize_audio_for_asr(raw, suffix)  # 16k 单声道 PCM 送 ASR
-                archive_raw, ar_meta = compressor.compress_audio(raw, suffix)  # 归档期 Opus 深压
+                pcm, up_meta = await asyncio.to_thread(compressor.normalize_audio_for_asr, raw, suffix)  # 16k 单声道 PCM 送 ASR
+                archive_raw, ar_meta = await asyncio.to_thread(compressor.compress_audio, raw, suffix)  # 归档期 Opus 深压
                 raw = pcm  # ASR 输入 = 无损 PCM
                 compress_meta = {"upload": up_meta, "archive": ar_meta}
         except Exception:

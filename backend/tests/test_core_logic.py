@@ -311,3 +311,98 @@ class TestAudioSourceResolution:
             {"kind": "audio", "audio_id": "ing-1", "uri": "/static/audio/a.opus"},
         ]
         assert evidence._resolve_audio_source(assets, "ing-1") == tmp_path / "a.opus"
+
+
+# ---------------------------------------------- 事件循环不被同步工作卡死 ----
+@pytest.mark.asyncio
+class TestEventLoopNotBlocked:
+    """回归：重型同步工作（Whisper 推理 / ffmpeg / Pillow）必须挪到线程。
+
+    历史 bug：`async def` 路由与 `async def _transcribe_real` 里直接调用同步
+    阻塞代码，单人测试无感，两人并发上传/转录时整个服务假死。
+    """
+
+    async def test_whisper_inference_runs_off_loop(self):
+        import threading
+        import time
+
+        from app.services.asr.transcriber import Transcriber
+
+        class _FakeModel:
+            thread_name: str | None = None
+
+            def transcribe(self, path, language=None, vad_filter=None):
+                type(self).thread_name = threading.current_thread().name
+                time.sleep(0.05)  # 放大时间窗，确保可观测
+
+                class _Seg:
+                    start, end, text = 0.0, 1.5, "抓大头：分母里 x 平方是大头"
+
+                return [_Seg()], None
+
+        transcriber = Transcriber()
+        transcriber._model = _FakeModel()
+        segments = await transcriber._transcribe_real(b"fake-wav-bytes")
+
+        assert len(segments) == 1 and segments[0].text.startswith("抓大头")
+        loop_thread = threading.current_thread().name
+        assert _FakeModel.thread_name is not None
+        assert _FakeModel.thread_name != loop_thread, "Whisper 推理仍在主线程同步执行，会卡死事件循环"
+        assert _FakeModel.thread_name != "MainThread"
+
+    async def test_loop_stays_responsive_during_blocking_call(self):
+        """阻塞调用期间事件循环仍要能推进其它协程（并发上传不互相拖死）。"""
+        import asyncio
+        import time
+
+        ticks = 0
+
+        async def _probe():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.02)
+
+        def _slow(_data):
+            time.sleep(0.25)  # 模拟 ffmpeg 子进程 / 图像压缩耗时
+            return b"ok"
+
+        task = asyncio.create_task(_probe())
+        assert await asyncio.to_thread(_slow, b"x") == b"ok"  # ingest 路由使用的调度方式
+        await asyncio.sleep(0)
+        task.cancel()
+
+        assert ticks >= 3, f"事件循环在阻塞调用期间被卡死（探针仅推进 {ticks} 次）"
+
+
+@pytest.mark.asyncio
+class TestPutObject:
+    """对象存储写入改走线程后的行为回归（本地静态目录分支）。"""
+
+    async def test_local_fallback_writes_file(self, tmp_path, monkeypatch):
+        import base64
+        import pathlib
+
+        from app.db import minio_client
+
+        monkeypatch.setattr(minio_client, "ensure_static_dirs", lambda: None)
+        monkeypatch.setattr(minio_client, "AUDIO_DIR", tmp_path)
+        monkeypatch.setattr(minio_client, "BOARDS_DIR", tmp_path)
+
+        url = await minio_client.put_object("audio", "lesson.wav", base64.b64encode(b"pcm").decode())
+
+        assert url.startswith("/static/audio/")
+        assert (tmp_path / pathlib.Path(url).name).read_bytes() == b"pcm"
+
+    async def test_board_routes_to_boards_dir(self, tmp_path, monkeypatch):
+        import base64
+
+        from app.db import minio_client
+
+        monkeypatch.setattr(minio_client, "ensure_static_dirs", lambda: None)
+        monkeypatch.setattr(minio_client, "AUDIO_DIR", tmp_path)
+        monkeypatch.setattr(minio_client, "BOARDS_DIR", tmp_path)
+
+        url = await minio_client.put_object("boards", "note.png", base64.b64encode(b"png").decode())
+
+        assert url.startswith("/static/boards/")
