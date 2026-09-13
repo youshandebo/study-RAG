@@ -128,6 +128,13 @@ async def put_admin_config(payload: dict, _: str = Depends(require_admin)):
     media = payload.get("media")
     if isinstance(media, dict):
         patch["media"] = {k: str(v) for k, v in media.items() if str(v or "").strip() != ""}
+    # 检索调权 / 精排 / 部署档位：原样转发，合法性校验与数值钳制在
+    # save_runtime_config / profiles.resolve 内完成。此前这三段被静默丢弃——
+    # 前端 RetrievalSection 保存"成功"但磁盘配置从未变化，重启即回落。
+    for section in ("retrieval", "rerank", "deployment"):
+        src = payload.get(section)
+        if isinstance(src, dict):
+            patch[section] = src
     runtime_config.save_runtime_config(patch)
     return runtime_config.masked_view()
 

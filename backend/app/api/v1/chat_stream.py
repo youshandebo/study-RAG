@@ -94,7 +94,7 @@ def _sse(event: str, data: dict) -> str:
 
 async def _retrieve_evidence(
     query: str,
-    top_k: int = 3,
+    top_k: int | None = None,
     min_score: float | None = None,
     course_id: str | None = None,
     retrieval_mode: str = "lecture",
@@ -103,6 +103,12 @@ async def _retrieve_evidence(
     chapter: str | None = None,
     tenant_id: str = DEFAULT_TENANT,
 ) -> tuple[list[EvidenceRef], list]:
+    # 切片数由部署档位驱动（eco=3 / standard=5 / performance=8），
+    # 调用方不传时跟随档位；显式传入的 top_k 优先（如考试评分等固定口径）。
+    if top_k is None:
+        from app.core import profiles
+
+        top_k = int(profiles.effective()["final_top_k"])
     retriever = await get_retriever()
     chunks = await retriever.retrieve(
         query, top_k=top_k, min_score=min_score, course_id=course_id or None,
@@ -492,7 +498,7 @@ async def _stream_body(
     elif intent == Intent.general:
         # 普通提问同样自动检索知识库：相关性达标的课堂切片注入上下文并暴露证据链
         refs, chunks = await _retrieve_evidence(
-            query, top_k=3, min_score=GENERAL_RELEVANCE_FLOOR,
+            query, min_score=GENERAL_RELEVANCE_FLOOR,  # top_k 跟随部署档位
             course_id=req.course_id, retrieval_mode=req.retrieval_mode,
             time_alpha_override=req.time_alpha_override,
             canonical_bonus_override=req.canonical_bonus_override,

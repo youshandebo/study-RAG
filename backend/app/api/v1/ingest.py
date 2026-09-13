@@ -133,6 +133,51 @@ async def ingest(
     - text   直接提交文字素材（text_content 表单字段，或 .txt/.md 文件）→ 切片入库
     """
     raw = await file.read() if file is not None else b""
+    # ---- 部署档位保命锁：入库全局互斥 ----
+    # 解析 PDF/长录音极耗 CPU。eco 档 Semaphore(1)：有任务在切片向量化时新上传
+    # 排队挂起，禁止并发解压与批量 Embedding，保证主聊天 API 始终拿得到 CPU 时间片。
+    # 配额/鉴权等轻量校验在锁外完成，重活（压缩 → ASR/VLM → 切片 → 向量化）入锁。
+    await _ingest_gate().acquire()
+    try:
+        return await _ingest_locked(
+            user=user, session_id=session_id, media_type=media_type, file=file,
+            lecture_date=lecture_date, text_content=text_content, subject=subject,
+            course_id=course_id, chapter=chapter, raw=raw,
+        )
+    finally:
+        _ingest_gate().release()
+
+
+_ingest_semaphore: asyncio.Semaphore | None = None
+
+
+def _ingest_gate() -> asyncio.Semaphore:
+    """按部署档位惰性创建入库信号量（容量 = max_concurrent_ingest）。
+
+    档位热切换后新容量在进程重启或事件循环轮换后生效——信号量容量
+    创建即固定，热调整需重建，此处取实现简单与运行时安全的折中。
+    """
+    global _ingest_semaphore
+    if _ingest_semaphore is None:
+        from app.core import profiles
+
+        _ingest_semaphore = asyncio.Semaphore(int(profiles.effective()["max_concurrent_ingest"]))
+    return _ingest_semaphore
+
+
+async def _ingest_locked(
+    *,
+    user: AuthUser,
+    session_id: str,
+    media_type: str,
+    file: UploadFile | None,
+    lecture_date: str,
+    text_content: str,
+    subject: str,
+    course_id: str,
+    chapter: str,
+    raw: bytes,
+):
     if not user.anonymous:
         owner = await repo.get_session_owner(session_id)
         if owner and owner != user.id:

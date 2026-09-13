@@ -481,6 +481,17 @@ export interface MediaSettings {
   audio_max_mb: number;
 }
 
+export interface DeploymentProfile {
+  profile: 'eco' | 'standard' | 'performance';
+  coarse_top_k: number;
+  final_top_k: number;
+  token_budget: number;
+  rerank_mode: 'rrf_only' | 'api';
+  max_concurrent_ingest: number;
+  qdrant_on_disk: boolean;
+  embed_batch_size: number;
+}
+
 export interface AdminConfigView {
   admin_password_set: boolean;
   llm: ModelSectionConfig;
@@ -489,6 +500,7 @@ export interface AdminConfigView {
   vlm: ModelSectionConfig;
   media?: MediaSettings;
   retrieval?: RetrievalWeights;
+  deployment?: DeploymentProfile;
   model_tracks: Array<{ key: string; name: string }>;
 }
 
@@ -562,8 +574,15 @@ export async function saveRetrievalWeights(weights: Partial<RetrievalWeights>): 
   });
 }
 
-export async function fetchAdminChunks(courseId = ''): Promise<AdminChunkInfo[]> {
-  return adminFetch(`/admin/chunks?course_id=${encodeURIComponent(courseId)}`);
+export async function saveDeploymentProfile(profile: DeploymentProfile['profile']): Promise<AdminConfigView> {
+  return adminFetch('/admin/config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ deployment: { profile } }),
+  });
+}
+
+export async function fetchAdminChunks(courseId = ''): Promise<AdminChunkInfo[]> {  return adminFetch(`/admin/chunks?course_id=${encodeURIComponent(courseId)}`);
 }
 
 export async function setChunkCanonical(chunkId: string, canonical: boolean): Promise<void> {

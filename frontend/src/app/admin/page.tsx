@@ -13,6 +13,7 @@ import {
   KeyRound,
   LayoutDashboard,
   Mic,
+  Server,
   SlidersHorizontal,
   Users,
 } from 'lucide-react';
@@ -41,8 +42,9 @@ import ModelSectionCard, { TestState } from '@/components/admin/ModelSectionCard
 import ToastStack, { ToastItem } from '@/components/admin/Toast';
 import { SECTION_META, SectionKey } from '@/components/admin/presets';
 import RetrievalSection from '@/components/admin/RetrievalSection';
+import DeploymentSection from '@/components/admin/DeploymentSection';
 
-type TabKey = 'overview' | SectionKey | 'media' | 'retrieval' | 'users' | 'security';
+type TabKey = 'overview' | SectionKey | 'media' | 'retrieval' | 'deployment' | 'users' | 'security';
 type Drafts = Record<SectionKey, ModelSectionConfig>;
 
 const NAV: Array<{ key: TabKey; label: string; icon: typeof Gauge }> = [
@@ -53,6 +55,7 @@ const NAV: Array<{ key: TabKey; label: string; icon: typeof Gauge }> = [
   { key: 'vlm', label: '多模态识图', icon: ImageIcon },
   { key: 'media', label: '媒体压缩', icon: SlidersHorizontal },
   { key: 'retrieval', label: '检索调权', icon: Gauge },
+  { key: 'deployment', label: '部署档位', icon: Server },
   { key: 'users', label: '会员管理', icon: Users },
   { key: 'security', label: '密码与安全', icon: KeyRound },
 ];
@@ -349,6 +352,8 @@ export default function AdminPage() {
           {tab === 'media' && mediaDraft && <MediaSection draft={mediaDraft} setDraft={setMediaDraft} saving={savingKey === ('media' as SectionKey)} onSave={() => void handleSave('media' as SectionKey)} />}
 
           {tab === 'retrieval' && config?.retrieval && <RetrievalSection config={config} />}
+
+          {tab === 'deployment' && config?.deployment && <DeploymentSection config={config} />}
 
           {tab === 'users' && <UsersSection onToast={toast} />}
 

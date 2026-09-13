@@ -343,8 +343,12 @@ class HybridRetriever:
         lam = 0.05
         today = date.today()
 
-        # 每路召回深度：过召回 4 倍，给融合与精排留余量
-        recall_depth = max(top_k * 4, 1)
+        # 每路召回深度：默认过召回 4 倍给融合与精排留余量；
+        # 部署档位的 coarse_top_k 是下限（eco=10 / standard=20 / performance=40）
+        from app.core import profiles as _profiles
+
+        _prof = _profiles.effective()
+        recall_depth = max(top_k * 4, int(_prof["coarse_top_k"]), 1)
 
         # ---- Dense 路：向量近邻 ----
         # 候选池经 store.search（Qdrant 带 tenant_id + course_id payload filter /
@@ -498,10 +502,13 @@ class HybridRetriever:
             from app.core.runtime_config import effective as rc_effective
 
             rc = rc_effective("rerank")
+            # 部署档位 rrf_only（eco 档默认）：强制跳过远程精排，
+            # 抹去外部 HTTP 延迟与并发连接开销，RRF 粗排直通（实测 MRR 0.90）
+            force_rrf_only = _prof.get("rerank_mode") == "rrf_only"
             pipeline = RerankPipeline(
                 get_reranker(),
                 RerankConfig(
-                    enabled=bool(rc.get("enabled")),
+                    enabled=bool(rc.get("enabled")) and not force_rrf_only,
                     tau=float(rc.get("tau", 0.42)),
                     beta=float(rc.get("beta", 0.30)),
                     recall_pool=int(rc.get("recall_pool", 18)),

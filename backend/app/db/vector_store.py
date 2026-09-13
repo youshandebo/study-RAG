@@ -89,9 +89,21 @@ class QdrantVectorStore:
         from qdrant_client import models
 
         if not await self._client.collection_exists(self._collection):
+            # 部署档位 qdrant_on_disk（eco/standard=True）：向量索引与载荷落盘，
+            # 内存压制在几十 MB 级别——2G 小机上防 OOM Killer 杀进程的保命锁，
+            # 代价是单次检索多几毫秒磁盘 IO。performance 档全内存换纳秒级检索。
+            from app.core import profiles
+
+            on_disk = bool(profiles.effective()["qdrant_on_disk"])
             await self._client.create_collection(
                 collection_name=self._collection,
-                vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
+                vectors_config=models.VectorParams(
+                    size=dim,
+                    distance=models.Distance.COSINE,
+                    on_disk=on_disk,
+                ),
+                hnsw_config=models.HnswConfigDiff(on_disk=on_disk),
+                on_disk_payload=on_disk,
             )
 
     async def upsert(self, point_id: str, vector: list[float], payload: dict) -> None:

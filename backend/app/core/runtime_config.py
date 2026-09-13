@@ -54,6 +54,8 @@ def _blank() -> dict:
         },
         # 会员档位：按 tier 覆盖 storage_mb/model/chat_per_min/max_upload_mb
         "plans": {},
+        # 部署档位：eco/standard/performance + 可选单项覆盖（overrides 留空=跟随预设）
+        "deployment": {"profile": "", "overrides": {}},
     }
 
 
@@ -111,6 +113,14 @@ def _normalize(raw: dict | None) -> dict:
             val = rerank_src.get(key)
             if val is not None and str(val).strip() != "":
                 cfg["rerank"][key] = str(val).strip()
+    dep_src = raw.get("deployment")
+    if isinstance(dep_src, dict):
+        cfg["deployment"]["profile"] = str(dep_src.get("profile") or "").strip().lower()
+        ov = dep_src.get("overrides")
+        if isinstance(ov, dict):
+            cfg["deployment"]["overrides"] = {
+                str(k): v for k, v in ov.items() if v not in (None, "")
+            }
     return cfg
 
 
@@ -147,6 +157,23 @@ def save_runtime_config(patch: dict) -> dict:
     patch = patch if isinstance(patch, dict) else {}
     if isinstance(patch.get("plans"), dict):
         current["plans"] = _normalize({"plans": patch["plans"]}).get("plans", {})
+    # 部署档位：profile 校验合法性 + overrides 原样合并（数值约束在 profiles.resolve 内完成）
+    dep = patch.get("deployment")
+    if isinstance(dep, dict):
+        from app.core.profiles import PROFILES
+
+        target = current.setdefault("deployment", {"profile": "", "overrides": {}})
+        if "profile" in dep:
+            name = str(dep.get("profile") or "").strip().lower()
+            target["profile"] = name if name in PROFILES else ""
+        if isinstance(dep.get("overrides"), dict):
+            merged = dict(target.get("overrides") or {})
+            for k, v in dep["overrides"].items():
+                if v in (None, ""):
+                    merged.pop(str(k), None)  # 空值 = 撤销该覆盖，回落预设
+                else:
+                    merged[str(k)] = v
+            target["overrides"] = merged
     for section in ("llm", "embedding", "asr", "vlm", "media", "retrieval", "rerank"):
         src = patch.get(section)
         if not isinstance(src, dict):
@@ -393,6 +420,10 @@ def masked_view() -> dict:
         "retrieval": effective("retrieval"),
         "plans": rc.get("plans") or {},
     }
+    # 部署档位：下发解析后的生效参数（含档位名），供面板展示当前口径
+    from app.core.profiles import effective as profile_effective
+
+    view["deployment"] = profile_effective()
     # rerank 段含 api_key，同样必须打码后再下发前端
     rr = effective("rerank")
     rr["api_key"] = mask_key(rr.get("api_key", ""))
