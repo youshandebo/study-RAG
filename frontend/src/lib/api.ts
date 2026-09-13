@@ -582,6 +582,35 @@ export async function saveDeploymentProfile(profile: DeploymentProfile['profile'
   });
 }
 
+export interface OutlineExamPoint {
+  name: string;
+  chunk_count: number;
+  has_canonical: boolean;
+}
+
+export interface OutlineChapter {
+  name: string;
+  exam_points: OutlineExamPoint[];
+}
+
+export interface OutlineLecture {
+  lecture_id: string;
+  title: string;
+  chunk_count: number;
+  chapters: OutlineChapter[];
+}
+
+export interface CourseOutline {
+  course_id: string;
+  lectures: OutlineLecture[];
+}
+
+export async function fetchCourseOutline(courseId: string): Promise<CourseOutline> {
+  const resp = await fetch(`${API_BASE}/course/${encodeURIComponent(courseId)}/outline`, authInit());
+  if (!resp.ok) throw new Error(`大纲加载失败 ${resp.status}`);
+  return resp.json() as Promise<CourseOutline>;
+}
+
 export async function fetchAdminChunks(courseId = ''): Promise<AdminChunkInfo[]> {  return adminFetch(`/admin/chunks?course_id=${encodeURIComponent(courseId)}`);
 }
 

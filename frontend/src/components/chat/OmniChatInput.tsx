@@ -87,6 +87,17 @@ export default function OmniChatInput() {
   // 切到"更多解法"时强制阅读弹窗（5s + 红色确认），防误触
   const [pendingExplore, setPendingExplore] = useState(false);
   const busy = streamingMessageId !== null;
+
+  // 大纲树点考点 → 待填提问注入（消费后清空，聚焦输入框待用户发送）
+  const pendingPrompt = useSessionStore((s) => s.pendingPrompt);
+  const setPendingPrompt = useSessionStore((s) => s.setPendingPrompt);
+  useEffect(() => {
+    if (pendingPrompt) {
+      setText(pendingPrompt);
+      setPendingPrompt(null);
+      textareaRef.current?.focus();
+    }
+  }, [pendingPrompt, setPendingPrompt]);
   // 限流/额度柔性提示（429/402）：不打断对话，倒计时结束后自动消散
   const [softNotice, setSoftNotice] = useState<SoftNotice | null>(null);
   // 当前会话每轮用量（供右下角上下文容量面板聚合展示）

@@ -43,6 +43,9 @@ interface SessionState {
   /** 移除占位消息：429/402 等"请求未开始"的失败不应在对话里留气泡 */
   removeMessage: (sessionId: string, id: string) => void;
   setStreamingId: (id: string | null) => void;
+  /** 大纲树点考点 → 注入输入框的待填提问（OmniChatInput 消费后清空） */
+  pendingPrompt: string | null;
+  setPendingPrompt: (text: string | null) => void;
 }
 
 export const useSessionStore = create<SessionState>((set, get) => ({
@@ -213,5 +216,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   setStreamingId(id) {
     set({ streamingMessageId: id });
+  },
+
+  pendingPrompt: null,
+  setPendingPrompt(text) {
+    set({ pendingPrompt: text });
   },
 }));

@@ -35,6 +35,7 @@ export default function QuickIngestPanel() {
       const asset = await uploadAsset(activeSessionId, kind, file);
       registerAsset(asset);
       setIngestProgress({ filename: file.name, percent: 100, stage: `完成 · 新增 ${asset.chunkCount} 个考点切片` });
+      window.dispatchEvent(new CustomEvent('outline:refresh')); // 大纲树实时反映新切片
       window.setTimeout(() => setIngestProgress(null), 2600);
     } catch (e) {
       setError(`入库失败：${(e as Error).message}（请确认后端已启动）`);
@@ -55,6 +56,7 @@ export default function QuickIngestPanel() {
       setNoteTitle('');
       setShowTextBox(false);
       setIngestProgress({ filename: asset.filename, percent: 100, stage: `完成 · 新增 ${asset.chunkCount} 个知识切片` });
+      window.dispatchEvent(new CustomEvent('outline:refresh'));
       window.setTimeout(() => setIngestProgress(null), 2600);
     } catch (e) {
       setError(`文字入库失败：${(e as Error).message}`);
