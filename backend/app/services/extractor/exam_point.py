@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.core.tenancy import DEFAULT_TENANT
 from app.services.llm.mock_engine import SOLVE_STEPS
 from app.services.rag.chunker import Chunk
 
@@ -39,7 +40,10 @@ def extract_for_solution(problem_text: str) -> ExamPoint:
     return ExamPoint(name="p-反常积分比较审敛法", source_chunk_ids=[], summary="；".join(SOLVE_STEPS[:2]))
 
 
-async def match_from_text(text: str, course_id: str | None = None, top: int = 1) -> ExamPoint:
+async def match_from_text(
+    text: str, course_id: str | None = None, top: int = 1,
+    tenant_id: str = DEFAULT_TENANT,
+) -> ExamPoint:
     """通用考点匹配：对已入库切片做向量+BM25 混合检索，取最相关切片的考点标注。
 
     取代旧的关键词表硬编码——新学科/新课程入库即自动可匹配，无需改代码。
@@ -52,7 +56,8 @@ async def match_from_text(text: str, course_id: str | None = None, top: int = 1)
 
         retriever = await get_retriever()
         hits = await retriever.retrieve_scored(
-            text, top_k=top, course_id=course_id or None, retrieval_mode="review"
+            text, top_k=top, course_id=course_id or None, retrieval_mode="review",
+            tenant_id=tenant_id,
         )
         if hits:
             best = hits[0][1]

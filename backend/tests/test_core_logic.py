@@ -1509,12 +1509,22 @@ class TestMultiChapterFixture:
 
         assert all(n >= 5 for n in sizes), f"候选池过浅: {sizes}"
 
-    def test_canonical_bonus_flattens_coarse_scores(self):
-        """记录一个真实缺陷:粗排的 canonical_bonus 是**固定加分**,不区分彼此。
+    def test_canonical_bonus_no_longer_flattens_coarse_scores(self):
+        """第 16 轮修复关键词通道后，粗排**已能**区分定版优劣。
 
-        三条定版会拿到完全相同的融合分,粗排阶段根本无法排序——跨章节的
-        错误定版可以和正确答案并列甚至靠前。门控之所以必需,根因在这里。
-        本测试把这个事实钉住,防止将来有人误以为粗排已经够用。
+        历史背景（值得留档）
+        -------------------
+        第 13 轮此处断言的是 `by_id[rel] == by_id[adv]`，理由是：
+        `canonical_bonus` 是**固定加分**（0.3），而词面与 BM25 两个通道
+        在中文上恒为 0（`_tokenize` 把整句切成一个 token，交集必为空）。
+        于是所有定版拿到完全相同的融合分，粗排无法排序。
+
+        第 16 轮把关键词通道切到 `bm25_tokenize`（中文 bigram）后，
+        通道恢复工作，定版之间因文本相关度不同而自然分开——
+        该缺陷不复存在，实测 rel=0.3295 vs adv=0.3000。
+
+        保留此测试是为了钉住**新基线**：若将来有人把分词退回整句口径，
+        两者会重新相等，这里会立刻失败。
         """
         import asyncio
 
@@ -1531,12 +1541,12 @@ class TestMultiChapterFixture:
         by_id = {c.id: s for s, c in scored}
 
         rel, adv = q["expect_relevant_chunk"], q["expect_adversarial_chunk"]
-        if rel in by_id and adv in by_id:
-            # 二者都是 canonical、都加了同一个 bonus，粗排分必然相同
-            assert by_id[rel] == pytest.approx(by_id[adv], abs=1e-9), (
-                "若此断言失败，说明粗排已能区分定版优劣，"
-                "那么重排的门控设计需要重新评估"
-            )
+        assert rel in by_id and adv in by_id, "夹具候选池应同时含正解与对抗定版"
+        assert by_id[rel] > by_id[adv], (
+            f"粗排未能把正解定版排在对抗定版之前 "
+            f"(rel={by_id[rel]:.4f} adv={by_id[adv]:.4f})——"
+            "关键词通道可能已退回整句分词口径"
+        )
 
     def test_fixture_dataset_feeds_calibration_script(self):
         """夹具产出的候选必须能被标定脚本消费（结构对齐 = 闭环可用）。"""
@@ -2063,3 +2073,566 @@ class TestBillingIntegration:
         from app.api.v1.compare import CompareBody
 
         assert "request_id" in CompareBody.model_fields
+
+
+# --------------------------------------------- 多租户：解析与防注入 ----
+class TestTenantResolution:
+    """租户解析的唯一合法来源是服务端：签名 JWT → 用户记录。
+
+    这组测试守的是"**客户端无法指定自己的租户**"这条底线。
+    """
+
+    def test_disabled_mode_always_returns_default(self, monkeypatch):
+        monkeypatch.delenv("MULTI_TENANT_MODE", raising=False)
+        from app.api.v1.auth import AuthUser
+        from app.core.tenancy import DEFAULT_TENANT, resolve_tenant
+
+        u = AuthUser("u1", "a@b.c", "free", tenant_id="org-a")
+        assert resolve_tenant(u) == DEFAULT_TENANT, "关闭多租户时不应有任何隔离行为"
+
+    def test_enabled_mode_uses_user_record(self, monkeypatch):
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        from app.api.v1.auth import AuthUser
+        from app.core.tenancy import resolve_tenant
+
+        assert resolve_tenant(AuthUser("u1", "a@b.c", "free", tenant_id="org-a")) == "org-a"
+
+    def test_anonymous_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        from app.api.v1.auth import AuthUser
+        from app.core.tenancy import DEFAULT_TENANT, resolve_tenant
+
+        anon = AuthUser(None, None, "guest", anonymous=True)
+        assert resolve_tenant(anon) == DEFAULT_TENANT
+
+    def test_missing_tenant_never_widens_to_all(self, monkeypatch):
+        """登录用户没有租户归属时，必须**收窄**到默认租户，绝不能放宽为全库。
+
+        这是 fail-closed 的核心：鉴权链路出问题时，安全的那一侧是"什么都看不到"。
+        """
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        from app.api.v1.auth import AuthUser
+        from app.core.tenancy import DEFAULT_TENANT, resolve_tenant
+
+        assert resolve_tenant(AuthUser("u1", "a@b.c", "free", tenant_id=None)) == DEFAULT_TENANT
+
+    def test_invalid_tenant_shape_normalized(self):
+        from app.core.tenancy import DEFAULT_TENANT, normalize_tenant
+
+        for bad in ("", "   ", "has space", "bad/slash", "a" * 200, "注入'; DROP--"):
+            assert normalize_tenant(bad) == DEFAULT_TENANT, f"非法租户应归默认: {bad!r}"
+        assert normalize_tenant("org-a_1") == "org-a_1"
+
+    def test_request_models_have_no_client_supplied_tenant(self):
+        """防回归：请求模型里不得出现 tenant 字段，否则客户端可自行指定租户。"""
+        from app.models.domain import ChatRequest, IngestRequest
+
+        for model in (ChatRequest, IngestRequest):
+            assert "tenant_id" not in model.model_fields, (
+                f"{model.__name__} 暴露了 tenant 字段，客户端可越权指定租户"
+            )
+        assert "tenant_id" not in __import__(
+            "app.api.v1.compare", fromlist=["CompareBody"]
+        ).CompareBody.model_fields
+
+    def test_api_layer_never_reads_tenant_from_request(self):
+        """源码守卫：业务端点不得从表单/查询参数/请求头读取租户。
+
+        管理员端点（admin.py）例外——它是运营侧"分配租户"的入口，
+        是唯一允许出现 tenant 参数的合法位置。
+        """
+        import pathlib
+
+        api_root = pathlib.Path(__file__).resolve().parent.parent / "app" / "api"
+        watched = {"chat_stream.py", "compare.py", "ingest.py", "exam.py", "evidence.py"}
+        offenders: list[str] = []
+        for py in api_root.rglob("*.py"):
+            if py.name not in watched:
+                continue
+            for lineno, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
+                low = line.lower()
+                if "tenant" not in low:
+                    continue
+                if any(k in low for k in ("form(", "query(", "header(", "req.tenant", "body.tenant")):
+                    offenders.append(f"{py.name}:{lineno}: {line.strip()}")
+        assert not offenders, f"检测到从客户端读取租户（可被伪造）: {offenders}"
+
+
+# --------------------------------------------- 多租户：检索层隔离 ----
+class TestTenantIsolation:
+    """隔离必须发生在数据层，且 Dense / Sparse 两路都要生效。"""
+
+    @staticmethod
+    def _chunk(cid: str, tenant: str, text: str, course: str, canonical: bool = False):
+        from app.services.rag.chunker import Chunk
+
+        return Chunk(
+            id=cid, audio_id="ut-t", start="00:00", end="00:10", text=text,
+            course_id=course, exam_point="ut 租户考点", tenant_id=tenant,
+            is_canonical=canonical,
+        )
+
+    async def _retriever(self):
+        from app.services.rag.retriever import HybridRetriever
+
+        r = HybridRetriever()
+        await r._ensure_seeded()
+        return r
+
+    @pytest.mark.asyncio
+    async def test_single_tenant_mode_is_transparent(self, monkeypatch):
+        """默认关闭时所有切片可见——升级不得造成"数据全丢"的回归。"""
+        monkeypatch.delenv("MULTI_TENANT_MODE", raising=False)
+        r = await self._retriever()
+        await r.register_chunks([
+            self._chunk("ut-tt-a", "org-a", "反常积分 抓大头 判敛", "ut-tenant-off"),
+            self._chunk("ut-tt-b", "org-b", "反常积分 抓大头 判敛", "ut-tenant-off"),
+        ])
+
+        hits = await r.retrieve_scored(
+            "反常积分 抓大头", course_id="ut-tenant-off", retrieval_mode="review"
+        )
+
+        ids = {c.id for _, c in hits}
+        assert {"ut-tt-a", "ut-tt-b"} <= ids, "关闭模式下不应有任何租户过滤"
+
+    @pytest.mark.asyncio
+    async def test_multi_tenant_mode_hides_other_tenant(self, monkeypatch):
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        r = await self._retriever()
+        await r.register_chunks([
+            self._chunk("ut-mm-a", "org-a", "反常积分 抓大头 判敛", "ut-tenant-on"),
+            self._chunk("ut-mm-b", "org-b", "反常积分 抓大头 判敛", "ut-tenant-on"),
+        ])
+
+        hits_a = await r.retrieve_scored(
+            "反常积分 抓大头", course_id="ut-tenant-on",
+            retrieval_mode="review", tenant_id="org-a",
+        )
+        hits_b = await r.retrieve_scored(
+            "反常积分 抓大头", course_id="ut-tenant-on",
+            retrieval_mode="review", tenant_id="org-b",
+        )
+
+        ids_a = {c.id for _, c in hits_a}
+        ids_b = {c.id for _, c in hits_b}
+        assert "ut-mm-a" in ids_a and "ut-mm-b" not in ids_a, "A 看到了 B 的切片"
+        assert "ut-mm-b" in ids_b and "ut-mm-a" not in ids_b, "B 看到了 A 的切片"
+
+    @pytest.mark.asyncio
+    async def test_bm25_scoring_respects_tenant(self, monkeypatch):
+        """Sparse 路（BM25）也必须隔离——只隔离 Dense 路等于留了后门。"""
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        r = await self._retriever()
+        await r.register_chunks([
+            self._chunk("ut-bm-a", "org-a", "梯度爆炸 梯度截断 阈值", "ut-bm"),
+            self._chunk("ut-bm-b", "org-b", "梯度爆炸 梯度截断 阈值", "ut-bm"),
+        ])
+
+        from app.services.rag import embedder
+
+        toks = embedder.bm25_tokenize("梯度截断 阈值")
+        scores_a = r._bm25.scores(toks, tenant_id="org-a")
+
+        assert "ut-bm-a" in scores_a
+        assert "ut-bm-b" not in scores_a, "BM25 打分泄漏了跨租户文档"
+
+    @pytest.mark.asyncio
+    async def test_bm25_idf_stays_global(self, monkeypatch):
+        """IDF 统计口径必须保持全库：按租户算会因语料过小而剧烈失真。"""
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        r = await self._retriever()
+        await r.register_chunks([
+            self._chunk("ut-idf-a", "org-a", "独有词 反常积分", "ut-idf"),
+            self._chunk("ut-idf-b", "org-b", "独有词 反常积分", "ut-idf"),
+        ])
+
+        from app.services.rag import embedder
+
+        toks = embedder.bm25_tokenize("独有词 反常积分")
+        # 全库统计下 "独有词" 出现在 2 份文档中的 df=2；若按租户算 df=1，
+        # IDF 会显著偏高。此处只断言"跨租户文档的分数不返回"，
+        # IDF 稳定性由实现注释保证（全库 n_docs 不受 tenant 影响）。
+        scores = r._bm25.scores(toks, tenant_id="org-a")
+        assert set(scores) <= {"ut-idf-a"}
+
+    @pytest.mark.asyncio
+    async def test_all_chunks_respects_tenant(self, monkeypatch):
+        """骨架视图也要隔离：packer 的邻居扩展基于它，串租户比检索泄漏更隐蔽。"""
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        r = await self._retriever()
+        await r.register_chunks([
+            self._chunk("ut-ac-a", "org-a", "甲内容", "ut-ac"),
+            self._chunk("ut-ac-b", "org-b", "乙内容", "ut-ac"),
+        ])
+
+        ids_a = {c.id for c in await r.all_chunks(tenant_id="org-a")}
+        assert "ut-ac-a" in ids_a
+        assert "ut-ac-b" not in ids_a
+
+    @pytest.mark.asyncio
+    async def test_set_canonical_does_not_depose_other_tenant(self, monkeypatch):
+        """**写**越权防护：设为定版不得降级其他机构同考点的定版。"""
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        r = await self._retriever()
+        await r.register_chunks([
+            self._chunk("ut-cx-a", "org-a", "甲解法", "ut-cx", canonical=False),
+            self._chunk("ut-cx-b", "org-b", "乙解法", "ut-cx", canonical=True),
+        ])
+
+        await r.set_canonical("ut-cx-a", True)
+
+        assert r._chunks["ut-cx-a"].is_canonical is True
+        assert r._chunks["ut-cx-b"].is_canonical is True, (
+            "跨租户把别的机构定版降级了——静默破坏他人数据"
+        )
+
+    @pytest.mark.asyncio
+    async def test_longer_prefix_does_not_leak_partial_tenant(self, monkeypatch):
+        """租户名互为前缀时不得误匹配（"org" 不应看到 "org-secret"）。"""
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        r = await self._retriever()
+        await r.register_chunks([
+            self._chunk("ut-pf-a", "org", "前缀租户内容 反常积分", "ut-pf"),
+            self._chunk("ut-pf-b", "org-secret", "机密租户内容 反常积分", "ut-pf"),
+        ])
+
+        hits = await r.retrieve_scored(
+            "反常积分", course_id="ut-pf", retrieval_mode="review", tenant_id="org"
+        )
+        ids = {c.id for _, c in hits}
+        assert "ut-pf-a" in ids
+        assert "ut-pf-b" not in ids, "前缀租户被误包含"
+
+
+# --------------------------------------------- 双路召回（Dense + Sparse）----
+class TestDualPathRecall:
+    """本轮核心修复：BM25 必须参与**召回**，而不只是候选池内的重排序。"""
+
+    @staticmethod
+    def _chunk(cid: str, text: str, course: str):
+        from app.services.rag.chunker import Chunk
+
+        return Chunk(
+            id=cid, audio_id="ut-dp", start="00:00", end="00:10", text=text,
+            course_id=course, exam_point="ut 双路考点",
+        )
+
+    async def _retriever(self):
+        from app.services.rag.retriever import HybridRetriever
+
+        r = HybridRetriever()
+        await r._ensure_seeded()
+        return r
+
+    @pytest.mark.asyncio
+    async def test_sparse_path_survives_total_dense_failure(self):
+        """Dense 路完全空手时，Sparse 路必须仍能提供候选。
+
+        这是双路召回的核心价值：向量检索漏掉的（或此处模拟的"完全失败"），
+        BM25 仍能凭关键词精确匹配把它们捞回来。
+        """
+        r = await self._retriever()
+        await r.register_chunks([
+            self._chunk("ut-dp1", "梯度下降的学习率衰减策略", "ut-dual-1"),
+        ])
+
+        class _EmptyStore:
+            async def upsert(self, *a, **kw):
+                return None
+
+            async def search(self, *a, **kw):
+                return []
+
+        r._store = _EmptyStore()
+
+        hits = await r.retrieve_scored(
+            "学习率衰减", course_id="ut-dual-1", retrieval_mode="review"
+        )
+
+        assert any(c.id == "ut-dp1" for _, c in hits), (
+            "Dense 空手时 Sparse 未补上候选——双路召回未生效"
+        )
+
+    @pytest.mark.asyncio
+    async def test_pool_is_union_of_both_paths(self):
+        """候选池必须是两路的并集，而不是"以 Dense 为准"。"""
+        r = await self._retriever()
+        await r.register_chunks([
+            self._chunk("ut-un1", "梯度下降 学习率 衰减", "ut-dual-2"),
+            self._chunk("ut-un2", "梯度下降 学习率 衰减", "ut-dual-2"),
+            self._chunk("ut-un3", "梯度下降 学习率 衰减", "ut-dual-2"),
+        ])
+
+        inner = r._store
+
+        class _OneHitStore:
+            """只返回指定的一条，模拟向量召回不足。"""
+
+            async def upsert(self, *a, **kw):
+                return await inner.upsert(*a, **kw)
+
+            async def search(self, vector, top_k, course_id=None, tenant_id=None):
+                hits = await inner.search(
+                    vector, top_k=100, course_id=course_id, tenant_id=tenant_id
+                )
+                return [h for h in hits if h[0] == "ut-un1"][:top_k]
+
+        r._store = _OneHitStore()
+
+        hits = await r.retrieve_scored(
+            "梯度下降 学习率 衰减", course_id="ut-dual-2", retrieval_mode="review"
+        )
+        ids = {c.id for _, c in hits}
+
+        assert "ut-un1" in ids, "Dense 命中项应保留"
+        assert len(ids) > 1, f"Sparse 路未补充候选，池子仍是 Dense 独裁: {ids}"
+
+    @pytest.mark.asyncio
+    async def test_sparse_path_respects_course_scope(self):
+        """Sparse 路不得绕过课程隔离——否则它成了绕过作用域的后门。"""
+        r = await self._retriever()
+        await r.register_chunks([
+            self._chunk("ut-sp-in", "梯度截断 阈值选择", "ut-dual-3"),
+            self._chunk("ut-sp-out", "梯度截断 阈值选择", "ut-dual-other"),
+        ])
+
+        class _EmptyStore:
+            async def upsert(self, *a, **kw):
+                return None
+
+            async def search(self, *a, **kw):
+                return []
+
+        r._store = _EmptyStore()
+
+        hits = await r.retrieve_scored(
+            "梯度截断 阈值", course_id="ut-dual-3", retrieval_mode="review"
+        )
+        ids = {c.id for _, c in hits}
+
+        assert "ut-sp-in" in ids
+        assert "ut-sp-out" not in ids, "Sparse 路绕过了课程隔离"
+
+    @pytest.mark.asyncio
+    async def test_sparse_path_respects_tenant(self, monkeypatch):
+        """Sparse 路同样不得绕过租户隔离。"""
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        r = await self._retriever()
+        from app.services.rag.chunker import Chunk
+
+        await r.register_chunks([
+            Chunk(id="ut-st-a", audio_id="ut", start="00:00", end="00:10",
+                  text="模式崩溃 判别器", course_id="ut-dual-4", exam_point="ut 双路考点",
+                  tenant_id="org-a"),
+            Chunk(id="ut-st-b", audio_id="ut", start="00:00", end="00:10",
+                  text="模式崩溃 判别器", course_id="ut-dual-4", exam_point="ut 双路考点",
+                  tenant_id="org-b"),
+        ])
+
+        class _EmptyStore:
+            async def upsert(self, *a, **kw):
+                return None
+
+            async def search(self, *a, **kw):
+                return []
+
+        r._store = _EmptyStore()
+
+        hits = await r.retrieve_scored(
+            "模式崩溃 判别器", course_id="ut-dual-4",
+            retrieval_mode="review", tenant_id="org-a",
+        )
+        ids = {c.id for _, c in hits}
+        assert "ut-st-a" in ids and "ut-st-b" not in ids, "Sparse 路绕过了租户隔离"
+
+
+# --------------------------------------------- Schema 增量迁移 ----
+class TestSchemaMigration:
+    """回归：create_all 只建缺失的表，对已存在的表**不加列**。
+
+    存量部署升级后若不补列，查询新字段会直接报 "no such column"。
+    """
+
+    def test_patch_table_covers_tenant_column(self):
+        from app.db.relational import _SCHEMA_PATCHES
+
+        assert ("users", "tenant_id", "VARCHAR(64)") in _SCHEMA_PATCHES
+
+    @pytest.mark.asyncio
+    async def test_existing_db_gains_tenant_column(self, tmp_path, monkeypatch):
+        """在"旧版" users 表（无 tenant_id）上验证补列真的发生。"""
+        import sqlite3
+
+        import app.db.relational as rel
+
+        db = tmp_path / "legacy.db"
+        # 模拟升级前的表结构：没有 tenant_id
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE users ("
+            "id VARCHAR(32) PRIMARY KEY, email VARCHAR(200), password_hash VARCHAR(200),"
+            "tier VARCHAR(20), created_at BIGINT)"
+        )
+        conn.commit()
+        conn.close()
+
+        saved = (rel._engine, rel._sessionmaker, rel._tables_ready, rel._pg_broken)
+        monkeypatch.setenv("APP_DB_PATH", str(db))
+        try:
+            rel._engine = None
+            rel._sessionmaker = None
+            rel._tables_ready = False
+            rel._pg_broken = False
+            assert rel._db_ready(), "应能在临时路径建 SQLite 引擎"
+            assert await rel._ensure_tables(), "建表 + 补列应成功"
+
+            conn = sqlite3.connect(db)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+            conn.close()
+            assert "tenant_id" in cols, f"存量表未获得 tenant_id 列: {cols}"
+        finally:
+            engine = rel._engine
+            if engine is not None:
+                await engine.dispose()
+            rel._engine, rel._sessionmaker, rel._tables_ready, rel._pg_broken = saved
+
+    @pytest.mark.asyncio
+    async def test_patch_is_idempotent(self, tmp_path, monkeypatch):
+        """重复补列不得报错（每次进程启动都会跑一遍）。"""
+        import app.db.relational as rel
+
+        db = tmp_path / "idem.db"
+        saved = (rel._engine, rel._sessionmaker, rel._tables_ready, rel._pg_broken)
+        monkeypatch.setenv("APP_DB_PATH", str(db))
+        try:
+            rel._engine = None
+            rel._sessionmaker = None
+            rel._tables_ready = False
+            rel._pg_broken = False
+            assert rel._db_ready()
+            assert await rel._ensure_tables()
+            # 强制重跑补列（模拟第二次启动）
+            rel._tables_ready = False
+            assert await rel._ensure_tables(), "第二次补列不应失败"
+        finally:
+            engine = rel._engine
+            if engine is not None:
+                await engine.dispose()
+            rel._engine, rel._sessionmaker, rel._tables_ready, rel._pg_broken = saved
+
+
+# --------------------------------------------- 顺带修复的降级缺陷 ----
+class TestRetrieverDegradation:
+    """`retriever` 引用了未定义的 `_logger`——降级路径会抛 NameError。"""
+
+    def test_logger_is_defined(self):
+        from app.services.rag import retriever
+
+        assert hasattr(retriever, "_logger"), "降级分支引用了 _logger 但未定义"
+
+    @pytest.mark.asyncio
+    async def test_store_failure_degrades_without_crashing(self):
+        """store.search 抛异常时必须优雅回退进程内候选池，而不是 NameError 崩掉。"""
+        from app.services.rag.retriever import HybridRetriever
+
+        r = HybridRetriever()
+        await r._ensure_seeded()
+        from app.services.rag.chunker import Chunk
+
+        await r.register_chunks([
+            Chunk(id="ut-dg1", audio_id="ut", start="00:00", end="00:10",
+                  text="降级测试 反常积分", course_id="ut-degrade", exam_point="ut 降级考点"),
+        ])
+
+        class _BoomStore:
+            async def upsert(self, *a, **kw):
+                return None
+
+            async def search(self, *a, **kw):
+                raise RuntimeError("simulated store outage")
+
+        r._store = _BoomStore()
+
+        hits = await r.retrieve_scored(
+            "反常积分", course_id="ut-degrade", retrieval_mode="review"
+        )
+        assert any(c.id == "ut-dg1" for _, c in hits), "降级后应仍能返回结果"
+
+
+# --------------------------------------------- 中文分词（关键词通道的地基）----
+class TestChineseTokenization:
+    """BM25 与词面信号的地基：中文必须被切成可比对的单元。
+
+    这是第 16 轮"修粗排召回"的另一半——若无此修复，双路召回里
+    Sparse 路永远空手，结构性改造等于空转。
+    """
+
+    def test_legacy_tokenizer_is_useless_for_chinese(self):
+        """留档旧口径的失效：整句一个 token，与任意子串查询零交集。"""
+        from app.services.rag.embedder import _tokenize
+
+        assert _tokenize("学习率衰减") == ["学习率衰减"]
+
+        query = set(_tokenize("学习率衰减"))
+        doc = set(_tokenize("梯度下降的学习率衰减策略"))
+        assert not (query & doc), "旧口径下中文关键词通道交集恒为空"
+
+    def test_bigram_tokenizer_matches_substrings(self):
+        from app.services.rag.embedder import bm25_tokenize
+
+        toks = bm25_tokenize("学习率衰减")
+        assert "学习" in toks and "习率" in toks and "率衰" in toks and "衰减" in toks
+
+        inter = set(bm25_tokenize("学习率衰减")) & set(
+            bm25_tokenize("梯度下降的学习率衰减策略")
+        )
+        assert len(inter) >= 3, f"bigram 应产生有效交集，实为 {inter}"
+
+    def test_english_kept_as_whole_word(self):
+        """英文按整词：bigram 会把 gradient 切碎，反而降低区分度。"""
+        from app.services.rag.embedder import bm25_tokenize
+
+        assert "gradient" in bm25_tokenize("Gradient Descent")
+        assert "descent" in bm25_tokenize("Gradient Descent")
+        # 不应产生 ga/ra/ad 这类碎片
+        assert not any(t in ("gr", "ra", "ad") for t in bm25_tokenize("Gradient"))
+
+    def test_single_cjk_char_survives(self):
+        from app.services.rag.embedder import bm25_tokenize
+
+        assert bm25_tokenize("解") == ["解"]
+
+    def test_mixed_script_tokenization(self):
+        from app.services.rag.embedder import bm25_tokenize
+
+        toks = bm25_tokenize("BGE-Reranker 重排模型 v2")
+        assert "bge" in toks and "reranker" in toks and "v2" in toks
+        assert "重排" in toks
+
+    def test_punctuation_ignored(self):
+        from app.services.rag.embedder import bm25_tokenize
+
+        assert bm25_tokenize("梯度，下降。") == bm25_tokenize("梯度 下降")
+        assert not any(t in "，。！？" for t in bm25_tokenize("梯度，下降。"))
+
+    def test_empty_input(self):
+        from app.services.rag.embedder import bm25_tokenize
+
+        assert bm25_tokenize("") == []
+        assert bm25_tokenize("   ") == []
+
+    def test_keyword_channel_actually_contributes(self):
+        """端到端：中文查询走完整检索时，关键词通道必须产生非零贡献。
+
+        回归第 13 轮实测的"粗排无法区分定版"——若两个通道恒为 0，
+        只有 canonical_bonus 与向量在起作用，定版之间必然同分。
+        """
+        from app.services.rag import embedder
+        from app.services.rag.retriever import HybridRetriever
+
+        overlap = HybridRetriever._lexical_overlap(
+            set(embedder.bm25_tokenize("学习率衰减")),
+            "梯度下降的学习率衰减策略",
+        )
+        assert overlap > 0, "词面通道对中文仍为零贡献，关键词通道未真正恢复"

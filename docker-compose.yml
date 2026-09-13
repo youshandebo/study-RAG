@@ -12,6 +12,9 @@ services:
       - POSTGRES_DSN=${POSTGRES_DSN:-}
       - REDIS_URL=redis://redis:6379/0
       - MINIO_ENDPOINT=${MINIO_ENDPOINT:-}
+      # 多租户隔离：默认关闭（单租户 public）。开启前先跑
+      # `python scripts/migrate_tenants.py` 给存量切片打标，否则旧数据不可见。
+      - MULTI_TENANT_MODE=${MULTI_TENANT_MODE:-}
     depends_on:
       - redis
     volumes:

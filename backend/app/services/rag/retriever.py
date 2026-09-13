@@ -1,9 +1,18 @@
 # Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
-"""混合检索器：向量相似度 + BM25 倒排 + 课程作用域隔离 + 时序衰减 + 邻近切片窗口。
+"""混合检索器：向量相似度 + BM25 倒排 + 租户/课程作用域隔离 + 时序衰减 + 邻近切片窗口。
 
-优先写入/查询 Qdrant（带 course_id payload filter）；未配置 Qdrant 时自动使用
-进程内向量索引（零依赖兜底）。进程内 BM25 倒排索引随每次向量入库同步增量
-更新，读写锁保证并发安全。
+**双路召回**（本轮核心修复）
+---------------------------
+Dense（向量）与 Sparse（BM25）各自独立召回 Top-N，并集进候选池后再统一加权。
+此前只把查询向量交给 `store.search()`，BM25 仅作候选池**内部**的重排序信号——
+这是"做了混合重排、却没做混合召回"的经典错误：向量检索漏掉的关键切片，
+BM25 权重再高也永远捞不回来（它不在池子里，加权公式给它算不出分）。
+
+**隔离边界**：租户（最外层，服务端权威） → 课程（次外层）。
+
+优先写入/查询 Qdrant（带 tenant_id + course_id payload filter）；未配置 Qdrant
+时自动使用进程内向量索引（零依赖兜底）。进程内 BM25 倒排索引随每次向量入库
+同步增量更新，读写锁保证并发安全。
 """
 from __future__ import annotations
 
@@ -14,9 +23,15 @@ import threading
 from datetime import date
 
 from app.core.config import get_settings
-from app.db.vector_store import get_vector_store
+from app.core.tenancy import DEFAULT_TENANT, multi_tenant_enabled
+from app.db.vector_store import _tenant_filter_active, get_vector_store
 from app.services.rag import corpus, embedder
 from app.services.rag.chunker import Chunk
+
+# 此前本模块引用了 `_logger` 却从未定义——两处"优雅降级"分支
+# （store.search 失败 / 精排失败）一旦真的触发就会抛 NameError，
+# 把降级变成崩溃。降级路径必须比主路径更可靠。
+_logger = logging.getLogger("app.rag.retriever")
 
 
 class RWLock:
@@ -59,7 +74,16 @@ class RWLock:
 
 
 class BM25Index:
-    """内存 BM25 关键词倒排索引：k1=1.5, b=0.75 经典参数。"""
+    """内存 BM25 关键词倒排索引：k1=1.5, b=0.75 经典参数。
+
+    租户分区：postings 仍是全局一份（词项 → 文档的倒排关系必须全局共享，
+    否则每个租户都要重建一遍词典），但每个 chunk 记录其租户归属，
+    `scores()` 只返回**本租户**的得分。
+
+    IDF 刻意保持**全库统计**而非租户内统计：租户语料小的时候，
+    某个词在一两份文档里出现就会让 IDF 剧烈失真，"普遍出现的词"被算成
+    "罕见词"从而被过度加权。隔离靠过滤返回结果实现，不靠改统计口径。
+    """
 
     K1, B = 1.5, 0.75
 
@@ -67,19 +91,28 @@ class BM25Index:
         self._lock = RWLock()
         self._postings: dict[str, dict[str, int]] = {}  # term -> {chunk_id: tf}
         self._doc_len: dict[str, int] = {}
+        self._tenant_of: dict[str, str] = {}            # chunk_id -> 租户归属
         self._avg_len = 1.0
 
-    def add(self, chunk_id: str, tokens: list[str]) -> None:
+    def add(self, chunk_id: str, tokens: list[str], tenant_id: str = DEFAULT_TENANT) -> None:
         with self._lock:
             for tok in tokens:
                 postings = self._postings.setdefault(tok, {})
                 postings[chunk_id] = postings.get(chunk_id, 0) + 1
             self._doc_len[chunk_id] = len(tokens) or 1
+            self._tenant_of[chunk_id] = tenant_id or DEFAULT_TENANT
             total = sum(self._doc_len.values())
             self._avg_len = total / max(len(self._doc_len), 1)
 
-    def scores(self, query_tokens: list[str]) -> dict[str, float]:
-        """对全量文档计算 BM25 得分（N 为千级，全扫足够）。"""
+    def scores(
+        self, query_tokens: list[str], tenant_id: str | None = None
+    ) -> dict[str, float]:
+        """对全量文档计算 BM25 得分（N 为千级，全扫足够）。
+
+        `tenant_id` 非空且多租户模式开启时，只返回该租户的文档得分——
+        跨租户文档在**打分阶段就不可见**，而不是"打完分再筛掉"。
+        """
+        restrict = _tenant_filter_active(tenant_id)
         self._lock.acquire_read()
         try:
             n_docs = max(len(self._doc_len), 1)
@@ -90,10 +123,19 @@ class BM25Index:
                     continue
                 idf = math.log(1 + (n_docs - len(postings) + 0.5) / (len(postings) + 0.5))
                 for cid, tf in postings.items():
+                    if restrict and self._tenant_of.get(cid, DEFAULT_TENANT) != tenant_id:
+                        continue
                     dl = self._doc_len.get(cid, 1)
                     denom = tf + self.K1 * (1 - self.B + self.B * dl / self._avg_len)
                     scores[cid] = scores.get(cid, 0.0) + idf * (tf * (self.K1 + 1)) / denom
             return scores
+        finally:
+            self._lock.release_read()
+
+    def tenant_of(self, chunk_id: str) -> str:
+        self._lock.acquire_read()
+        try:
+            return self._tenant_of.get(chunk_id, DEFAULT_TENANT)
         finally:
             self._lock.release_read()
 
@@ -124,6 +166,7 @@ class HybridRetriever:
 
         真实部署（配了真实模型 Key）默认不再灌入，避免演示数据混进生产知识库；
         需要时可用 SEED_DEMO_CORPUS=1 显式开启，或用 =0 在演示模式下也关闭。
+        演示语料统一归入默认租户——它属于演示身份，不归属任何真实租户。
         """
         if self._seeded:
             return
@@ -132,17 +175,24 @@ class HybridRetriever:
             return
         for item in corpus.SEED_CHUNKS:
             chunk = Chunk(**item)
+            chunk.tenant_id = DEFAULT_TENANT
             self._chunks[chunk.id] = chunk
             vec = await embedder.embed(f"{chunk.exam_point} {chunk.text}")
             self._vectors[chunk.id] = vec
             await self._store.upsert(chunk.id, vec, chunk.to_payload())
-            self._bm25.add(chunk.id, embedder._tokenize(f"{chunk.exam_point} {chunk.text}"))
+            self._bm25.add(
+                chunk.id,
+                embedder.bm25_tokenize(f"{chunk.exam_point} {chunk.text}"),
+                chunk.tenant_id,
+            )
 
     @staticmethod
     def _lexical_overlap(query_tokens: set[str], text: str) -> float:
         if not query_tokens:
             return 0.0
-        hay = set(embedder._tokenize(text))
+        # 与 BM25 共用 bigram 口径：两者都是"关键词通道"，
+        # 用 `_tokenize` 会让中文整句变成一个 token，交集恒为空（信号恒 0）。
+        hay = set(embedder.bm25_tokenize(text))
         inter = query_tokens & hay
         return len(inter) / len(query_tokens)
 
@@ -158,10 +208,12 @@ class HybridRetriever:
         time_alpha_override: float | None = None,
         canonical_bonus_override: float | None = None,
         chapter: str | None = None,
+        tenant_id: str = DEFAULT_TENANT,
     ) -> list[Chunk]:
         scored = await self.retrieve_scored(
             query, top_k, exam_point, course_id, retrieval_mode,
             time_alpha_override, canonical_bonus_override, chapter,
+            tenant_id=tenant_id,
         )
         picked = (
             [c for _, c in scored]
@@ -219,10 +271,12 @@ class HybridRetriever:
         time_alpha_override: float | None = None,
         canonical_bonus_override: float | None = None,
         chapter: str | None = None,
+        tenant_id: str = DEFAULT_TENANT,
     ) -> list[tuple[float, Chunk]]:
         """返回 (融合得分, 切片)：0.50 向量 + 0.20 词面 + 0.20 BM25 + 0.15 元数据。
 
-        - course_id 强作用域：非空时只在该课程的切片内检索（Qdrant 走 payload filter）
+        - tenant_id 最外层强作用域：数据层硬过滤（Qdrant must / 内存子集收窄）
+        - course_id 次外层强作用域：非空时只在该课程的切片内检索
         - retrieval_mode：lecture（随堂，时间衰减提权近讲）/ review（备考，纯语义跨月，
           canonical 仍生效）/ explore（拓展解法：解除 canonical 与章节聚合，纯语义）
         - 权重系数来自 runtime_config 的 retrieval 预设档位（strict/balanced/explore）
@@ -233,8 +287,12 @@ class HybridRetriever:
 
         weights = cfg_effective("retrieval")
         qvec = await embedder.embed(query)
-        qtokens = embedder._tokenize(query)
-        bm25_raw = self._bm25.scores(qtokens)
+        qtokens = embedder.bm25_tokenize(query)
+        # 租户过滤必须在**召回**与**打分**两端同时生效，缺任一端都可能越权：
+        # 只过滤召回，则 BM25 打分仍会看到跨租户文档的 tf/idf 统计；
+        # 只过滤打分，则跨租户文档已进候选池，后续任何分支漏判即泄漏。
+        scoped_tenant = tenant_id if _tenant_filter_active(tenant_id) else None
+        bm25_raw = self._bm25.scores(qtokens, tenant_id=scoped_tenant)
         bm25_max = max(bm25_raw.values(), default=0.0)
         # 模式映射：canonical 权重与时间衰减分离——
         #   时间衰减回答"现在在讲什么"（仅随堂），canonical 回答"这道题该用哪个方法"
@@ -256,12 +314,17 @@ class HybridRetriever:
         lam = 0.05
         today = date.today()
 
-        # 候选池：一律经由 store.search（Qdrant 带 payload filter / 内存库等价余弦），
-        # 多副本部署时检索结果由共享向量库决定，不再依赖进程内字典。
+        # 每路召回深度：过召回 4 倍，给融合与精排留余量
+        recall_depth = max(top_k * 4, 1)
+
+        # ---- Dense 路：向量近邻 ----
+        # 候选池经 store.search（Qdrant 带 tenant_id + course_id payload filter /
+        # 内存库等价余弦），多副本部署时结果由共享向量库决定，不依赖进程内字典。
         # 远端命中的切片若不在本进程缓存，用 payload 重建元数据。
         try:
             hits = await self._store.search(
-                qvec, top_k=top_k * 4, course_id=course_id or None
+                qvec, top_k=recall_depth, course_id=course_id or None,
+                tenant_id=tenant_id,
             )
         except Exception as exc:
             _logger.warning("store.search 失败，回退进程内候选池: %s", exc)
@@ -270,6 +333,11 @@ class HybridRetriever:
                 for cid in self._vectors
                 if not course_id or self._chunks[cid].course_id == course_id
             ]
+            if scoped_tenant:
+                hits = [
+                    (pid, sim, pl) for pid, sim, pl in hits
+                    if str((pl or {}).get("tenant_id") or DEFAULT_TENANT) == scoped_tenant
+                ]
 
         candidate_map: dict[str, tuple[float, Chunk]] = {}
         for pid, sim, payload in hits:
@@ -283,6 +351,36 @@ class HybridRetriever:
                     continue  # payload 缺关键字段（脏数据）跳过
                 self._chunks[pid] = chunk
             candidate_map[pid] = (float(sim), chunk)
+
+        # ---- Sparse 路：BM25 关键词召回（本轮核心修复）----
+        # 此前 BM25 只作为"候选池内部的重排序信号"参与，从未贡献召回：
+        # 加权公式里的 `bm25_raw.get(cid)` 只对**已在池中**的 cid 有值，
+        # 于是向量检索漏掉的关键切片永远拿不到分，也永远进不了结果。
+        # 结果就是 Dense 单独决定召回上限，长尾自然语言场景下 MRR 被锁死。
+        dense_ids = set(candidate_map)
+        sparse_added = 0
+        for cid, _bm in sorted(bm25_raw.items(), key=lambda kv: kv[1], reverse=True)[:recall_depth]:
+            if cid in dense_ids:
+                continue
+            chunk = self._chunks.get(cid)
+            if chunk is None:
+                continue  # 倒排索引指向的切片不在本进程缓存（脏索引），跳过
+            # Sparse 路必须遵守与 Dense 路**完全相同**的作用域，
+            # 否则它会成为绕过租户/课程隔离的后门。
+            if course_id and chunk.course_id != course_id:
+                continue
+            if scoped_tenant and chunk.tenant_id != scoped_tenant:
+                continue
+            # 向量分补算：本进程有向量则算真余弦；没有则记 0，该切片
+            # 仍可凭 BM25 与词面信号参与竞争，只是没有语义分加持。
+            vec = self._vectors.get(cid)
+            candidate_map[cid] = (float(embedder.cosine(qvec, vec)) if vec else 0.0, chunk)
+            sparse_added += 1
+        if sparse_added:
+            _logger.debug(
+                "双路召回：Dense %d 条 + Sparse 新增 %d 条 = %d 条候选",
+                len(dense_ids), sparse_added, len(candidate_map),
+            )
 
         # 版本去重：被显式 supersedes 的旧解法不参与竞争，避免 LLM"串戏"
         candidates = self._filter_superseded([c for _, c in candidate_map.values()])
@@ -357,6 +455,7 @@ class HybridRetriever:
         """入库流水线回写入口：Embedding 写入向量库后，同步增量更新内存 BM25 倒排索引。
 
         向量与倒排各自持有锁；先索引后可见，避免并发读写冲突。返回新增数量。
+        租户归属由调用方（ingest）在 `_tag_scope` 阶段服务端注入，此处只做落库。
         """
         await self._ensure_seeded()
         added = 0
@@ -369,13 +468,26 @@ class HybridRetriever:
             self._chunks[chunk.id] = chunk
             self._vectors[chunk.id] = vec
             await self._store.upsert(chunk.id, vec, chunk.to_payload())
-            self._bm25.add(chunk.id, embedder._tokenize(f"{chunk.exam_point} {chunk.text}"))
+            self._bm25.add(
+                chunk.id,
+                embedder.bm25_tokenize(f"{chunk.exam_point} {chunk.text}"),
+                chunk.tenant_id,
+            )
             added += 1
         return added
 
-    async def all_chunks(self) -> list[Chunk]:
+    async def all_chunks(self, tenant_id: str | None = None) -> list[Chunk]:
+        """全量切片视图（packer 骨架 / 管理后台统计用）。
+
+        `tenant_id` 非空且多租户模式开启时只返回该租户的切片——
+        骨架用于邻近扩展，若跨租户返回，扩展出来的"邻居"会把别的
+        机构内容拼进本题上下文（比检索泄漏更隐蔽）。
+        """
         await self._ensure_seeded()
-        return list(self._chunks.values())
+        chunks = list(self._chunks.values())
+        if _tenant_filter_active(tenant_id):
+            chunks = [c for c in chunks if c.tenant_id == tenant_id]
+        return chunks
 
     async def set_canonical(self, chunk_id: str, canonical: bool) -> Chunk | None:
         """老师定版操作：将切片设为/取消考点标准解法。
@@ -397,6 +509,9 @@ class HybridRetriever:
                     and other.is_canonical
                     and other.exam_point == target.exam_point
                     and other.course_id == target.course_id
+                    # 租户必须同域：否则"设为定版"会把别的机构同考点的定版降级，
+                    # 这是跨租户**写**越权——比读越权更严重（静默破坏他人数据）
+                    and other.tenant_id == target.tenant_id
                 ):
                     other.is_canonical = False
                     deposed = other

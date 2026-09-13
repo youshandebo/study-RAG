@@ -294,7 +294,12 @@ async def admin_list_chunks(
     course_id: str = "",
     exam_point: str = "",
 ):
-    """切片清单（供老师定版管理）：可按课程/考点过滤。"""
+    """切片清单（供老师定版管理）：可按课程/考点过滤。
+
+    平台管理员视角，**有意**不做租户收窄（运营需要跨机构总览）；
+    但每条都带 `tenant_id`，避免运营误把他人机构的切片设为定版。
+    业务侧（chat / evidence / exam）一律走租户隔离，不走本端点。
+    """
     from app.services.rag.retriever import get_retriever
 
     retriever = await get_retriever()
@@ -307,6 +312,7 @@ async def admin_list_chunks(
             continue
         out.append({
             "id": c.id,
+            "tenant_id": c.tenant_id,
             "exam_point": c.exam_point,
             "course_id": c.course_id,
             "chapter": c.chapter,
@@ -341,6 +347,10 @@ class TierBody(BaseModel):
     tier: str
 
 
+class TenantBody(BaseModel):
+    tenant_id: str = ""   # 空串 = 取消租户归属（回落默认租户）
+
+
 @router.get("/admin/users")
 async def admin_list_users(_: str = Depends(require_admin)):
     return await repo.list_users()
@@ -365,6 +375,34 @@ async def admin_set_user_tier(user_id: str, body: TierBody, _: str = Depends(req
     if not ok:
         raise HTTPException(status_code=404, detail="用户不存在")
     return {"ok": True, "tier": body.tier}
+
+
+@router.post("/admin/users/{user_id}/tenant")
+async def admin_set_user_tenant(
+    user_id: str, body: TenantBody, _: str = Depends(require_admin)
+):
+    """分配/变更用户的租户归属。
+
+    这是**唯一**能为用户指定租户的入口。业务端点（chat / ingest / exam /
+    evidence）一律从服务端解析租户，客户端无法通过任何请求参数影响它——
+    因此越权路径被收敛到了这一个受管理员鉴权保护的写操作上。
+
+    租户 id 变更后，该用户能访问的知识库边界随之切换；已有切片的租户
+    归属不会自动迁移（否则等于跨租户搬运数据），需用
+    `scripts/migrate_tenants.py` 显式执行。
+    """
+    from app.core.tenancy import DEFAULT_TENANT, is_valid_tenant
+
+    tenant = (body.tenant_id or "").strip()
+    if tenant and not is_valid_tenant(tenant):
+        raise HTTPException(
+            status_code=400,
+            detail="租户 id 仅允许字母、数字、下划线与短横线，长度 1~64",
+        )
+    ok = await repo.set_user_tenant(user_id, tenant or None)
+    if not ok:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return {"ok": True, "tenant_id": tenant or DEFAULT_TENANT}
 
 
 # -------------------------------------------------------------------- stats --

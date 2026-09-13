@@ -25,6 +25,7 @@ from app.api.v1.auth import AuthUser, current_user_optional
 from app.core.billing import account_key, get_ledger
 from app.core.membership import plan_for
 from app.core.security import SlidingWindowLimiter
+from app.core.tenancy import DEFAULT_TENANT, resolve_tenant
 from app.services.llm.provider import get_tier_provider
 from app.models.domain import (
     ChatRequest,
@@ -100,6 +101,7 @@ async def _retrieve_evidence(
     time_alpha_override: float | None = None,
     canonical_bonus_override: float | None = None,
     chapter: str | None = None,
+    tenant_id: str = DEFAULT_TENANT,
 ) -> tuple[list[EvidenceRef], list]:
     retriever = await get_retriever()
     chunks = await retriever.retrieve(
@@ -108,6 +110,7 @@ async def _retrieve_evidence(
         time_alpha_override=time_alpha_override,
         canonical_bonus_override=canonical_bonus_override,
         chapter=chapter or None,
+        tenant_id=tenant_id,
     )
     refs = [
         EvidenceRef(
@@ -128,13 +131,17 @@ GENERAL_RELEVANCE_FLOOR = 0.42
 
 
 def _is_relevant(query: str, chunk) -> bool:
-    """轻量二次判定：查询词与切片文本存在实词交叠即视为相关。"""
+    """轻量二次判定：查询词与切片文本存在实词交叠即视为相关。
+
+    用 bigram 口径（与 BM25 一致）——`_tokenize` 对中文会切出整句单 token，
+    交集恒为空，等于该判定永远返回 False。
+    """
     import app.services.rag.embedder as emb
 
-    qtokens = {t for t in emb._tokenize(query) if len(t) >= 2}
+    qtokens = {t for t in emb.bm25_tokenize(query) if len(t) >= 2}
     if not qtokens:
         return False
-    hay = set(emb._tokenize(chunk.text)) | set(emb._tokenize(chunk.exam_point or ""))
+    hay = set(emb.bm25_tokenize(chunk.text)) | set(emb.bm25_tokenize(chunk.exam_point or ""))
     return bool(qtokens & hay)
 
 
@@ -163,7 +170,8 @@ async def _history_messages(session_id: str, max_turns: int = 6) -> list[dict]:
 
 
 async def _pack_for_prompt(
-    chunks: list[Chunk], system_prompt: str, query: str, history: list[dict]
+    chunks: list[Chunk], system_prompt: str, query: str, history: list[dict],
+    tenant_id: str = DEFAULT_TENANT,
 ) -> list[Chunk]:
     """按模型上下文预算装箱切片；失败时原样返回（装箱是优化，不该拖垮主链路）。"""
     if not chunks:
@@ -171,7 +179,9 @@ async def _pack_for_prompt(
     try:
         limit = _context_limit()
         budget = packer.compute_budget(limit, system_prompt, query, history)
-        skeleton = {c.id: c for c in await (await get_retriever()).all_chunks()}
+        # 骨架用于邻近切片扩展：必须限本租户，否则扩展出的"邻居"
+        # 会把别的机构内容拼进本题上下文（比检索泄漏更隐蔽）
+        skeleton = {c.id: c for c in await (await get_retriever()).all_chunks(tenant_id=tenant_id)}
         result = packer.pack_context(
             [(1.0 - i * 1e-6, c) for i, c in enumerate(chunks)],  # 保留检索顺序作为优先级
             budget,
@@ -276,8 +286,10 @@ async def chat_stream(req: ChatRequest, request: Request, user: AuthUser = Depen
 
     # 档位模型：plan.model 非空时用主通道凭证换档位模型名（服务端注入，客户端不可选）
     tier_model = str(plan_for(user.tier).get("model") or "")
+    # 租户：由服务端从签名 JWT + 用户记录解析，客户端不可指定（见 core/tenancy.py）
+    tenant = resolve_tenant(user)
     return StreamingResponse(
-        _stream(req, tier_model, request, hold=hold),
+        _stream(req, tier_model, request, hold=hold, tenant=tenant),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache"},
     )
@@ -288,6 +300,7 @@ async def _stream(
     tier_model: str = "",
     request: Request | None = None,
     hold=None,
+    tenant: str = DEFAULT_TENANT,
 ):
     """结算外壳：把生成体包进 try/finally，保证**任何**退出路径都落终态。
 
@@ -302,7 +315,7 @@ async def _stream(
     """
     produced = 0
     try:
-        async for event in _stream_body(req, tier_model, request, hold=hold):
+        async for event in _stream_body(req, tier_model, request, hold=hold, tenant=tenant):
             # 从 delta 事件里累计产出字符数，作为结算依据
             if event.startswith("event: delta"):
                 try:
@@ -331,6 +344,7 @@ async def _stream_body(
     tier_model: str = "",
     request: Request | None = None,
     hold=None,
+    tenant: str = DEFAULT_TENANT,
 ):
     """流式生成。request 用于连接存活检测——客户端关页面/点停止后必须中断生成，
     否则 LLM 会在后台跑完全文，白烧 token 且占住连接（Ghost Generation）。
@@ -384,12 +398,13 @@ async def _stream_body(
             time_alpha_override=req.time_alpha_override,
             canonical_bonus_override=req.canonical_bonus_override,
             chapter=req.chapter,
+            tenant_id=tenant,
         )
         yield _sse("evidence", {"list": [r.model_dump(mode="json") for r in refs]})
 
         # Token 预算装箱：按可用窗口贪心选片，并在预算允许时补前后邻近切片，
         # 替代原先"取前 N 条直接拼"——避免长切片顶爆窗口、短句浪费空间。
-        chunks = await _pack_for_prompt(chunks, SOLVE_SYSTEM, query, history)
+        chunks = await _pack_for_prompt(chunks, SOLVE_SYSTEM, query, history, tenant_id=tenant)
         context = packer.serialize(chunks)
         u_sys, u_ret = SOLVE_SYSTEM, context
         provider = get_tier_provider(tier_model)
@@ -433,6 +448,7 @@ async def _stream_body(
             query, top_k=3, course_id=req.course_id, retrieval_mode=req.retrieval_mode,
             time_alpha_override=req.time_alpha_override,
             canonical_bonus_override=req.canonical_bonus_override, chapter=req.chapter,
+            tenant_id=tenant,
         )
         socratic_ctx = "\n---\n".join(
             f"[{_c.board_caption or _c.exam_point}] {_c.text[:200]}" for _c in _chunks[:3]
@@ -454,6 +470,7 @@ async def _stream_body(
             query, top_k=3, course_id=req.course_id, retrieval_mode=req.retrieval_mode,
             time_alpha_override=req.time_alpha_override,
             canonical_bonus_override=req.canonical_bonus_override, chapter=req.chapter,
+            tenant_id=tenant,
         )
         _pitfalls = extract_from_chunks(_chunks)
         _exam_point = _chunks[0].exam_point if _chunks else ""
@@ -480,6 +497,7 @@ async def _stream_body(
             time_alpha_override=req.time_alpha_override,
             canonical_bonus_override=req.canonical_bonus_override,
             chapter=req.chapter,
+            tenant_id=tenant,
         )
         # 过滤在 chunk 集合上做；refs 与 chunks 按 audio_snippet_url 中的 chunk_id
         # 一一对应，避免"取前 N 个"导致前端证据与上下文错位
@@ -499,7 +517,7 @@ async def _stream_body(
         if relevant:
             # 同上：general 是长文档问答最容易被顶爆窗口的路径。
             # 该分支没有独立 system prompt（通识问答直出），预算给空串即可。
-            relevant = await _pack_for_prompt(relevant, "", req.text or "", history)
+            relevant = await _pack_for_prompt(relevant, "", req.text or "", history, tenant_id=tenant)
             ret_ctx = packer.serialize(relevant)
             u_ret = ret_ctx
             user_content = (
@@ -666,7 +684,9 @@ async def socratic_reply(
     context = ""
     if topic:
         try:
-            _refs, _chunks = await _retrieve_evidence(topic, top_k=3)
+            _refs, _chunks = await _retrieve_evidence(
+                topic, top_k=3, tenant_id=resolve_tenant(user)
+            )
             context = "\n---\n".join(
                 f"[{_c.board_caption or _c.exam_point}] {_c.text[:200]}" for _c in _chunks[:3]
             )

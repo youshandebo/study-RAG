@@ -36,6 +36,9 @@ services:
       - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
       - ALLOW_PRIVATE_LLM_HOSTS=${ALLOW_PRIVATE_LLM_HOSTS:-}
+      # 多租户隔离：默认关闭（单租户 public）。开启前先跑
+      # `python scripts/migrate_tenants.py` 给存量切片打标，否则旧数据不可见。
+      - MULTI_TENANT_MODE=${MULTI_TENANT_MODE:-}
       # 小服务器友好：单 worker + 限并发（超并发排队而非 OOM）
       - UVICORN_WORKERS=${UVICORN_WORKERS:-1}
       - UVICORN_LIMIT_CONCURRENCY=${UVICORN_LIMIT_CONCURRENCY:-24}

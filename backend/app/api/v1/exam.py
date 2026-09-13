@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import base64
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 import app.db.relational as repo
+from app.api.v1.auth import AuthUser, current_user_optional
+from app.core.tenancy import resolve_tenant
 from app.services.agent.process_diff import diff_process, socratic_followup
 from app.services.agent.quiz_generator import QuizGenerator, grade_objective
 from app.services.extractor.difficulty import score
@@ -29,6 +31,7 @@ MAX_QUESTIONS = 12  # 单卷批改上限（演示规模，防止 LLM 费用失�
 
 @router.post("/exam/grade")
 async def grade_exam(
+    user: AuthUser = Depends(current_user_optional),
     session_id: str = Form(...),
     course_id: str = Form(""),
     file: UploadFile | None = File(None),
@@ -36,6 +39,13 @@ async def grade_exam(
     subject: str = Form("数学"),
 ):
     """上传复习卷（图片走 OCR / 文本直传），返回批改报告 + 同考点变式新卷。"""
+    # 会话归属校验：与 chat/ingest 一致，防止跨用户提交到他人会话
+    if not user.anonymous:
+        owner = await repo.get_session_owner(session_id)
+        if owner and owner != user.id:
+            raise HTTPException(status_code=403, detail="无权向该会话提交试卷")
+    tenant = resolve_tenant(user)
+
     raw = await file.read() if file is not None else b""
     ocr_text = (text_content or "").strip()
     if not ocr_text and raw:
@@ -63,12 +73,15 @@ async def grade_exam(
 
     for q in questions:
         # 考点匹配（向量检索，通用化，不再依赖关键词表）
-        point = await match_from_text(q.question_text, course_id=course_id or None)
+        point = await match_from_text(
+            q.question_text, course_id=course_id or None, tenant_id=tenant
+        )
         q.exam_point = point.name
         # 定版解法参照（review 模式：时间平权、canonical 保留）
         canonical_hits = await retriever.retrieve(
             q.question_text, top_k=2, course_id=course_id or None,
             retrieval_mode="review", with_context_window=False,
+            tenant_id=tenant,
         )
         canonical = [c for c in canonical_hits if c.exam_point == point.name] or canonical_hits[:1]
         q.canonical_chunk_ids = [c.id for c in canonical]

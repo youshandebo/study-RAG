@@ -1,13 +1,19 @@
 # Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
-"""音画证据切片调取与回放数据接口。"""
+"""音画证据切片调取与回放数据接口。
+
+安全：证据链是**原始课堂录音/板书**，越权读取的后果比读到摘要更严重
+（可直接收听他人课堂）。所有端点按租户收窄，租户由服务端解析。
+"""
 from __future__ import annotations
 
 import hashlib
 import pathlib
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from app.api.v1.auth import AuthUser, current_user_optional
+from app.core.tenancy import resolve_tenant
 from app.db.minio_client import AUDIO_DIR
 from app.services.rag.retriever import get_retriever
 
@@ -15,10 +21,12 @@ router = APIRouter()
 
 
 @router.get("/evidence/audio/{chunk_id}")
-async def evidence_audio(chunk_id: str):
+async def evidence_audio(
+    chunk_id: str, user: AuthUser = Depends(current_user_optional)
+):
     """返回某条课堂切片的证据包：原声定位参数 + 板书元数据。"""
     retriever = await get_retriever()
-    for chunk in await retriever.all_chunks():
+    for chunk in await retriever.all_chunks(tenant_id=resolve_tenant(user)):
         if chunk.id == chunk_id:
             return JSONResponse(
                 {
@@ -37,9 +45,9 @@ async def evidence_audio(chunk_id: str):
 
 
 @router.get("/evidence/list")
-async def evidence_list():
+async def evidence_list(user: AuthUser = Depends(current_user_optional)):
     retriever = await get_retriever()
-    chunks = await retriever.all_chunks()
+    chunks = await retriever.all_chunks(tenant_id=resolve_tenant(user))
     return [
         {
             "chunk_id": c.id,
@@ -80,7 +88,12 @@ def _resolve_audio_source(assets: list[dict] | None, audio_id: str) -> pathlib.P
 
 
 @router.get("/evidence/audio/{chunk_id}/slice")
-async def evidence_audio_slice(chunk_id: str, start_ms: int = 0, end_ms: int = 0):
+async def evidence_audio_slice(
+    chunk_id: str,
+    start_ms: int = 0,
+    end_ms: int = 0,
+    user: AuthUser = Depends(current_user_optional),
+):
     """毫秒级按需切片：ffmpeg -ss/-to -c copy 无损快速切分，StreamingResponse 流式返回短片段。
 
     - src 参数必须是 /static/audio/ 下的本地文件 URL（MinIO 部署请走对象存储直链）
@@ -95,10 +108,10 @@ async def evidence_audio_slice(chunk_id: str, start_ms: int = 0, end_ms: int = 0
     if not compressor.ffmpeg_available():
         raise HTTPException(status_code=503, detail="服务器未安装 ffmpeg，无法按需切片；请安装后重试")
 
-    # 定位该切片所属的真实音频文件
+    # 定位该切片所属的真实音频文件（限本租户，否则可借 chunk_id 探测/收听他人课堂）
     retriever = await get_retriever()
     audio_id = ""
-    for chunk in await retriever.all_chunks():
+    for chunk in await retriever.all_chunks(tenant_id=resolve_tenant(user)):
         if chunk.id == chunk_id:
             audio_id = chunk.audio_id
             break

@@ -43,6 +43,52 @@ def _tokenize(text: str) -> list[str]:
     return [g for g in grams if g]
 
 
+def bm25_tokenize(text: str) -> list[str]:
+    """BM25 专用分词：中文按字符 bigram，英文/数字按整词。
+
+    为什么不能复用 `_tokenize`
+    -------------------------
+    `str.isalnum()` 对汉字返回 True，于是 `_tokenize` 会把
+    "梯度下降的学习率衰减策略" 切成**一整个 token**，它与查询 "学习率衰减"
+    永不相等——BM25 在中文场景下等于从未匹配过，"关键词通道"只是装饰。
+
+    这也是"混合检索"名存实亡的根因：既然倒排索引对中文不产生任何有效
+    posting，那么无论权重怎么调，BM25 贡献恒为 0，Dense 单独决定召回上限。
+
+    bigram 是零依赖的中文检索标准做法：
+        "学习率衰减" → 学习 / 习率 / 率衰 / 衰减
+    文档只要含相同片段即可命中，不需要词典、不需要新依赖，
+    且对未登录词（新术语、人名、公式名）天然友好。
+
+    英文保持整词（bigram 会把 "gradient" 切碎，反而降低区分度）。
+    """
+    tokens: list[str] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch.isascii() and (ch.isalnum() or ch == "_"):
+            j = i
+            while j < n and text[j].isascii() and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            tokens.append(text[i:j].lower())
+            i = j
+            continue
+        if ch.isalnum() and not ch.isascii():
+            j = i
+            while j < n and text[j].isalnum() and not text[j].isascii():
+                j += 1
+            seg = text[i:j]
+            if len(seg) == 1:
+                tokens.append(seg)
+            else:
+                tokens.extend(seg[k : k + 2] for k in range(len(seg) - 1))
+            i = j
+            continue
+        i += 1
+    return tokens
+
+
 async def embed(text: str) -> list[float]:
     cfg = runtime_config.effective("embedding")
     if cfg["api_key"] and cfg["base_url"] and cfg["model"]:

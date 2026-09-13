@@ -21,6 +21,9 @@ class Chunk:
     end: str
     text: str
     board_index: int | None = None
+    # 租户作用域：知识库的**最外层**隔离边界，必须先于 course_id 生效。
+    # 服务端权威注入（见 core/tenancy.py），客户端不可指定。
+    tenant_id: str = "public"
     # 课程作用域元数据：检索强隔离 + 时序衰减的物理时间基准
     subject: str = "未分类"       # 学科：数学 / 物理 / …
     course_id: str = "default"    # 课程唯一标识，检索强制同作用域
@@ -40,6 +43,7 @@ class Chunk:
             "is_canonical": self.is_canonical,
             "method_version": self.method_version,
             "supersedes": self.supersedes,
+            "tenant_id": self.tenant_id,
             "subject": self.subject,
             "course_id": self.course_id,
             "chapter": self.chapter,

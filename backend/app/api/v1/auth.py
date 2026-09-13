@@ -38,17 +38,25 @@ class LoginBody(BaseModel):
 
 
 class AuthUser:
-    """请求级用户上下文；anonymous=True 表示开放演示模式。"""
+    """请求级用户上下文；anonymous=True 表示开放演示模式。
+
+    `tenant_id` 是知识库的最外层隔离边界，**只从服务端签发的 JWT 与用户记录
+    解析**——绝不读取请求体/查询参数/请求头里的租户字段（那些都可被伪造）。
+    """
 
     def __init__(self, user_id: str | None, email: str | None, tier: str | None,
-                 anonymous: bool = False, is_admin: bool = False) -> None:
+                 anonymous: bool = False, is_admin: bool = False,
+                 tenant_id: str | None = None) -> None:
         self.id = user_id
         self.email = email
         self.tier = tier or ("guest" if anonymous else "free")
         self.anonymous = anonymous
         self.is_admin = is_admin
+        self.tenant_id = tenant_id
 
     def to_public(self) -> dict:
+        from app.core.tenancy import resolve_tenant
+
         return {
             "anonymous": self.anonymous,
             "id": self.id,
@@ -56,6 +64,8 @@ class AuthUser:
             "tier": self.tier,
             "is_admin": self.is_admin,
             "plan": plan_for(self.tier),
+            # 前端据此显隐"当前机构"，但真正的隔离在服务端做，前端只做展示
+            "tenant_id": resolve_tenant(self),
         }
 
 
@@ -80,7 +90,13 @@ async def _resolve_user(payload: dict | None) -> AuthUser | None:
     user = await repo.get_user_by_id(str(payload.get("sub", "")))
     if user is None:
         return None
-    return AuthUser(user["id"], user["email"], user.get("tier"), is_admin=_is_admin_email(user.get("email")))
+    return AuthUser(
+        user["id"], user["email"], user.get("tier"),
+        is_admin=_is_admin_email(user.get("email")),
+        # 租户以**数据库记录**为准，而非 token 里的值——token 可能签发自
+        # 迁移之前，且 DB 是唯一可被运营即时变更的权威源
+        tenant_id=user.get("tenant_id"),
+    )
 
 
 async def current_user_optional(

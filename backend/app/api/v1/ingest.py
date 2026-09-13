@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 import app.db.relational as repo
 from app.api.v1.auth import AuthUser, current_user_optional
 from app.core.membership import plan_for, storage_limit_bytes
+from app.core.tenancy import resolve_tenant
 from app.db.minio_client import put_object
 from app.services.asr.hotwords import correct
 from app.services.asr.transcriber import Transcriber
@@ -180,13 +181,19 @@ async def ingest(
             archive_raw = raw
 
     def _tag_scope(chunk_list: list[Chunk]) -> None:
-        """为切片补齐课程作用域元数据（检索强隔离与时间衰减的数据基础）。
+        """为切片补齐作用域元数据（租户隔离 + 课程隔离 + 时间衰减的数据基础）。
+
+        **租户由服务端权威注入**（`resolve_tenant(user)`，来源为签名 JWT + 用户
+        记录），绝不接受任何客户端参数——否则租户 A 只要在表单里填 B 的
+        tenant/course 就能把资料写进 B 的知识库。
 
         未提供授课日期时**不补今天**：衰减项要求 lecture_date 非空才生效，
         若填今天则 dt=0、衰减系数取最大值，无时间戳的资料反而被当成"最新"
         获得提权，信号完全反向。留空即不参与衰减（中性）。
         """
+        tenant = resolve_tenant(user)
         for c in chunk_list:
+            c.tenant_id = tenant
             c.subject = subject
             c.course_id = course_id or "default"
             c.chapter = chapter

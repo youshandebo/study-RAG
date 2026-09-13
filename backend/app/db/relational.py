@@ -27,6 +27,14 @@ _memory_messages: dict[str, list[dict[str, Any]]] = {}
 _memory_assets: dict[str, list[dict[str, Any]]] = {}
 _memory_users: dict[str, dict[str, Any]] = {}
 
+# 增量列迁移表：(表, 列, DDL 类型)。
+# create_all 只建**缺失的表**，对已存在的表**不会加列**——存量部署升级后
+# 直接用新字段会报 "no such column"。这里做幂等的 ALTER TABLE 补列，
+# SQLite 与 Postgres 语法一致。
+_SCHEMA_PATCHES: tuple[tuple[str, str, str], ...] = (
+    ("users", "tenant_id", "VARCHAR(64)"),
+)
+
 
 def _use_postgres() -> bool:
     """配置了 POSTGRES_DSN 且驱动可用时返回 True（本函数只建引擎，不建连）。"""
@@ -84,6 +92,30 @@ def _db_ready() -> bool:
         return False
 
 
+async def _apply_schema_patches() -> None:
+    """幂等补列：让存量库平滑获得新增字段。
+
+    先探测列是否存在（SQLAlchemy inspector 对 SQLite/Postgres 通用），
+    只在缺失时 ALTER——不用"捕获异常当成功"，否则权限/连接类真实错误
+    会被静默吞掉，等到查询时才以更难懂的方式爆出来。
+    """
+    from sqlalchemy import inspect as sa_inspect, text
+
+    assert _engine is not None
+    async with _engine.begin() as conn:
+        for table, column, ddl_type in _SCHEMA_PATCHES:
+            def _missing(sync_conn, _t: str = table, _c: str = column) -> bool:
+                try:
+                    cols = {c["name"] for c in sa_inspect(sync_conn).get_columns(_t)}
+                except Exception:
+                    return False  # 表还不存在（create_all 已建，理论不会走到）
+                return bool(cols) and _c not in cols
+
+            if await conn.run_sync(_missing):
+                await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
+                _logger.info("表结构补列: %s.%s %s", table, column, ddl_type)
+
+
 async def _ensure_tables() -> bool:
     """首次真正执行 SQL 前建表（幂等）；驱动缺失/连接失败熔断降级。"""
     global _tables_ready, _pg_broken
@@ -95,6 +127,7 @@ async def _ensure_tables() -> bool:
         assert _engine is not None
         async with _engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+        await _apply_schema_patches()
         _tables_ready = True
         _logger.info("Postgres 表结构就绪")
         return True
@@ -320,13 +353,16 @@ async def list_all_assets() -> list[dict[str, Any]]:
 
 
 # ------------------------------------------------------------------ users --
-async def create_user(email: str, password_hash: str, tier: str = "free") -> dict[str, Any]:
+async def create_user(
+    email: str, password_hash: str, tier: str = "free", tenant_id: str | None = None
+) -> dict[str, Any]:
     user = {
         "id": uuid.uuid4().hex[:12],
         "email": email.lower(),
         "password_hash": password_hash,
         "tier": tier,
         "created_at": int(time.time() * 1000),
+        "tenant_id": tenant_id or None,
     }
     if _db_ready() and await _ensure_tables():
         from app.db.pg_models import UserRow
@@ -350,7 +386,8 @@ async def get_user_by_email(email: str) -> dict[str, Any] | None:
         if row is None:
             return None
         return {"id": row.id, "email": row.email, "password_hash": row.password_hash,
-                "tier": row.tier, "created_at": row.created_at}
+                "tier": row.tier, "created_at": row.created_at,
+                "tenant_id": getattr(row, "tenant_id", None)}
     for u in _memory_users.values():
         if u["email"] == email.lower():
             return u
@@ -367,7 +404,9 @@ async def get_user_by_id(user_id: str) -> dict[str, Any] | None:
             row = await s.get(UserRow, user_id)  # AsyncSession.get 为协程，漏 await 会把协程当行对象用
         if row is None:
             return None
-        return {"id": row.id, "email": row.email, "tier": row.tier, "created_at": row.created_at}
+        return {"id": row.id, "email": row.email, "tier": row.tier,
+                "created_at": row.created_at,
+                "tenant_id": getattr(row, "tenant_id", None)}
     u = _memory_users.get(user_id)
     return {k: v for k, v in u.items() if k != "password_hash"} if u else None
 
@@ -392,7 +431,11 @@ async def list_users() -> list[dict[str, Any]]:
 
         async with await _pg_session() as s:
             rows = (await s.execute(select(UserRow).order_by(UserRow.created_at.desc()))).scalars().all()
-        return [{"id": r.id, "email": r.email, "tier": r.tier, "created_at": r.created_at} for r in rows]
+        return [
+            {"id": r.id, "email": r.email, "tier": r.tier, "created_at": r.created_at,
+             "tenant_id": getattr(r, "tenant_id", None)}
+            for r in rows
+        ]
     return [
         {k: v for k, v in u.items() if k != "password_hash"}
         for u in sorted(_memory_users.values(), key=lambda x: x["created_at"], reverse=True)
@@ -411,6 +454,29 @@ async def set_user_tier(user_id: str, tier: str) -> bool:
         return bool(result.rowcount)
     if user_id in _memory_users:
         _memory_users[user_id]["tier"] = tier
+        return True
+    return False
+
+
+async def set_user_tenant(user_id: str, tenant_id: str | None) -> bool:
+    """分配/变更用户的租户归属（运营后台操作）。
+
+    这是**唯一**能为用户指定租户的入口，且只在服务端（管理接口）调用——
+    用户自己无法通过任何请求参数修改自己的 tenant_id。
+    """
+    if _db_ready() and await _ensure_tables():
+        from sqlalchemy import update
+
+        from app.db.pg_models import UserRow
+
+        async with await _pg_session() as s:
+            result = await s.execute(
+                update(UserRow).where(UserRow.id == user_id).values(tenant_id=tenant_id or None)
+            )
+            await s.commit()
+        return bool(result.rowcount)
+    if user_id in _memory_users:
+        _memory_users[user_id]["tenant_id"] = tenant_id or None
         return True
     return False
 

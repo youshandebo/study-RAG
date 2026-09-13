@@ -32,6 +32,9 @@ class UserRow(Base):
     password_hash: Mapped[str] = mapped_column(String(200))
     tier: Mapped[str] = mapped_column(String(20), default="free", index=True)
     created_at: Mapped[int] = mapped_column(BigInteger, index=True)
+    # 租户归属：知识库最外层隔离边界（多租户模式下由运营后台分配）。
+    # 可空 + 默认空串 = 存量库安全：老用户没有归属时回落默认租户。
+    tenant_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
 
 
 class MessageRow(Base):
