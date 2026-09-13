@@ -10,6 +10,24 @@ import SocraticDialogueCard from './SocraticDialogueCard';
 import QuizInteractiveCard from './QuizInteractiveCard';
 import MultiModelSplitTrack from './MultiModelSplitTrack';
 import type { PolymorphicMessage } from '@/types/message';
+import { fetchEvidence } from '@/lib/api';
+import { useEvidenceStore } from '@/stores/useEvidenceStore';
+
+/** 引用角标 [N] → 证据抽屉联动：取消息携带的第 N 条证据，拉详情并打开抽屉高亮 */
+function useCitationOpener() {
+  const activateEvidence = useEvidenceStore((s) => s.activateEvidence);
+  return (message: PolymorphicMessage) => {
+    const list = message.evidenceList ?? message.solvePayload?.evidenceList;
+    if (!list?.length) return undefined;
+    return (n: number) => {
+      const ev = list[n - 1];
+      if (!ev) return;
+      void fetchEvidence(ev.audioSnippetUrl).then((bundle) => {
+        if (bundle) activateEvidence(bundle);
+      });
+    };
+  };
+}
 
 export default function MessageCardRenderer({
   message,
@@ -36,6 +54,8 @@ export default function MessageCardRenderer({
   }
 
   // 助教消息：左侧 🎓 头像 + 多态卡片本体 + 用量小字
+  const citationOpener = useCitationOpener();
+  const onCite = citationOpener(message);
   return (
     <div className="msg-enter flex items-start gap-2.5">
       <div
@@ -46,7 +66,7 @@ export default function MessageCardRenderer({
         <Bot size={15} strokeWidth={1.5} className="text-ink-soft" />
       </div>
       <div className="min-w-0 flex-1">
-        {renderAssistantCard(message, streaming)}
+        {renderAssistantCard(message, streaming, onCite)}
         <UsageFootnote usage={message.usage} />
       </div>
     </div>
@@ -82,7 +102,7 @@ function UsageFootnote({ usage }: { usage?: PolymorphicMessage['usage'] }) {
   );
 }
 
-function renderAssistantCard(message: PolymorphicMessage, streaming: boolean) {
+function renderAssistantCard(message: PolymorphicMessage, streaming: boolean, onCite?: (n: number) => void) {
   switch (message.type) {
     case 'solve_card':
       return <SolveSolutionCard message={message} streaming={streaming} />;
@@ -105,7 +125,12 @@ function renderAssistantCard(message: PolymorphicMessage, streaming: boolean) {
               </span>
             )}
           </div>
-          <Markdown text={message.content} className={streaming ? 'stream-cursor' : ''} />
+          <Markdown
+            text={message.content}
+            className={streaming ? 'stream-cursor' : ''}
+            streaming={streaming}
+            onCite={onCite}
+          />
         </div>
       );
   }

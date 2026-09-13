@@ -13,9 +13,17 @@ import {
 } from 'lucide-react';
 import ModeChangeDialog from './ModeChangeDialog';
 import { useSessionStore } from '@/stores/useSessionStore';
-import { streamChat } from '@/lib/api';
+import { ApiError, streamChat } from '@/lib/api';
 import type { PolymorphicMessage, UsageInfo } from '@/types/message';
 import ContextMeter from './ContextMeter';
+
+/** 柔性提示卡片（限流/额度）：显示在输入框下方，不打断、不弹 Toast */
+interface SoftNotice {
+  kind: 'rate' | 'quota';
+  message: string;
+  /** 限流时的倒计时秒数（来自后端 Retry-After），到 0 自动清除 */
+  countdown?: number;
+}
 
 const QUICK_CMDS = [
   { label: '拍照解题', icon: Camera, text: '', action: 'upload' as const },
@@ -69,6 +77,7 @@ export default function OmniChatInput() {
   const historyPosRef = useRef(-1);
 
   const { sessions, activeSessionId, updateSessionMeta, appendMessage, setStreamingId, streamingMessageId, registerAbort } = useSessionStore();
+  const removeMessage = useSessionStore((s) => s.removeMessage);
   const activeSession = sessions.find((x) => x.id === activeSessionId);
   const exploreMode = activeSession?.retrievalMode === 'explore';
   const scene: 'lecture' | 'review' | 'explore' = exploreMode
@@ -78,11 +87,26 @@ export default function OmniChatInput() {
   // 切到"更多解法"时强制阅读弹窗（5s + 红色确认），防误触
   const [pendingExplore, setPendingExplore] = useState(false);
   const busy = streamingMessageId !== null;
+  // 限流/额度柔性提示（429/402）：不打断对话，倒计时结束后自动消散
+  const [softNotice, setSoftNotice] = useState<SoftNotice | null>(null);
   // 当前会话每轮用量（供右下角上下文容量面板聚合展示）
   const messagesMap = useSessionStore((s) => s.messagesBySession);
   const sessionUsages = (messagesMap[activeSessionId] ?? [])
     .map((m) => m.usage)
     .filter((u): u is UsageInfo => !!u);
+
+  // 限流倒计时：每秒 -1，到 0 自动清除提示（恢复可用状态）
+  useEffect(() => {
+    if (!softNotice?.countdown) return;
+    const timer = window.setInterval(() => {
+      setSoftNotice((prev) => {
+        if (!prev?.countdown) return prev;
+        const next = prev.countdown - 1;
+        return next <= 0 ? null : { ...prev, countdown: next };
+      });
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [softNotice?.countdown]);
 
   const readImage = useCallback((file: File) => {
     const reader = new FileReader();
@@ -164,6 +188,7 @@ export default function OmniChatInput() {
       historyRef.current = [outgoing, ...historyRef.current.filter((h) => h !== outgoing)].slice(0, 30);
       historyPosRef.current = -1;
     }
+    setSoftNotice(null);   // 新一轮提问时清掉旧的限流/额度提示
     const userMsg: PolymorphicMessage = {
       id: crypto.randomUUID(),
       sessionId: activeSessionId,
@@ -175,6 +200,9 @@ export default function OmniChatInput() {
     appendMessage(userMsg);
 
     const pendingId = crypto.randomUUID();
+    // 幂等键与用户消息共用同一 UUID：同一条消息的任何重试都携带同一 request_id，
+    // 后端 billing 据此判定重复请求不重复扣费（网络重试/双击的安全网）
+    const requestId = userMsg.id;
     appendMessage({
       id: pendingId,
       sessionId: activeSessionId,
@@ -199,6 +227,7 @@ export default function OmniChatInput() {
         chapter: activeChapter,   // 顶部 Chip 指定的章节软过滤
         retrievalMode: activeSession?.retrievalMode ?? 'lecture',
         timeAlphaOverride: activeSession?.timeAlphaOverride ?? null,
+        requestId,
       },
       {
         onMeta: (meta) => useSessionStore.setState((s) => ({
@@ -211,6 +240,9 @@ export default function OmniChatInput() {
           streamingMessageId: meta.messageId,
         })),
         onDelta: (piece) => useSessionStore.getState().appendDelta(activeSessionId, pendingId, piece),
+        onEvidence: (list) =>
+          // 证据列表挂到消息顶层：普通回答的 [N] 角标据此联动证据抽屉
+          useSessionStore.getState().patchMessage(activeSessionId, pendingId, { evidenceList: list }),
         onTrackDelta: (index, _name, piece) =>
           useSessionStore.getState().appendTrackDelta(activeSessionId, pendingId, index, piece),
         onTrackDone: (index) => useSessionStore.getState().finishTrack(activeSessionId, pendingId, index),
@@ -219,6 +251,10 @@ export default function OmniChatInput() {
           // 用最终卡片替换占位（若 id 已因 meta 改名则按位置兜底）；legacyId 同步清理 IndexedDB 旧占位行
           const list = store.messagesBySession[activeSessionId] ?? [];
           const targetId = list.some((m) => m.id === card.id) ? card.id : pendingId;
+          // 保留流式期间已由 evidence 事件挂载的证据列表：卡片到达时不得抹掉
+          const keepEvidence =
+            list.find((m) => m.id === targetId || m.id === pendingId)?.evidenceList
+            ?? card.solvePayload?.evidenceList;
           store.patchMessage(
             activeSessionId,
             targetId,
@@ -231,15 +267,33 @@ export default function OmniChatInput() {
               comparePayload: card.comparePayload,
               intent: card.intent,
               usage: card.usage,
+              evidenceList: keepEvidence,
             },
             pendingId,
           );
         },
         onDone: () => setStreamingId(null),
-        onError: () => {
-          useSessionStore.getState().patchMessage(activeSessionId, pendingId, {
-            content: '⚠️ 连接助教失败，请确认后端服务已启动（默认 http://localhost:8000）。',
-          });
+        onError: (err) => {
+          const store = useSessionStore.getState();
+          if (err instanceof ApiError && (err.isRateLimit || err.isQuotaExceeded)) {
+            // 429/402：请求压根没开始，占位气泡不是对话内容——移除气泡，
+            // 改在输入框下方显示柔性提示卡片（带 Retry-After 倒计时）
+            removeMessage(activeSessionId, pendingId);
+            setSoftNotice(
+              err.isRateLimit
+                ? {
+                    kind: 'rate',
+                    message: err.message,
+                    countdown: err.retryAfter ?? 15,
+                  }
+                : { kind: 'quota', message: err.message },
+            );
+          } else {
+            // 其他失败（连接中断等）：沿用气泡内提示
+            store.patchMessage(activeSessionId, pendingId, {
+              content: '⚠️ 连接助教失败，请确认后端服务已启动（默认 http://localhost:8000）。',
+            });
+          }
           setStreamingId(null);
         },
       },
@@ -531,6 +585,45 @@ export default function OmniChatInput() {
               </button>
             )}
           </div>
+
+          {/* 柔性提示卡片：限流（429，倒计时自动消散）/ 额度不足（402，附升级指引）。
+              不打断对话、不弹全局 Toast——后端返回的中文提示与 Retry-After 直接呈现 */}
+          {softNotice && (
+            <div
+              role="status"
+              aria-live="polite"
+              className={`mt-2 flex animate-rise items-start gap-2.5 rounded-lg border px-3.5 py-2.5 ${
+                softNotice.kind === 'rate'
+                  ? 'border-amber-500/30 bg-amber-500/5'
+                  : 'border-violet-500/30 bg-violet-500/5'
+              }`}
+            >
+              <Gauge
+                size={15}
+                strokeWidth={1.5}
+                className={`mt-0.5 shrink-0 ${softNotice.kind === 'rate' ? 'text-amber-600' : 'text-violet-600'}`}
+                aria-hidden
+              />
+              <div className="min-w-0 flex-1">
+                <div className={`text-[12.5px] font-medium ${softNotice.kind === 'rate' ? 'text-amber-700' : 'text-violet-700'}`}>
+                  {softNotice.kind === 'rate' ? '提问过快，休息一下' : '额度已用完'}
+                </div>
+                <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-soft">{softNotice.message}</div>
+                {softNotice.countdown != null && softNotice.countdown > 0 && (
+                  <div className="mt-1 text-[11px] font-medium text-amber-600">
+                    <span className="font-mono tabular-nums">{softNotice.countdown}</span> 秒后可再次提问
+                  </div>
+                )}
+              </div>
+              <button
+                onClick={() => setSoftNotice(null)}
+                className="shrink-0 rounded-md p-1 text-ink-faint transition hover:bg-white/60 hover:text-ink"
+                aria-label="关闭提示"
+              >
+                ✕
+              </button>
+            </div>
+          )}
 
           {/* 底部工具栏：深度推导开关 + 快捷指令 + 字数统计 */}
           <div className="mt-2 flex flex-wrap items-center gap-1.5 border-t border-dashed border-rule/70 pt-2.5">

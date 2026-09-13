@@ -20,6 +20,38 @@ export interface StreamHandlers {
   onError?: (err: Error) => void;
 }
 
+/** 结构化 API 错误：保留后端返回的 HTTP 状态、中文 detail 与 Retry-After。
+ *
+ * 此前 `streamChat` 在 !resp.ok 时直接 `throw new Error(\`后端响应 ${status}\`)`，
+ * 后端精心构造的提示（「提问过于频繁…请 N 秒后再试」/「额度不足…」）与
+ * `Retry-After` 头被全部丢弃，前端只能显示生硬的裸状态码——这是典型的
+ * "后端信息有、前端接不住"的暗坑。
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly retryAfter?: number,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+  get isRateLimit(): boolean { return this.status === 429; }
+  get isQuotaExceeded(): boolean { return this.status === 402; }
+}
+
+/** 读取错误响应体（detail）与 Retry-After 头，构造结构化错误 */
+async function toApiError(resp: Response): Promise<ApiError> {
+  let detail = '';
+  try {
+    const data = await resp.clone().json();
+    if (typeof data?.detail === 'string') detail = data.detail;
+  } catch { /* 非 JSON 响应体 */ }
+  const retryHeader = resp.headers.get('Retry-After');
+  const retryAfter = retryHeader ? Math.max(1, Number.parseInt(retryHeader, 10) || 1) : undefined;
+  return new ApiError(detail || `后端响应 ${resp.status}`, resp.status, retryAfter);
+}
+
 /** 解析单条 SSE 帧 */
 function parseSSEChunk(chunk: string): { event: string; data: string } | null {
   const lines = chunk.split('\n');
@@ -159,12 +191,14 @@ export async function streamChat(
     text?: string;
     imageB64?: string;
     forceIntent?: Intent;
-    courseId?: string;
-    chapter?: string;
-    retrievalMode?: 'lecture' | 'review_narrow' | 'review_broad' | 'review' | 'explore';
-    timeAlphaOverride?: number | null;
-    canonicalBonusOverride?: number | null;
-  },
+  courseId?: string;
+  chapter?: string;
+  retrievalMode?: 'lecture' | 'review_narrow' | 'review_broad' | 'review' | 'explore';
+  timeAlphaOverride?: number | null;
+  canonicalBonusOverride?: number | null;
+  /** 幂等键：同一条消息的重试必须复用，缺省时自动生成（见 ApiError 注释） */
+  requestId?: string;
+},
   handlers: StreamHandlers,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -182,10 +216,13 @@ export async function streamChat(
         retrieval_mode: body.retrievalMode ?? 'lecture',
         time_alpha_override: body.timeAlphaOverride ?? null,
         canonical_bonus_override: body.canonicalBonusOverride ?? null,
+        // 幂等键：网络重试/双击重复提交时后端据此不重复扣额度（见 core/billing.py）。
+        // 每条消息生成一个 UUID 并随消息携带，重发同一条消息必须复用同一个 id。
+        request_id: body.requestId ?? crypto.randomUUID(),
       }),
       signal,
     }));
-    if (!resp.ok) throw new Error(`后端响应 ${resp.status}`);
+    if (!resp.ok) throw await toApiError(resp);
     await consumeSSE(resp, handlers);
   } catch (err) {
     if ((err as Error).name === 'AbortError') {

@@ -49,6 +49,15 @@ export default function SolveSolutionCard({
     if (bundle) activateEvidence(bundle);
   };
 
+  // 引用角标 [N] → 第 N 条证据（与下方证据链列表同一数据源，编号一致）
+  const onCite =
+    payload?.evidenceList?.length
+      ? (n: number) => {
+          const ev = payload.evidenceList[n - 1];
+          if (ev) void openEvidence(ev.audioSnippetUrl);
+        }
+      : undefined;
+
   return (
     <div className="paper-card margin-rule msg-enter px-5 py-4">
       {/* 头部徽章行 */}
@@ -65,9 +74,14 @@ export default function SolveSolutionCard({
         </div>
       )}
 
-      {/* 老师原法推导正文 */}
+      {/* 老师原法推导正文（流式期间缓冲未闭合 $$，防公式闪烁；[N] 角标联动证据抽屉） */}
       <div className="mb-1 text-[13.5px] font-semibold text-ink">老师原法推导</div>
-      <Markdown text={message.content} className={streaming ? 'stream-cursor' : ''} />
+      <Markdown
+        text={message.content}
+        className={streaming ? 'stream-cursor' : ''}
+        streaming={streaming}
+        onCite={onCite}
+      />
 
       {/* 步骤概览 */}
       {payload?.steps?.length ? (

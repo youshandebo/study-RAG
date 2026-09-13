@@ -80,6 +80,11 @@ export interface PolymorphicMessage extends BaseMessage {
 
   /** 本轮 Token 用量（完成后由 usage 事件 / 最终卡片携带） */
   usage?: UsageInfo;
+
+  /** 知识库证据列表（SSE `evidence` 事件）。
+   * solve 卡同时挂在 solvePayload.evidenceList；普通问答（general_text）
+   * 挂载在顶层——否则 `[1]` 角标在普通回答里无处可指，联动无从谈起。 */
+  evidenceList?: EvidenceRef[];
 }
 
 /** SSE 流式事件（后端 chat_stream 协议） */

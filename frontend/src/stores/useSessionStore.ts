@@ -40,6 +40,8 @@ interface SessionState {
   appendDelta: (sessionId: string, id: string, text: string) => void;
   appendTrackDelta: (sessionId: string, id: string, index: number, text: string) => void;
   finishTrack: (sessionId: string, id: string, index: number) => void;
+  /** 移除占位消息：429/402 等"请求未开始"的失败不应在对话里留气泡 */
+  removeMessage: (sessionId: string, id: string) => void;
   setStreamingId: (id: string | null) => void;
 }
 
@@ -194,6 +196,17 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           const tracks = m.comparePayload.tracks.map((t, i) => (i === index ? { ...t, status: 'done' as const } : t));
           return { ...m, comparePayload: { tracks } };
         }),
+      },
+    }));
+  },
+
+  removeMessage(sessionId, id) {
+    // 占位气泡同步清理 IndexedDB——否则刷新后空占位会复活
+    void db.messages.delete(id);
+    set((s) => ({
+      messagesBySession: {
+        ...s.messagesBySession,
+        [sessionId]: (s.messagesBySession[sessionId] ?? []).filter((m) => m.id !== id),
       },
     }));
   },
