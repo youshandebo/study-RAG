@@ -38,7 +38,8 @@ def _blank() -> dict:
         # 媒体压缩参数（数值以字符串形式存储，effective() 负责转型）
         "media": {"image_quality": "", "image_max_edge": "", "audio_bitrate": "", "audio_max_mb": ""},
         # 检索调权：预设档位 + 可选的原始系数覆盖（留空=跟随预设）
-        "retrieval": {"profile": "", "vector": "", "lexical": "", "bm25": "", "canonical_bonus": "", "time_alpha": ""},
+        # fusion：rrf（倒数排名融合，默认）| weighted（加权和）
+        "retrieval": {"profile": "", "fusion": "", "vector": "", "lexical": "", "bm25": "", "canonical_bonus": "", "time_alpha": ""},
         # 二阶段精排（远程 Rerank API）：默认关闭，走 NoopReranker 零依赖兜底
         "rerank": {
             "enabled": "",
@@ -89,6 +90,7 @@ def _normalize(raw: dict | None) -> dict:
     retrieval_src = raw.get("retrieval")
     if isinstance(retrieval_src, dict):
         cfg["retrieval"]["profile"] = str(retrieval_src.get("profile") or "").strip()
+        cfg["retrieval"]["fusion"] = str(retrieval_src.get("fusion") or "").strip()
         for key in ("vector", "lexical", "bm25", "canonical_bonus", "time_alpha"):
             val = retrieval_src.get(key)
             if val is not None and str(val).strip() != "":
@@ -154,7 +156,7 @@ def save_runtime_config(patch: dict) -> dict:
             if key not in src:
                 continue
             val = src[key]
-            if section == "retrieval" and key != "profile":
+            if section == "retrieval" and key not in ("profile", "fusion"):
                 try:
                     float(val)
                 except (TypeError, ValueError):
@@ -258,6 +260,14 @@ def effective(kind: str):
 
     if kind == "retrieval":
         # 预设档位 + 高级覆盖：未覆盖字段回落预设值
+        #
+        # fusion 决定候选池内多路信号如何合成：
+        #   rrf      —— 倒数排名融合（默认）。只看名次不看分值，天然免疫
+        #               "两路分数量纲不可比"（长查询 vs 短查询、BM25 长尾 vs
+        #               余弦密集）。夹具实测 MRR 0.90（加权和 0.80）。
+        #               融合分经语义调制后仍可作绝对阈值使用。
+        #   weighted —— 加权和。分数是绝对量纲，直接与 min_score 配套，
+        #               但需按场景人工配平权重（易受查询长度影响）。
         presets = {
             "strict":   {"vector": 0.45, "lexical": 0.15, "bm25": 0.15, "canonical_bonus": 0.5, "time_alpha": 0.30},
             "balanced": {"vector": 0.50, "lexical": 0.20, "bm25": 0.20, "canonical_bonus": 0.3, "time_alpha": 0.20},
@@ -265,7 +275,11 @@ def effective(kind: str):
         }
         section = rc.get("retrieval", {})
         profile = section.get("profile") if section.get("profile") in presets else "balanced"
-        out = {"profile": profile, **presets[profile]}
+        fusion = str(section.get("fusion") or "").strip().lower()
+        if fusion not in ("weighted", "rrf"):
+            # 默认 RRF：夹具实测 MRR 0.90（加权和 0.80），且免疫两路分值的尺度漂移
+            fusion = "rrf"
+        out = {"profile": profile, "fusion": fusion, **presets[profile]}
         for key in ("vector", "lexical", "bm25", "canonical_bonus", "time_alpha"):
             if str(section.get(key) or "").strip():
                 try:

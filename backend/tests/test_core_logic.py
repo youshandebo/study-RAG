@@ -2522,6 +2522,103 @@ class TestSchemaMigration:
             rel._engine, rel._sessionmaker, rel._tables_ready, rel._pg_broken = saved
 
 
+# --------------------------------------------- Alembic 迁移（可选路径）----
+class TestAlembicMigrations:
+    """Alembic 是**可选**路径：未安装时内置建表 + 补列仍须独立可用。
+
+    这组测试守住"迁移文件与 ORM 模型不漂移"与"配置文件在中文 Windows 上可用"。
+    """
+
+    @staticmethod
+    def _versions_dir():
+        import pathlib
+
+        return pathlib.Path(__file__).resolve().parent.parent / "migrations" / "versions"
+
+    @staticmethod
+    def _all_migration_text() -> str:
+        d = TestAlembicMigrations._versions_dir()
+        return "\n".join(p.read_text(encoding="utf-8") for p in sorted(d.glob("*.py")))
+
+    def test_alembic_ini_is_pure_ascii(self):
+        """中文 Windows 上 alembic 用 **locale 编码**（GBK）读 ini。
+
+        配置里出现任何 UTF-8 多字节字符，所有 alembic 命令都会直接
+        UnicodeDecodeError——这是实测踩到的坑，不是理论风险。
+        中文说明一律放 README 与 env.py（Python 文件显式 UTF-8）。
+        """
+        import pathlib
+
+        ini = pathlib.Path(__file__).resolve().parent.parent / "alembic.ini"
+        assert ini.exists(), "缺少 alembic.ini"
+        bad = [i for i, b in enumerate(ini.read_bytes()) if b > 127]
+        assert not bad, f"alembic.ini 第 {bad[:5]} 字节非 ASCII，中文 Windows 会崩"
+
+    def test_migration_chain_is_linear_and_has_head(self):
+        """revision 链必须线性且可解析（否则 upgrade head 无法定位终点）。"""
+        import ast
+        import pathlib
+
+        d = self._versions_dir()
+        revs: dict[str, str | None] = {}
+        for p in sorted(d.glob("*.py")):
+            tree = ast.parse(p.read_text(encoding="utf-8"))
+            got: dict[str, object] = {}
+            for node in tree.body:
+                if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                    name = getattr(node.targets[0], "id", "")
+                    if name in ("revision", "down_revision"):
+                        try:
+                            got[name] = ast.literal_eval(node.value)
+                        except ValueError:
+                            pass
+            assert "revision" in got, f"{p.name} 缺 revision"
+            revs[str(got["revision"])] = got.get("down_revision")  # type: ignore[arg-type]
+
+        assert revs, "没有任何 revision"
+        assert sum(1 for v in revs.values() if v is None) == 1, "应恰有一个基线"
+        for rev, parent in revs.items():
+            if parent is not None:
+                assert parent in revs, f"{rev} 的 down_revision {parent} 不存在于 revisions"
+        # 无环：从基线一路能走到终点
+        children = {p: r for r, p in revs.items() if p is not None}
+        assert len(children) == len(revs) - 1, "revision 链出现分叉或环"
+
+    def test_migrations_cover_all_model_columns(self):
+        """防漂移：ORM 模型的每一列都必须在迁移历史里出现过。
+
+        若给 pg_models 加了列却忘了写迁移，Alembic 路径下的库会缺列，
+        而内置路径（_SCHEMA_PATCHES）也不会补——直到运行时才炸。
+        """
+        from app.db.pg_models import Base
+
+        text = self._all_migration_text()
+        missing: list[str] = []
+        for table, t in Base.metadata.tables.items():
+            if table not in text:
+                missing.append(f"表 {table}")
+                continue
+            for col in t.columns:
+                if f'"{col.name}"' not in text:
+                    missing.append(f"{table}.{col.name}")
+
+        assert not missing, f"模型列未体现在迁移中: {missing}"
+
+    def test_tenant_column_is_in_a_migration(self):
+        """tenant_id 必须在**增量** revision 里，而不是塞进基线。
+
+        塞进基线会让存量库无法对齐（它按基线建表时不包含该列）。
+        断言匹配带引号的列定义（`"tenant_id"`），避免把文档字符串里
+        "为什么基线不含它"的说明误判成列定义。
+        """
+        d = self._versions_dir()
+        baseline = (d / "0001_baseline.py").read_text(encoding="utf-8")
+        increment = (d / "0002_users_tenant_id.py").read_text(encoding="utf-8")
+
+        assert '"tenant_id"' not in baseline, "tenant_id 作为列定义不应出现在基线里"
+        assert '"tenant_id"' in increment, "tenant_id 应作为独立增量 revision 的列定义"
+
+
 # --------------------------------------------- 顺带修复的降级缺陷 ----
 class TestRetrieverDegradation:
     """`retriever` 引用了未定义的 `_logger`——降级路径会抛 NameError。"""
@@ -2636,3 +2733,156 @@ class TestChineseTokenization:
             "梯度下降的学习率衰减策略",
         )
         assert overlap > 0, "词面通道对中文仍为零贡献，关键词通道未真正恢复"
+
+
+# --------------------------------------------- RRF 融合 ----
+class TestRRFFusion:
+    """倒数排名融合：用名次替代分值，免疫两路信号的分数量纲差异。
+
+    实测（夹具）：weighted MRR 0.80 → rrf MRR 0.90。
+    纯 RRF（不做语义调制）能到 1.00，但绝对阈值会失效——见下方专门测试。
+    """
+
+    def test_ranks_skip_non_positive_signal(self):
+        """零/负值不参与排名——给"全体为零"的信号排名等于捏造区分度。"""
+        from app.services.rag.retriever import _ranks
+
+        assert _ranks({"a": 0.0, "b": 0.0}) == {}
+        assert _ranks({"a": -0.5, "b": 0.0}) == {}
+        assert _ranks({"a": 1.0, "b": 0.0}) == {"a": 1}
+
+    def test_ranks_order_and_determinism(self):
+        from app.services.rag.retriever import _ranks
+
+        assert _ranks({"a": 0.1, "b": 0.9, "c": 0.5}) == {"b": 1, "c": 2, "a": 3}
+        # 同分按 id 排序，保证结果可复现
+        assert _ranks({"z": 0.5, "a": 0.5}) == {"a": 1, "z": 2}
+
+    def test_ranks_immune_to_magnitude_scaling(self):
+        """RRF 的核心特性：整路分值等比放大不改变名次。
+
+        这正是加权和做不到的——BM25 的分值尺度随查询长度漂移，
+        加权和需要不断手工配平，RRF 天然不受影响。
+        """
+        from app.services.rag.retriever import _ranks
+
+        base = {"a": 1.0, "b": 0.5, "c": 0.1}
+        assert _ranks(base) == _ranks({k: v * 1000 for k, v in base.items()})
+
+    def test_fusion_defaults_to_rrf(self):
+        from app.core.runtime_config import effective
+
+        assert effective("retrieval")["fusion"] == "rrf"
+
+    def test_invalid_fusion_falls_back_to_rrf(self):
+        from app.core import runtime_config as rc
+
+        try:
+            rc.save_runtime_config({"retrieval": {"fusion": "not-a-strategy"}})
+            assert rc.effective("retrieval")["fusion"] == "rrf"
+        finally:
+            rc.save_runtime_config({"retrieval": {"fusion": ""}})
+
+    def test_fusion_can_be_switched_to_weighted(self):
+        from app.core import runtime_config as rc
+
+        try:
+            rc.save_runtime_config({"retrieval": {"fusion": "weighted"}})
+            assert rc.effective("retrieval")["fusion"] == "weighted"
+        finally:
+            rc.save_runtime_config({"retrieval": {"fusion": ""}})
+
+    @staticmethod
+    async def _mrr(fusion: str) -> float:
+        """在微型多章节夹具上跑粗排，返回 MRR。"""
+        import os
+
+        from app.core import runtime_config as rc
+        from app.db.vector_store import InMemoryVectorStore
+        from app.services.rag.retriever import HybridRetriever
+        from tests.fixtures import multichapter as fx
+
+        os.environ.setdefault("SEED_DEMO_CORPUS", "0")
+        rc.save_runtime_config({"retrieval": {"fusion": fusion}})
+        try:
+            r = HybridRetriever()
+            await r._ensure_seeded()
+            r._store = InMemoryVectorStore()
+            await r.register_chunks(fx.FIXTURE_CHUNKS)
+
+            rr = 0.0
+            for q in fx.FIXTURE_QUERIES:
+                hits = await r.retrieve_scored(
+                    q["query"], top_k=15, course_id=q["course_id"]
+                )
+                rels = set(q.get("expect_relevant_chunks") or [q["expect_relevant_chunk"]])
+                rank = next(
+                    (i for i, (_s, c) in enumerate(hits, 1) if c.id in rels), None
+                )
+                rr += (1.0 / rank) if rank else 0.0
+            return rr / len(fx.FIXTURE_QUERIES)
+        finally:
+            rc.save_runtime_config({"retrieval": {"fusion": ""}})
+
+    @pytest.mark.asyncio
+    async def test_rrf_beats_weighted_on_fixture(self):
+        """实测基线：RRF 的排序质量优于加权和。
+
+        若此断言失败，说明夹具或信号构造发生了实质变化，
+        应当重新跑 `scripts/measure_recall_mrr.py` 评估融合策略。
+        """
+        rrf = await self._mrr("rrf")
+        weighted = await self._mrr("weighted")
+
+        assert rrf >= weighted, f"RRF({rrf:.4f}) 未优于加权和({weighted:.4f})"
+        assert rrf >= 0.85, f"RRF 的 MRR 低于预期基线: {rrf:.4f}"
+
+    @pytest.mark.asyncio
+    async def test_rrf_scores_stay_bounded(self):
+        """融合分必须有界：语义调制后 rrf_norm ∈ (0,1]。
+
+        不调制的话 min_score/GENERAL_RELEVANCE_FLOOR 会失效
+        （实测 65 条候选中 41 条越过 0.42）。这里守着"分布形状仍可用"。
+        """
+        import os
+
+        from app.core import runtime_config as rc
+        from app.db.vector_store import InMemoryVectorStore
+        from app.services.rag.retriever import HybridRetriever
+        from tests.fixtures import multichapter as fx
+
+        os.environ.setdefault("SEED_DEMO_CORPUS", "0")
+        rc.save_runtime_config({"retrieval": {"fusion": "rrf"}})
+        try:
+            r = HybridRetriever()
+            await r._ensure_seeded()
+            r._store = InMemoryVectorStore()
+            await r.register_chunks(fx.FIXTURE_CHUNKS)
+
+            hits = await r.retrieve_scored(
+                fx.FIXTURE_QUERIES[0]["query"], top_k=15,
+                course_id=fx.FIXTURE_QUERIES[0]["course_id"],
+            )
+            # 上限 = 1（rrf_norm 满分）+ canonical_bonus（定版加成）
+            assert all(s <= 1.0 + 0.5 + 1e-9 for s, _c in hits), "融合分越界"
+            assert any(s > 0 for s, _c in hits), "不应全为 0"
+
+            # 阈值必须仍有筛选能力：不能"几乎全过"
+            passed = sum(1 for s, _c in hits if s >= 0.42)
+            assert 0 < passed < len(hits), (
+                f"0.42 阈值失去筛选能力（{passed}/{len(hits)}）——"
+                "RRF 的语义调制可能被移除"
+            )
+        finally:
+            rc.save_runtime_config({"retrieval": {"fusion": ""}})
+
+    def test_semantic_anchor_is_a_neutral_midpoint(self):
+        """锚点取 0.5：实测 0.85~0.2 区间内 MRR 不变，故取中性折中。
+
+        这是**有意**的选择而非随手写的魔法数：锚点越小越依赖绝对语义
+        （阈值更严但排序优势被削弱），越大越接近纯 RRF（排序最好但阈值失效）。
+        """
+        from app.services.rag.retriever import RRF_K, RRF_SEMANTIC_ANCHOR
+
+        assert 0.0 < RRF_SEMANTIC_ANCHOR < 1.0
+        assert RRF_K == 60, "k 用的是 Cormack 2009 的经典取值"

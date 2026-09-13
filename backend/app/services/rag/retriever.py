@@ -152,6 +152,35 @@ _DEFAULT_ALPHA_BY_SCOPE = {
     "explore": 0.0,         # 拓展解法：纯语义
 }
 
+# ---------------------------------------------------------------- RRF ----
+# 倒数排名融合的平滑常数（Cormack et al. 2009 的经典取值 60）。
+# k 越大，头部名次的优势越平缓：k=60 时 rank1/rank10 = (70/61) ≈ 1.15，
+# 即"第一名只比第十名强 15%"。这正是 RRF 的价值——不放大单路信号的分值幅度。
+RRF_K = 60
+
+# 语义调制锚点：RRF 只看名次，**任何**查询都会有一个"第一名"，哪怕全库
+# 都与它无关。若不调制，一条与问题毫不相干的切片只要在某一路排靠前就能
+# 拿到高分——实测 65 条候选中 41 条越过 0.42 阈值，绝对阈值判定彻底失效。
+# 因此用向量语义分（绝对量）作调制因子，使融合分重新具备绝对相关性语义：
+#   base = rrf_norm * (ANCHOR + (1-ANCHOR) * max(0, sim))
+# sim=0 时保留 ANCHOR 比例的分数（不归零，因为 BM25 精确命中本身也是证据），
+# sim=1 时满分保留。ANCHOR 越大越依赖名次，越小越依赖绝对值。
+RRF_SEMANTIC_ANCHOR = 0.5
+
+
+def _ranks(values: dict[str, float]) -> dict[str, int]:
+    """把各候选的信号值转成降序名次（1 起）。
+
+    只对**正向证据**排名：值为 0 或负的候选不参与。
+    理由：RRF 丢弃分值幅度、只保留顺序，如果给"全体为零"的信号也分配
+    1..N 的名次，就等于凭空捏造区分度——一个查询与所有切片都无关键词
+    重合时，BM25 仍然会"排出名次"，那一组名次是纯噪声。
+    同分按 id 排序，保证结果可复现。
+    """
+    positive = [(k, v) for k, v in values.items() if v > 0]
+    positive.sort(key=lambda kv: (-kv[1], kv[0]))
+    return {k: i + 1 for i, (k, _v) in enumerate(positive)}
+
 
 class HybridRetriever:
     def __init__(self) -> None:
@@ -386,7 +415,10 @@ class HybridRetriever:
         candidates = self._filter_superseded([c for _, c in candidate_map.values()])
         sim_of = {c.id: candidate_map[c.id][0] for c in candidates if c.id in candidate_map}
 
-        scored: list[tuple[float, Chunk]] = []
+        # ---- 阶段一：作用域过滤 + 信号采集 ----
+        # 必须先算全所有候选的信号，RRF 才能知道各路的完整名次。
+        kept: list[Chunk] = []
+        signals: dict[str, tuple[float, float, float]] = {}  # cid -> (sim, lex, bm25)
         for chunk in candidates:
             if exam_point and exam_point not in chunk.exam_point and exam_point != chunk.exam_point:
                 continue
@@ -395,15 +427,55 @@ class HybridRetriever:
             if chapter and chunk.chapter and chapter not in chunk.chapter and chapter != chunk.chapter:
                 continue
             cid = chunk.id
-            sim = sim_of.get(cid, 0.0)
             lex = self._lexical_overlap(set(qtokens), chunk.text)
             bm25 = (bm25_raw.get(cid, 0.0) / bm25_max) if bm25_max > 0 else 0.0
-            # 通用信号：向量 / 词面 / BM25——无演示课程关键词
-            base = (
-                float(weights["vector"]) * sim
-                + float(weights["lexical"]) * lex
-                + float(weights["bm25"]) * bm25
-            )
+            signals[cid] = (sim_of.get(cid, 0.0), lex, bm25)
+            kept.append(chunk)
+
+        # ---- 阶段二：融合打分 ----
+        w_vec = float(weights["vector"])
+        w_lex = float(weights["lexical"])
+        w_bm25 = float(weights["bm25"])
+        fusion = str(weights.get("fusion") or "weighted")
+
+        base_of: dict[str, float] = {}
+        if fusion == "rrf":
+            # 三路各自排名，再按 1/(k+rank) 汇总。
+            # 归一化分母用**理论最大值**（三路都排第一）而非实际最大值：
+            # 用实际最大值会让任何查询的 top1 恒等于 1.0，"这条到底有多相关"
+            # 的信息被彻底抹掉。
+            rank_dense = _ranks({c.id: signals[c.id][0] for c in kept})
+            rank_lex = _ranks({c.id: signals[c.id][1] for c in kept})
+            rank_bm25 = _ranks({c.id: signals[c.id][2] for c in kept})
+            denom = (w_vec + w_lex + w_bm25) / (RRF_K + 1)
+            for c in kept:
+                cid = c.id
+                rrf = 0.0
+                if cid in rank_dense:
+                    rrf += w_vec / (RRF_K + rank_dense[cid])
+                if cid in rank_lex:
+                    rrf += w_lex / (RRF_K + rank_lex[cid])
+                if cid in rank_bm25:
+                    rrf += w_bm25 / (RRF_K + rank_bm25[cid])
+                rrf_norm = (rrf / denom) if denom > 0 else 0.0
+                # 语义调制：把"名次"重新锚回"绝对相关性"，否则 min_score
+                # 与 GENERAL_RELEVANCE_FLOOR 在 RRF 下会失效（详见常量注释）
+                sim = signals[cid][0]
+                base_of[cid] = rrf_norm * (
+                    RRF_SEMANTIC_ANCHOR
+                    + (1.0 - RRF_SEMANTIC_ANCHOR) * max(0.0, sim)
+                )
+        else:
+            # 加权和（fusion=weighted，可选）：分数是绝对量纲，
+            # 与 min_score / canonical_bonus 直接配套，但两路分值尺度不可比
+            # （长查询 BM25 偏高、短查询词面偏低），需要按场景配平权重。
+            for c in kept:
+                sim, lex, bm25 = signals[c.id]
+                base_of[c.id] = w_vec * sim + w_lex * lex + w_bm25 * bm25
+
+        scored: list[tuple[float, Chunk]] = []
+        for chunk in kept:
+            base = base_of[chunk.id]
             # canonical 定版权威加分：explore 模式下为 0（学生已掌握老师方法，看别的思路）
             if chunk.is_canonical:
                 base += canonical_w

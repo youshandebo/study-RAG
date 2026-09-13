@@ -129,15 +129,35 @@ bigram  查询 ['学习','习率','率衰','衰减']  文档 […'学习','习�
 > IDF 刻意保持**全库统计**而非租户内统计：租户语料小的时候，某个词在一两份文档里
 > 出现就会让 IDF 剧烈失真，"普遍出现的词"被算成"罕见词"从而被过度加权。
 
-### 打分：加权融合
+### 打分：RRF 融合（倒数排名融合）
+
+候选池内的多路信号用 **RRF** 合成，而不是加权求和：
 
 ```
-S = w_vec·cos + w_lex·词面重叠 + w_bm25·BM25 + w_canonical·定版加分
+RRF(d) = Σ_m  w_m / (k + rank_m(d))          k = 60（Cormack et al. 2009）
 ```
 
-权重来自 `runtime_config` 预设档位（`strict` / `balanced` / `explore`）并支持
-管理后台逐项覆盖，热生效。随后施加**时间衰减**（仅非定版切片，定版不随时间贬值）
-与**版本去重**（`supersedes` 链上的旧解法直接出局，避免 LLM 串戏）。
+**为什么不用加权和**：`0.5·向量 + 0.2·词面 + 0.2·BM25` 要求三路分值**量纲可比**，
+但实际并非如此——长查询的 BM25 天然偏高、短查询的词面重叠率天然偏高，同一个
+权重在不同长度的提问下含义不同。BM25 长期失效时这个问题被掩盖（另两路也恒为 0），
+一旦稀疏通道真正通电就立刻暴露：**排序被高频词覆盖但答意稍偏的切片挤占**。
+
+RRF 只看名次、不看分值，等比缩放任何一路的分数都不改变结果——不需要为不同
+场景手工配平权重。夹具实测 **MRR 0.80（加权和）→ 0.90（RRF）**。
+
+> **语义调制（不可省略）**：纯 RRF 有个致命副作用——任何查询都会有一个
+> "第一名"，哪怕全库都与它无关。实测 65 条候选里 41 条越过 0.42 阈值，
+> `min_score` / `GENERAL_RELEVANCE_FLOOR` 这类**绝对阈值**彻底失效。
+> 因此在 RRF 分上乘一个语义调制因子，把"名次"重新锚回"绝对相关性"：
+> `base = rrf_norm × (0.5 + 0.5 × max(0, cos))`。锚点 0.5 是在
+> 「MRR 不变的平台区」内选的中性值（实测 0.85~0.2 区间 MRR 恒为 0.90）。
+
+排序完成后施加**时间衰减**（仅非定版切片，定版不随时间贬值）与**版本去重**
+（`supersedes` 链上的旧解法直接出局，避免 LLM 串戏）。
+
+`retrieval.fusion` 可切回 `weighted`（加权和）；权重仍沿用 `strict` / `balanced` /
+`explore` 三档预设并支持后台逐项覆盖，热生效。改完用
+`python scripts/measure_recall_mrr.py` 量化，别凭感觉。
 
 ## 二阶段精排（Rerank）
 
@@ -311,11 +331,59 @@ event: done         {}
 ## 目录结构
 
 ```
-backend/   FastAPI + 意图路由 + RAG(多路召回/切片/对齐/混合打分/精排) + 苏格拉底/出题/批改 Agent + 入库流水线
+backend/   FastAPI + 意图路由 + RAG(多路召回/切片/对齐/RRF 融合/精排) + 苏格拉底/出题/批改 Agent + 入库流水线
+  migrations/   Alembic 迁移历史（可选依赖，见「数据库迁移」）
 frontend/  Next.js 14 + Zustand 四状态机 + Dexie 离线库 + 多态卡片渲染 + KaTeX
 scripts/   检索质量度量 / 重排参数标定 / 租户迁移
 docker-compose.yml   一键编排
 ```
+
+## 数据库迁移
+
+两条路径并存，按部署成熟度选用：
+
+| 路径 | 依赖 | 适用 |
+| --- | --- | --- |
+| **内置自动建表**（默认） | 无 | 单机 / 演示 / 快速启动 |
+| **Alembic**（可选） | `pip install alembic` | 团队协作 / 需要可追溯、可回滚的 schema 历史 |
+
+**内置路径**：`relational._ensure_tables()` 启动时 `create_all` 建缺失的表，
+再按 `_SCHEMA_PATCHES` 幂等补列（`create_all` **不会**给已存在的表加列——
+这是升级时最容易踩的坑）。列是否存在用 SQLAlchemy inspector 探测，
+而不是"捕获异常当成功"，后者会把权限/连接类真实错误一并吞掉。
+
+**Alembic 路径**：
+
+```bash
+cd backend
+alembic upgrade head                    # 升到最新
+alembic revision -m "描述"               # 新建 revision
+alembic revision --autogenerate -m "描述" # 按模型差异自动生成
+alembic downgrade -1                    # 回滚一步
+alembic current / alembic history        # 查看状态
+```
+
+连接串**不在** `alembic.ini` 里维护，由 `migrations/env.py` 从项目统一配置解析
+（`ALEMBIC_DATABASE_URL` > `POSTGRES_DSN` > 本地 SQLite），避免同一份信息两处漂移。
+库是异步驱动（`sqlite+aiosqlite` / `postgresql+asyncpg`），env.py 走
+`async_engine_from_config` + `run_sync`；SQLite 下启用 `render_as_batch`
+（它不支持大多数 ALTER，batch 模式会重建表来模拟）。
+
+**存量库接入**（表已由 `create_all` 建好，可能已含新列）：
+
+```bash
+alembic stamp head      # schema 已一致，直接记录为最新版本
+```
+
+> ⚠️ `alembic.ini` **必须保持纯 ASCII**。Alembic 用 `configparser` 以
+> **locale 编码**读取它，中文 Windows 上 locale 是 GBK——配置里出现任何
+> UTF-8 多字节字符，所有 alembic 命令都会直接 `UnicodeDecodeError`。
+> 中文说明放在本文件与 `migrations/env.py`（Python 文件显式声明 UTF-8）。
+> 该约束由 `test_alembic_ini_is_pure_ascii` 守住。
+
+迁移历史：`0001` 基线四表（sessions / users / messages / assets）→
+`0002` users 增加 `tenant_id`（多租户隔离）。新列一律作为**增量 revision**，
+不塞进基线——否则存量库无法对齐。
 
 ## 兜底策略一览
 
@@ -325,6 +393,7 @@ docker-compose.yml   一键编排
 - 无 Whisper → 内置带毫秒时间戳的演示转录
 - **无 Rerank API → 跳过精排，直接沿用粗排顺序**（零外部依赖，且不含任何本地模型推理）
 - **未开启多租户 → 单租户 `public`**，行为与引入隔离前逐位一致；开启前需先跑 `scripts/migrate_tenants.py`
+- **未装 alembic → 内置自动建表 + 幂等补列**（`create_all` + `ALTER TABLE` 探测），迁移能力零依赖可用
 - **持久化为真实可选**：`POSTGRES_DSN` 需先 `pip install asyncpg "sqlalchemy[asyncio]>=2.0"`，`QDRANT_URL` 需先 `pip install qdrant-client`；未安装驱动/未配置时自动降级进程内存储（重启即失，部署多副本必须配置）
 - 无 MinIO → 本地静态目录托管
 - 无 Redis → 限流与计费走进程内实现（单副本正确；多副本需配置 `REDIS_URL` 以共享窗口与账本）
