@@ -136,6 +136,14 @@ export function normalizeCard(raw: Record<string, unknown>): PolymorphicMessage 
       revealed: Boolean(so.revealed),
       guardBlocked: Boolean(so.guard_blocked),
       convergeFailed: Boolean(so.converge_failed),
+      selftest: (() => {
+        const st = so.selftest as Record<string, unknown> | undefined | null;
+        if (!st || !String(st.question_text ?? '').trim()) return null;
+        return {
+          questionText: String(st.question_text ?? ''),
+          options: (st.options as string[]) ?? [],
+        };
+      })(),
     };
   }
   const qz = raw.quiz_payload as Record<string, unknown> | undefined | null;
@@ -295,7 +303,19 @@ export async function login(
   return data;
 }
 
-export async function fetchMe(): Promise<{ anonymous: boolean; email?: string; tier: string; is_admin?: boolean; plan: { storage_mb: number; chat_per_min: number; label?: string } } | null> {
+export interface MeInfo {
+  anonymous: boolean;
+  id?: string;
+  email?: string;
+  tier: string;
+  is_admin?: boolean;
+  /** member | tenant_admin —— 仅用于前端显隐租户运营模块，服务端另有校验 */
+  role?: string;
+  tenant_id?: string;
+  plan: { storage_mb: number; chat_per_min: number; label?: string };
+}
+
+export async function fetchMe(): Promise<MeInfo | null> {
   const resp = await fetch(`${API_BASE}/auth/me`, authInit());
   if (!resp.ok) return null;
   return resp.json();
@@ -433,6 +453,28 @@ export async function generateVariant(id: string): Promise<VariantResult> {
       difficulty: q.difficulty === undefined ? undefined : Number(q.difficulty),
     },
   };
+}
+
+/** 带鉴权下载 CSV：Authorization 头没法用在 <a href> 上，只能 fetch + blob。 */
+async function downloadCsv(path: string, filename: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}${path}`, authInit());
+  handleAuthError(resp.status);
+  if (!resp.ok) throw new ApiError(`导出失败（${resp.status}）`, resp.status);
+  const text = await resp.text();
+  const blob = new Blob([text], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/** 导出本租户卡点分布 CSV（租户管理员） */
+export async function exportConceptStruggles(limit = 50): Promise<void> {
+  await downloadCsv(`/ops/concepts/struggles?limit=${limit}&format=csv`, 'concept_struggles.csv');
 }
 
 /** 租户级高频卡点（教研视角；需 tenant_admin 权限） */

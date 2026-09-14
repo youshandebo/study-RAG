@@ -506,3 +506,56 @@ class TestSchemaAndMigration:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         assert mod.revision == "0005" and mod.down_revision == "0004"
+
+
+# ==================================================== P2-C 前端契约 ====
+class TestP2CContract:
+    def test_me_payload_exposes_role(self, monkeypatch):
+        """前端据此显隐"机构卡点"页签；服务端另有强制校验，role 只用于显隐。"""
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        from app.api.v1.auth import AuthUser
+
+        pub = AuthUser("u-1", "a@b.com", "free", tenant_id="org-a", role="tenant_admin").to_public()
+        assert pub["role"] == "tenant_admin"
+        assert pub["tenant_id"] == "org-a", "多租户模式下 /auth/me 应回传所属机构"
+
+    @pytest.mark.asyncio
+    async def test_converging_payload_carries_structured_selftest(self, db_env, mock_quiz):
+        """收敛阶段必须结构化下发自测题（前端据此渲染可点选项）。"""
+        from app.services.agent.socratic_tutor import SocraticTutor
+
+        t = SocraticTutor()
+        payload = None
+        for text in ["教我反常积分", "我觉得是 x^2", "对，应该是 x^2", "对，就是 x^2"]:
+            payload = await t.start_or_advance("s-c", text, tenant_id="org-a", user_id="u-1", topic="反常积分")
+
+        assert payload is not None and payload.phase == "converging"
+        assert payload.selftest is not None, "收敛阶段应下发结构化自测题"
+        assert payload.selftest.question_text
+        assert payload.selftest.options, "自测题必须带选项，前端才能渲染成点选"
+
+    @pytest.mark.asyncio
+    async def test_non_converging_payload_has_no_selftest(self, db_env, mock_quiz):
+        from app.services.agent.socratic_tutor import SocraticTutor
+
+        payload = await SocraticTutor().start_or_advance("s-d", "教我", tenant_id="org-a", user_id="u-1")
+        assert payload.selftest is None
+
+    @pytest.mark.asyncio
+    async def test_struggles_csv_export_scoped_to_tenant(self, db_env):
+        from fastapi.responses import PlainTextResponse
+
+        from app.api.v1.feedback import concept_struggles
+
+        await nb_store.add_mistake(tenant_id="org-a", user_id="u-1", concept_tag="反常积分",
+                                   source_type=nb_store.SOURCE_PASSIVE)
+        await nb_store.add_mistake(tenant_id="org-b", user_id="u-9", concept_tag="B机构知识点")
+
+        resp = await concept_struggles(limit=50, format="csv", user=_user("org-a", "tenant_admin"))
+
+        assert isinstance(resp, PlainTextResponse)
+        body = resp.body.decode("utf-8")
+        assert body.startswith("﻿"), "缺 UTF-8 BOM，Excel 打开中文乱码"
+        assert "concept_tag" in body.splitlines()[0]
+        assert "反常积分" in body
+        assert "B机构知识点" not in body, "CSV 里出现了其他租户的卡点"

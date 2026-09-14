@@ -66,6 +66,10 @@ class AuthUser:
             "email": self.email,
             "tier": self.tier,
             "is_admin": self.is_admin,
+            # 前端据此显隐"租户卡点看板"等租户内运营模块；
+            # 真正的权限校验在服务端做（见 api/v1/feedback.py / notebook.py），
+            # 前端 role 只用于显隐，不作为授权依据。
+            "role": self.role,
             "plan": plan_for(self.tier),
             # 前端据此显隐"当前机构"，但真正的隔离在服务端做，前端只做展示
             "tenant_id": resolve_tenant(self),

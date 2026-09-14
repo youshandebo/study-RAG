@@ -112,9 +112,16 @@ async def export_badcases(
     return {"tenant_id": tenant, "window_days": days, "count": len(rows), "items": rows}
 
 
+_STRUGGLE_COLUMNS = (
+    "concept_tag", "mistakes", "passive_converge", "converge_fail_rate",
+    "avg_mastery", "mastered", "active", "last_at",
+)
+
+
 @router.get("/ops/concepts/struggles")
 async def concept_struggles(
     limit: int = 50,
+    format: str = "json",
     user: AuthUser = Depends(current_user_optional),
 ):
     """租户级高频卡点聚合：按知识点统计错题数 / 平均掌握度 / 被动挂科率。
@@ -131,4 +138,26 @@ async def concept_struggles(
     tenant = resolve_tenant(user)
     limit = max(1, min(200, limit))
     rows = await notebook_store.tenant_struggles(tenant, limit=limit)
+
+    if format.lower() == "csv":
+        import csv
+        import io
+
+        from fastapi.responses import PlainTextResponse
+
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=list(_STRUGGLE_COLUMNS), extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            flat = dict(r)
+            flat["last_at"] = (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["last_at"] / 1000))
+                if r.get("last_at") else ""
+            )
+            writer.writerow(flat)
+        return PlainTextResponse(
+            content="﻿" + buf.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": "attachment; filename=concept_struggles.csv"},
+        )
     return {"tenant_id": tenant, "count": len(rows), "items": rows}

@@ -67,6 +67,8 @@ export interface PolymorphicMessage extends BaseMessage {
     revealed?: boolean;
     guardBlocked?: boolean;
     convergeFailed?: boolean;
+    /** P2-B/C CONVERGING 挂起自测题：结构化下发，前端渲染成可点选项 */
+    selftest?: { questionText: string; options: string[] } | null;
   };
 
   /** 3. 针对易错点的自测题载荷 */

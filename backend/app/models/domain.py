@@ -43,11 +43,24 @@ class SolvePayload(BaseModel):
     evidence_list: list[EvidenceRef] = []
 
 
+class SocraticSelfTest(BaseModel):
+    """CONVERGING 阶段挂起的自测题（结构化下发，供前端渲染成可点选项）。
+
+    为什么要把选项结构化成字段、而不是只用 `guiding_question` 里的文本：
+    文本形态要求学生手敲一整段作答，判分规则命中率低、体验也差。
+    结构化下发给前端渲染"点选项即提交"，才能让确定性判分真正吃到规律。
+    """
+
+    question_text: str = ""
+    options: list[str] = []
+
+
 class SocraticPayload(BaseModel):
     current_step_index: int
     total_steps: int
     guiding_question: str
     hints: list[str] = []
+    selftest: Optional[SocraticSelfTest] = None
     # P2-A 显式状态机载荷：阶段与提示阶梯对前端可见（可选，保持向后兼容）。
     # 前端据此显隐"提示进度""已揭晓"等，但真正的流转由服务端 FSM 决定。
     phase: str = ""

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 
-from app.models.domain import SocraticPayload
+from app.models.domain import SocraticPayload, SocraticSelfTest
 from app.services.agent import socratic_store
 from app.services.agent.quiz_generator import QuizGenerator
 from app.services.agent.socratic_fsm import (
@@ -150,7 +150,7 @@ class SocraticTutor:
             )
 
         # ---------------------------------------------- 组织本轮输出 ----
-        question, _pending_after = await self._compose(
+        question, active_quiz = await self._compose(
             state, session_id=session_id, topic=topic, context=context,
             history=history or [], student_reply=student_reply,
             exam_point=exam_point, still_pending=(pending if consumed_quiz is None else None),
@@ -158,6 +158,14 @@ class SocraticTutor:
 
         if state.guard_blocked:
             question = f"{_GUARD_NOTICE}\n\n{question}"
+
+        # 收敛阶段：把挂起题结构化下发，前端据此渲染"点选项即提交"的卡片
+        selftest = None
+        if active_quiz is not None and state.phase is SocraticPhase.converging:
+            selftest = SocraticSelfTest(
+                question_text=str(active_quiz.get("question_text") or ""),
+                options=[str(o) for o in (active_quiz.get("options") or [])],
+            )
 
         await socratic_store.save_state(
             session_id, state,
@@ -176,6 +184,7 @@ class SocraticTutor:
             total_steps=TOTAL_STEPS,
             guiding_question=question,
             hints=hints,
+            selftest=selftest,
             phase=state.phase.value,
             phase_label=phase_label(state.phase),
             hint_level=state.hint_level,

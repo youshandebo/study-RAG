@@ -5,14 +5,16 @@
 /** 统一主工作台：左会话栏 + 中全能对话画布 + 右证据抽屉 */
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { BookMarked, BookOpen, ChevronRight, LogIn, LogOut, Settings, User } from 'lucide-react';
-import { fetchMe, getSassToken, setSassToken, setSassUser } from '@/lib/api';
+import { BookMarked, BookOpen, ChevronRight, LogIn, LogOut, NotebookPen, Settings, User } from 'lucide-react';
+import { fetchMe, getSassToken, setSassToken, setSassUser, type MeInfo } from '@/lib/api';
 import SessionSidebar from '@/components/chat/SessionSidebar';
 import UnifiedMessageList from '@/components/chat/UnifiedMessageList';
 import OmniChatInput from '@/components/chat/OmniChatInput';
 import EvidenceDrawer from '@/components/drawer/EvidenceDrawer';
+import NotebookDrawer from '@/components/notebook/NotebookDrawer';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useEvidenceStore } from '@/stores/useEvidenceStore';
+import { useNotebookStore } from '@/stores/useNotebookStore';
 import { hydrateMessages } from '@/db';
 import { API_BASE } from '@/lib/api';
 
@@ -37,8 +39,9 @@ export default function WorkspacePage() {
   const openDrawer = useEvidenceStore((s) => s.openDrawer);
   const drawerOpen = useEvidenceStore((s) => s.open);
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
-  const [me, setMe] = useState<{ anonymous: boolean; email?: string; tier: string; is_admin?: boolean; plan: { label?: string } } | null>(null);
+  const [me, setMe] = useState<MeInfo | null>(null);
   const hydratedFor = useRef<Set<string>>(new Set());
+  const { openDrawer: openNotebook, dueCount, refreshDue } = useNotebookStore();
 
   // 当前会员身份：有 token 时拉 /auth/me（失效自动清本地态）
   useEffect(() => {
@@ -47,14 +50,16 @@ export default function WorkspacePage() {
       return;
     }
     void fetchMe().then((m) => {
-      if (m && !m.anonymous) setMe(m);
-      else {
+      if (m && !m.anonymous) {
+        setMe(m);
+        void refreshDue(); // 登录后拉一次待复习角标
+      } else {
         setSassToken(null);
         setSassUser(null);
         setMe(null);
       }
     });
-  }, []);
+  }, [refreshDue]);
 
   // 启动初始化：加载/创建会话
   useEffect(() => {
@@ -187,6 +192,22 @@ export default function WorkspacePage() {
                 管理后台
               </a>
             )}
+            {/* 错题本入口：待复习数量红点角标（仅登录用户） */}
+            {me && !me.anonymous && (
+              <button
+                onClick={() => openNotebook('review')}
+                title="错题本 · Leitner 复习"
+                className="relative flex items-center gap-1.5 rounded-lg border border-rule/60 bg-white/70 px-3 py-1.5 text-[12.5px] text-ink-soft transition hover:border-rule hover:text-ink"
+              >
+                <NotebookPen size={14} strokeWidth={1.5} />
+                错题本
+                {dueCount > 0 && (
+                  <span className="absolute -right-1.5 -top-1.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-cinnabar px-1 text-[10px] font-bold text-white">
+                    {dueCount > 99 ? '99+' : dueCount}
+                  </span>
+                )}
+              </button>
+            )}
             <button
               onClick={() => openDrawer()}
               className="flex items-center gap-1.5 rounded-lg border border-rule/60 bg-white/70 px-3 py-1.5 text-[12.5px] text-ink-soft transition hover:border-rule hover:text-ink"
@@ -203,6 +224,8 @@ export default function WorkspacePage() {
       </main>
 
       <EvidenceDrawer />
+      {/* 错题本抽屉：租户管理员 / 平台超管额外可见"机构卡点"页签 */}
+      <NotebookDrawer canManage={!!(me?.is_admin || me?.role === 'tenant_admin')} />
     </div>
   );
 }
