@@ -582,6 +582,10 @@ async def _stream_body(
         payload = await SocraticTutor().start_or_advance(
             req.session_id, req.text if req.text else None,
             topic=query, context=socratic_ctx, history=history,
+            tenant_id=tenant, user_id=user_id or "",
+            course_id=req.course_id,
+            concept_tag=(_chunks[0].exam_point if _chunks else ""),
+            exam_point=(_chunks[0].exam_point if _chunks else ""),
         )
         yield _sse("delta", {"text": payload.guiding_question})
         assistant.type = MessageType.socratic_card

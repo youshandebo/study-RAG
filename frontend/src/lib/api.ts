@@ -3,6 +3,7 @@
 
 import type { EvidenceRef, Intent, PolymorphicMessage, UsageInfo } from '@/types/message';
 import type { EvidenceBundle, IngestAsset } from '@/types/evidence';
+import type { ConceptStruggle, MistakeItem, ReviewResult, VariantResult } from '@/types/notebook';
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000/api/v1';
 /** 后端源（剥离 /api/v1）：静态板书等资源直连后端 */
@@ -325,6 +326,128 @@ export async function gradeQuiz(sessionId: string, optionIndex: number): Promise
   const resp = await fetch(`${API_BASE}/quiz/grade?${qs}`, authInit({ method: 'POST' }));
   handleAuthError(resp.status);
   return resp.json();
+}
+
+// -------------------------------------------------------------- notebook ----
+// 后端返回 snake_case，前端协议为 camelCase —— 与消息层同样在客户端统一转换。
+function normalizeMistake(r: Record<string, unknown>): MistakeItem {
+  return {
+    id: String(r.id ?? ''),
+    tenantId: String(r.tenant_id ?? ''),
+    userId: String(r.user_id ?? ''),
+    courseId: String(r.course_id ?? ''),
+    conceptTag: String(r.concept_tag ?? ''),
+    sourceType: (r.source_type ?? 'passive_converge') as MistakeItem['sourceType'],
+    sessionId: String(r.session_id ?? ''),
+    questionContext: String(r.question_context ?? ''),
+    referenceAnswer: String(r.reference_answer ?? ''),
+    options: (r.options as string[] | null) ?? null,
+    misconception: String(r.misconception ?? ''),
+    leitnerBox: Number(r.leitner_box ?? 1),
+    masteryScore: Number(r.mastery_score ?? 0),
+    reviewCount: Number(r.review_count ?? 0),
+    lastReviewedAt: Number(r.last_reviewed_at ?? 0),
+    nextReviewAt: Number(r.next_review_at ?? 0),
+    status: (r.status ?? 'active') as MistakeItem['status'],
+    createdAt: Number(r.created_at ?? 0),
+    updatedAt: Number(r.updated_at ?? 0),
+  };
+}
+
+async function notebookFetch(path: string, init?: RequestInit): Promise<Record<string, unknown>> {
+  const resp = await fetch(`${API_BASE}${path}`, authInit(init));
+  handleAuthError(resp.status);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new ApiError(String(data?.detail ?? `后端响应 ${resp.status}`), resp.status);
+  return data as Record<string, unknown>;
+}
+
+/** 到期（含逾期）待复习的错题 */
+export async function fetchDueMistakes(limit = 50): Promise<MistakeItem[]> {
+  const data = await notebookFetch(`/notebook/due?limit=${limit}`);
+  return ((data.items as Record<string, unknown>[]) ?? []).map(normalizeMistake);
+}
+
+/** 我的错题本（可按状态过滤） */
+export async function fetchNotebook(status = '', limit = 200): Promise<MistakeItem[]> {
+  const qs = new URLSearchParams({ limit: String(limit) });
+  if (status) qs.set('status', status);
+  const data = await notebookFetch(`/notebook?${qs}`);
+  return ((data.items as Record<string, unknown>[]) ?? []).map(normalizeMistake);
+}
+
+/** 主动收录：把当前问题/题目加入错题本 */
+export async function addToNotebook(payload: {
+  question: string;
+  answer?: string;
+  options?: string[] | null;
+  conceptTag?: string;
+  courseId?: string;
+  misconception?: string;
+  sessionId?: string;
+}): Promise<MistakeItem> {
+  const data = await notebookFetch('/notebook', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      question: payload.question,
+      answer: payload.answer ?? '',
+      options: payload.options ?? null,
+      concept_tag: payload.conceptTag ?? '',
+      course_id: payload.courseId ?? '',
+      misconception: payload.misconception ?? '',
+      session_id: payload.sessionId ?? '',
+    }),
+  });
+  return normalizeMistake((data.item as Record<string, unknown>) ?? {});
+}
+
+/** 提交一次复习作答（判分与 Leitner 升降盒都在服务端完成） */
+export async function reviewMistake(id: string, answer: string): Promise<ReviewResult> {
+  const data = await notebookFetch(`/notebook/${encodeURIComponent(id)}/review`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ answer }),
+  });
+  const raw = data.item as Record<string, unknown> | null | undefined;
+  return {
+    correct: (data.correct as boolean | null) ?? null,
+    reason: String(data.reason ?? ''),
+    item: raw ? normalizeMistake(raw) : null,
+  };
+}
+
+/** 针对某道错题生成同质同构变式题 */
+export async function generateVariant(id: string): Promise<VariantResult> {
+  const data = await notebookFetch(`/notebook/${encodeURIComponent(id)}/generate-variant`, { method: 'POST' });
+  const q = (data.question as Record<string, unknown>) ?? {};
+  return {
+    ok: Boolean(data.ok),
+    sourceId: String(data.source_id ?? id),
+    question: {
+      questionText: String(q.question_text ?? ''),
+      options: (q.options as string[] | null) ?? null,
+      targetPitfall: String(q.target_pitfall ?? ''),
+      explanation: String(q.explanation ?? ''),
+      answer: (q.answer as string | null) ?? null,
+      difficulty: q.difficulty === undefined ? undefined : Number(q.difficulty),
+    },
+  };
+}
+
+/** 租户级高频卡点（教研视角；需 tenant_admin 权限） */
+export async function fetchConceptStruggles(limit = 50): Promise<ConceptStruggle[]> {
+  const data = await notebookFetch(`/ops/concepts/struggles?limit=${limit}`);
+  return ((data.items as Record<string, unknown>[]) ?? []).map((r) => ({
+    conceptTag: String(r.concept_tag ?? ''),
+    mistakes: Number(r.mistakes ?? 0),
+    passiveConverge: Number(r.passive_converge ?? 0),
+    convergeFailRate: Number(r.converge_fail_rate ?? 0),
+    avgMastery: Number(r.avg_mastery ?? 0),
+    mastered: Number(r.mastered ?? 0),
+    active: Number(r.active ?? 0),
+    lastAt: Number(r.last_at ?? 0),
+  }));
 }
 
 // ----------------------------------------------------------------- evidence ---

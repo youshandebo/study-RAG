@@ -35,6 +35,8 @@ _memory_users: dict[str, dict[str, Any]] = {}
 _SCHEMA_PATCHES: tuple[tuple[str, str, str], ...] = (
     ("users", "tenant_id", "VARCHAR(64)"),
     ("users", "role", "VARCHAR(20)"),
+    # P2-B：存量 socratic_sessions 表补 pending_quiz_json（create_all 不会加列）
+    ("socratic_sessions", "pending_quiz_json", "TEXT"),
 )
 
 

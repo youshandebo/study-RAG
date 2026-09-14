@@ -1,21 +1,29 @@
 # Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
-"""苏格拉底式启发伴学代理：**显式状态机驱动**的分步引导。
+"""苏格拉底式启发伴学代理：**显式状态机驱动**的分步引导 + 收敛自测闭环。
 
 职责边界（重要）
 ----------------
-本类只负责"把 FSM 决定的阶段翻译成人话"：
-    读状态 → `detect_signal` 归类学生回复 → `advance` 流转 → 按阶段组织提问 → 落库。
+本类只负责"把 FSM 决定的阶段翻译成人话"，并串起自测闭环：
+    读状态 → 归类信号（含对挂起自测题的判分）→ `advance` 流转
+    → 按阶段组织提问 / 出收敛自测题 → 落库（状态 + 挂起题）
 **阶段流转与"能否揭晓答案"完全由 `socratic_fsm` 决定，LLM 无权改写。**
-这样即便模型在用户反复催促下"心软"，也无法越过状态机提前泄题——
-泄题与否是代码逻辑，不是模型的临场发挥。
+这样即便模型在用户反复催促下"心软"，也无法越过状态机提前泄题。
 
-真实模型可用时，引导问题由 LLM 在**当前阶段的约束**下现场生成
-（主题来自课堂检索切片与对话历史）；无 Key / 生成失败时回落内置演示脚本，离线可演示。
+CONVERGING 自测闭环（P2-B）
+--------------------------
+`REFLECTING` 判为掌握 → 进入 `CONVERGING` → 本题**出题并挂起**（落库）；
+学生下一轮作答 → 先判分（确定性规则优先，开放题退到结构化）→ 回灌 FSM：
+- 判对（`graded=True`）→ 吸收进 `RESOLVED`，清空挂起题
+- 判错（`graded=False`）→ 打 `converge_failed`、回退 `GUIDING`，并**被动归档错题本**
+- 判不出来（`None`）→ 留在 `CONVERGING`（既不冤枉也不放水，见 grading 模块）
 """
 from __future__ import annotations
 
+import logging
+
 from app.models.domain import SocraticPayload
 from app.services.agent import socratic_store
+from app.services.agent.quiz_generator import QuizGenerator
 from app.services.agent.socratic_fsm import (
     MAX_HINT_LEVEL,
     SocraticPhase,
@@ -33,6 +41,10 @@ from app.services.llm.mock_engine import (
     SOCRATIC_HINTS,
     SOCRATIC_STEPS,
 )
+from app.services.notebook import store as notebook_store
+from app.services.notebook.grading import grade_with_fallback
+
+_logger = logging.getLogger("app.services.agent.socratic_tutor")
 
 # 被逃逸守卫拦截时给学生的柔性说明——不是训斥，而是"换个方式继续帮你"
 _GUARD_NOTICE = "我先不直接把答案给你——难题拆开就不难了。我们只看一个小地方："
@@ -43,10 +55,19 @@ TOTAL_STEPS = len(SOCRATIC_STEPS)
 
 def _mock_question(state: SocraticState) -> str:
     """无真实模型时的兜底脚本：按已发起轮次顺序推进内置讲法。"""
-    if state.phase is SocraticPhase.revealed or state.phase is SocraticPhase.resolved:
+    if state.phase in (SocraticPhase.revealed, SocraticPhase.resolved):
         return SOCRATIC_CLOSING
     idx = min(max(0, state.question_count), TOTAL_STEPS - 1)
     return SOCRATIC_STEPS[idx]
+
+
+def _format_selftest(quiz: dict) -> str:
+    """把自测题渲染成给学生看的文本（题干 + 选项）。"""
+    lines = ["我们来做一道小题检验一下：", str(quiz.get("question_text") or "")]
+    options = quiz.get("options") or []
+    if options:
+        lines.append("\n".join(f"{chr(65 + i)}. {o}" for i, o in enumerate(options)))
+    return "\n\n".join(line for line in lines if line)
 
 
 class SocraticTutor:
@@ -62,27 +83,50 @@ class SocraticTutor:
         user_id: str = "",
         course_id: str = "",
         concept_tag: str = "",
+        exam_point: str = "",
         graded: bool | None = None,
     ) -> SocraticPayload:
-        """读状态 → 归类信号 → 流转 → 组织提问 → 落库，返回本轮引导载荷。
-
-        `graded`：自测题路径的客观判分结果（True 答对 / False 答错）。
-        传入时优先于文本启发式——判分结果永远比措辞可靠。
-        """
+        """读状态 → 归类信号（可含自测判分）→ 流转 → 组织提问/出题 → 落库。"""
         stored = await socratic_store.load_state(session_id)
         state = SocraticState.from_dict(stored)
-
-        # 首轮：用户输入是"主题/开场白"，不是对某个引导问题的作答，
-        # 不做信号归类（否则"教教我"里的"教"都可能被误判）。诊断阶段会
-        # 用一个澄清式提问反问他卡在哪，方向依然正确。
+        pending = await socratic_store.get_pending_quiz(session_id)
         is_first_turn = stored is None
+
+        # ------------------------------------------------ 信号归类 ----
+        consumed_quiz: dict | None = None
+        self_test_verdict: bool | None = None
+
         if is_first_turn or student_reply is None:
+            # 首轮（或主动发起）：用户输入是"主题/开场白"，不做信号归类
             signal = Signal.none
+        elif graded is not None:
+            # 调用方已给出判分（如 /quiz/grade 回灌）
+            signal = Signal.passed if graded else Signal.wrong
+            self_test_verdict = graded
+            consumed_quiz = pending
+        elif pending:
+            # 挂起着一道自测题 → 本轮作答先判分，再回灌状态机
+            verdict, reason = await grade_with_fallback(
+                reference_answer=pending.get("answer"),
+                student_answer=student_reply,
+                options=pending.get("options"),
+                question=str(pending.get("question_text") or ""),
+            )
+            consumed_quiz = pending
+            if verdict is True:
+                signal, self_test_verdict = Signal.passed, True
+            elif verdict is False:
+                signal, self_test_verdict = Signal.wrong, False
+            else:
+                # 判不出来：留在 CONVERGING 继续问，不因判分器不可用而放行/惩罚
+                signal = Signal.attempt
+                _logger.info("自测判分未定（%s），保持收敛阶段", reason)
         else:
-            signal = detect_signal(student_reply, graded=graded)
+            signal = detect_signal(student_reply)
+
         state = advance(state, signal)
 
-        # 事件日志（截断保留，避免无限增长）——供后续错题本/教研分析回溯
+        # ------------------------------------------------ 事件日志 ----
         if student_reply is not None:
             state.history.append({
                 "n": state.question_count,
@@ -93,15 +137,32 @@ class SocraticTutor:
             })
             state.history = state.history[-50:]
 
-        question = await self._question_for(
-            state, topic=topic, context=context, history=history or [], student_reply=student_reply,
+        # 已作答的自测题不再挂起
+        if consumed_quiz is not None:
+            await socratic_store.set_pending_quiz(session_id, None)
+
+        # --------------------------------- 被动归档：自测失败入错题本 ----
+        if self_test_verdict is False and consumed_quiz:
+            await self._archive_mistake(
+                tenant_id=tenant_id, user_id=user_id, course_id=course_id,
+                concept_tag=concept_tag or exam_point or topic,
+                session_id=session_id, quiz=consumed_quiz,
+            )
+
+        # ---------------------------------------------- 组织本轮输出 ----
+        question, _pending_after = await self._compose(
+            state, session_id=session_id, topic=topic, context=context,
+            history=history or [], student_reply=student_reply,
+            exam_point=exam_point, still_pending=(pending if consumed_quiz is None else None),
         )
+
         if state.guard_blocked:
             question = f"{_GUARD_NOTICE}\n\n{question}"
 
         await socratic_store.save_state(
             session_id, state,
-            tenant_id=tenant_id, user_id=user_id, course_id=course_id, concept_tag=concept_tag,
+            tenant_id=tenant_id, user_id=user_id, course_id=course_id,
+            concept_tag=concept_tag or exam_point,
         )
 
         terminal = state.phase in (SocraticPhase.resolved, SocraticPhase.revealed)
@@ -124,16 +185,62 @@ class SocraticTutor:
             converge_failed=state.converge_failed,
         )
 
-    async def _question_for(
+    # ------------------------------------------------------------ 内部 ----
+    async def _compose(
         self,
         state: SocraticState,
         *,
+        session_id: str,
         topic: str,
         context: str,
         history: list[dict],
         student_reply: str | None,
+        exam_point: str,
+        still_pending: dict | None,
+    ) -> tuple[str, dict | None]:
+        """按当前阶段产出要发给学生的话；CONVERGING 阶段负责出题/复用挂起题。"""
+        if state.phase is SocraticPhase.converging:
+            quiz = still_pending
+            if quiz is None:
+                payload = await QuizGenerator().generate(
+                    target_pitfall=exam_point or topic or None,
+                    exam_point=exam_point or topic,
+                    context=context,
+                )
+                quiz = payload.model_dump()
+                await socratic_store.set_pending_quiz(session_id, quiz)
+            return _format_selftest(quiz), quiz
+        return await self._question_for(
+            state, topic=topic, context=context, history=history, student_reply=student_reply,
+        ), None
+
+    async def _archive_mistake(
+        self, *, tenant_id: str, user_id: str, course_id: str,
+        concept_tag: str, session_id: str, quiz: dict,
+    ) -> None:
+        """引导自测失败 → 被动归档错题本（含题目、参考答案、诊断误区）。
+
+        写入失败只记日志：错题本必须能容错，绝不能因归档失败而让整轮引导报错。
+        """
+        try:
+            await notebook_store.add_mistake(
+                tenant_id=tenant_id, user_id=user_id, course_id=course_id,
+                concept_tag=concept_tag or "未标注",
+                source_type=notebook_store.SOURCE_PASSIVE,
+                session_id=session_id, trace_id=session_id,
+                question_context=str(quiz.get("question_text") or ""),
+                reference_answer=str(quiz.get("answer") or ""),
+                options=quiz.get("options") or None,
+                misconception=str(quiz.get("target_pitfall") or quiz.get("explanation") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("错题被动归档失败（不影响本轮引导）: %s", exc)
+
+    async def _question_for(
+        self, state: SocraticState, *,
+        topic: str, context: str, history: list[dict], student_reply: str | None,
     ) -> str:
-        """按当前阶段组织提问：LLM 现场生成优先，失败回落演示脚本。"""
+        """非收敛阶段：按阶段组织提问（LLM 现场生成优先，失败回落演示脚本）。"""
         llm_question = await self._llm_question(
             state=state, topic=topic, context=context,
             chat_history=history, student_reply=student_reply,
@@ -147,12 +254,8 @@ class SocraticTutor:
 
     @staticmethod
     async def _llm_question(
-        *,
-        state: SocraticState,
-        topic: str,
-        context: str,
-        chat_history: list[dict],
-        student_reply: str | None,
+        *, state: SocraticState, topic: str, context: str,
+        chat_history: list[dict], student_reply: str | None,
     ) -> str | None:
         """LLM 现场生成当前阶段的引导语；演示引擎 / 异常返回 None 走演示脚本。"""
         try:

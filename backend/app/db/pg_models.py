@@ -2,7 +2,7 @@
 """Postgres ORM 模型（SQLAlchemy 2.0 声明式，仅配置 POSTGRES_DSN 时使用）。"""
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, Integer, String, Text
+from sqlalchemy import BigInteger, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -175,6 +175,57 @@ class SocraticSessionRow(Base):
     guard_blocked: Mapped[int] = mapped_column(Integer, default=0)
     last_signal: Mapped[str] = mapped_column(String(20), default="none")
     history_json: Mapped[str] = mapped_column(Text, default="[]")
+    # 挂起中的自测题（CONVERGING 阶段出题后等待学生作答；判分后清空）。
+    # 存进会话行而不是进程内存：判分必须跨请求、跨副本读到同一道题，
+    # 否则负载均衡到别的副本就会"找不到题 → 无法判分"。
+    pending_quiz_json: Mapped[str] = mapped_column(Text, default="")
+
+    created_at: Mapped[int] = mapped_column(BigInteger, index=True)
+    updated_at: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
+# ------------------------------------------------------------ 错题本 ----
+# P2-B：错题的两路归集（引导自测失败被动归档 / 用户手动收藏 / 考试失分）
+# 与 Leitner 复习调度。**跨租户 + 用户级双重隔离**：租户是硬边界，
+# user_id 保证学生之间互不可见——错题属于个人学习数据，比知识库更私密。
+
+
+class MistakeNotebookRow(Base):
+    """错题本条目（每条 = 一个待掌握的知识点实例 + Leitner 复习调度元数据）。"""
+
+    __tablename__ = "mistake_notebook"
+    __table_args__ = (
+        # 学生查自己的错题（最高频）：租户 + 用户 + 状态
+        Index("ix_mistake_tenant_user_status", "tenant_id", "user_id", "status"),
+        # 到期待复习扫描（定时/打开错题本时）：按 next_review_at
+        Index("ix_mistake_next_review", "next_review_at"),
+        # 教研侧按知识点聚合卡点：租户 + 概念标签
+        Index("ix_mistake_tenant_concept", "tenant_id", "concept_tag"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    user_id: Mapped[str] = mapped_column(String(64), default="")
+    course_id: Mapped[str] = mapped_column(String(64), default="")
+    concept_tag: Mapped[str] = mapped_column(String(200), default="")
+
+    # passive_converge（引导自测失败被动归档）| active_manual（手动收藏）| exam_failed
+    source_type: Mapped[str] = mapped_column(String(30), default="passive_converge")
+    session_id: Mapped[str] = mapped_column(String(64), default="")
+    trace_id: Mapped[str] = mapped_column(String(64), default="")
+
+    question_context: Mapped[str] = mapped_column(Text, default="")   # 题目 / 当时的上下文
+    reference_answer: Mapped[str] = mapped_column(Text, default="")    # 判分依据（复习时按它判）
+    options_json: Mapped[str] = mapped_column(Text, default="")        # 客观题选项（判分用）
+    misconception: Mapped[str] = mapped_column(Text, default="")       # 诊断出的误区
+
+    leitner_box: Mapped[int] = mapped_column(Integer, default=1)        # 1..5
+    mastery_score: Mapped[int] = mapped_column(Integer, default=0)      # 0..100
+    review_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_reviewed_at: Mapped[int] = mapped_column(BigInteger, default=0)
+    next_review_at: Mapped[int] = mapped_column(BigInteger, default=0)
+
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)  # active|mastered|archived
 
     created_at: Mapped[int] = mapped_column(BigInteger, index=True)
     updated_at: Mapped[int] = mapped_column(BigInteger, default=0)

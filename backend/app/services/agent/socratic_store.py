@@ -69,7 +69,8 @@ async def load_state(session_id: str) -> dict[str, Any] | None:
             row = await session.get(SocraticSessionRow, session_id)
         return _row_to_state(row) if row else None
     stored = _mem.get(session_id)
-    if stored is None:
+    if stored is None or "phase" not in stored:
+        # 可能只有 pending_quiz（尚未流转过状态机）——按"无状态"处理
         return None
     return {
         "phase": stored["phase"], "hint_level": stored["hint_level"],
@@ -156,6 +157,60 @@ async def save_state(
             existing[key] = fsm.get(key)
         existing["history"] = list(fsm.get("history") or [])
     _mem[session_id]["updated_at"] = now
+
+
+# ------------------------------------------------------- 挂起自测题 ----
+# CONVERGING 出题后，题目要"挂起"等待学生作答；下一轮收到作答才能判分。
+# 这一步必须落库：多副本下若只放在内存，学生下一轮被负载均衡到别的副本，
+# 就会"找不到题 → 判分不了 → 状态机永远卡在 CONVERGING"。
+async def set_pending_quiz(session_id: str, quiz: dict | None) -> None:
+    """挂起 / 清除当前待作答的自测题（`None` = 清除）。"""
+    if not session_id:
+        return
+    payload = json.dumps(quiz, ensure_ascii=False) if quiz else ""
+    now = _now_ms()
+    session = await repo.db_session()
+    if session is not None:
+        from app.db.pg_models import SocraticSessionRow
+
+        try:
+            async with session:
+                row = await session.get(SocraticSessionRow, session_id)
+                if row is None:
+                    row = SocraticSessionRow(session_id=session_id, created_at=now)
+                    session.add(row)
+                row.pending_quiz_json = payload
+                row.updated_at = now
+                await session.commit()
+            return
+        except Exception as exc:  # noqa: BLE001 - 挂起题写入失败不得拖垮本轮回合
+            _logger.warning("挂起自测题写入失败: %s", exc)
+            return
+    entry = _mem.setdefault(session_id, {})
+    entry["pending_quiz"] = quiz
+    entry["updated_at"] = now
+
+
+async def get_pending_quiz(session_id: str) -> dict | None:
+    """读取挂起的自测题；没有则返回 None。"""
+    if not session_id:
+        return None
+    session = await repo.db_session()
+    if session is not None:
+        from app.db.pg_models import SocraticSessionRow
+
+        async with session:
+            row = await session.get(SocraticSessionRow, session_id)
+        raw = (getattr(row, "pending_quiz_json", "") or "") if row else ""
+        if not raw.strip():
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
+    quiz = (_mem.get(session_id) or {}).get("pending_quiz")
+    return quiz if isinstance(quiz, dict) else None
 
 
 async def delete_state(session_id: str) -> None:

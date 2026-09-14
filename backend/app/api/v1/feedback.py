@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from app.api.v1.auth import AuthUser, current_user_optional
 from app.core.tenancy import resolve_tenant
+from app.services.notebook import store as notebook_store
 from app.services.ops import store
 
 router = APIRouter()
@@ -109,3 +110,25 @@ async def export_badcases(
             headers={"Content-Disposition": "attachment; filename=badcases.csv"},
         )
     return {"tenant_id": tenant, "window_days": days, "count": len(rows), "items": rows}
+
+
+@router.get("/ops/concepts/struggles")
+async def concept_struggles(
+    limit: int = 50,
+    user: AuthUser = Depends(current_user_optional),
+):
+    """租户级高频卡点聚合：按知识点统计错题数 / 平均掌握度 / 被动挂科率。
+
+    权限与 `/ops/badcases` 完全一致（登录 + `role=tenant_admin`），
+    且 `tenant_id` **只来自服务端解析**——教研看不到别的机构的盲区分布。
+    数据源是同租户学生的错题本（`mistake_notebook`），不跨租户。
+    """
+    if user.anonymous:
+        raise HTTPException(status_code=401, detail="请先登录")
+    if (user.role or "member") != "tenant_admin":
+        raise HTTPException(status_code=403, detail="仅租户管理员可查看本租户卡点分布")
+
+    tenant = resolve_tenant(user)
+    limit = max(1, min(200, limit))
+    rows = await notebook_store.tenant_struggles(tenant, limit=limit)
+    return {"tenant_id": tenant, "count": len(rows), "items": rows}
