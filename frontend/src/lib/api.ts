@@ -18,6 +18,8 @@ export interface StreamHandlers {
   onCard?: (card: PolymorphicMessage) => void;
   onDone?: () => void;
   onError?: (err: Error) => void;
+  /** 流中途的**服务端**错误事件（如模型上游不可用）：连接没断，但回答不完整 */
+  onStreamError?: (message: string) => void;
 }
 
 /** 结构化 API 错误：保留后端返回的 HTTP 状态、中文 detail 与 Retry-After。
@@ -180,6 +182,9 @@ function dispatch(event: string, payload: unknown, h: StreamHandlers): void {
       break;
     case 'done':
       h.onDone?.();
+      break;
+    case 'error':
+      h.onStreamError?.(p.message as string);
       break;
   }
 }

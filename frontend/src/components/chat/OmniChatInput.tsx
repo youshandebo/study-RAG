@@ -19,7 +19,8 @@ import ContextMeter from './ContextMeter';
 
 /** 柔性提示卡片（限流/额度）：显示在输入框下方，不打断、不弹 Toast */
 interface SoftNotice {
-  kind: 'rate' | 'quota';
+  /** rate=限流 429 / quota=额度 402 / upstream=模型上游不可用（流中途的服务端错误事件） */
+  kind: 'rate' | 'quota' | 'upstream';
   message: string;
   /** 限流时的倒计时秒数（来自后端 Retry-After），到 0 自动清除 */
   countdown?: number;
@@ -118,6 +119,15 @@ export default function OmniChatInput() {
     }, 1000);
     return () => window.clearInterval(timer);
   }, [softNotice?.countdown]);
+
+  // 柔性提示的配色与标题：额度用紫；限流与上游故障同属"稍后再试"，用琥珀
+  const noticeTone = softNotice?.kind === 'quota' ? 'violet' : 'amber';
+  const noticeTitle =
+    softNotice?.kind === 'quota'
+      ? '额度已用完'
+      : softNotice?.kind === 'upstream'
+        ? '模型服务不稳定'
+        : '提问过快，休息一下';
 
   const readImage = useCallback((file: File) => {
     const reader = new FileReader();
@@ -284,6 +294,10 @@ export default function OmniChatInput() {
           );
         },
         onDone: () => setStreamingId(null),
+        onStreamError: (message) =>
+          // 流中途的服务端错误：连接还在、但回答不完整——用柔性提示说明，
+          // 不往气泡里编内容（服务端同样不再补演示文案）
+          setSoftNotice({ kind: 'upstream', message }),
         onError: (err) => {
           const store = useSessionStore.getState();
           if (err instanceof ApiError && (err.isRateLimit || err.isQuotaExceeded)) {
@@ -604,7 +618,7 @@ export default function OmniChatInput() {
               role="status"
               aria-live="polite"
               className={`mt-2 flex animate-rise items-start gap-2.5 rounded-lg border px-3.5 py-2.5 ${
-                softNotice.kind === 'rate'
+                noticeTone === 'amber'
                   ? 'border-amber-500/30 bg-amber-500/5'
                   : 'border-violet-500/30 bg-violet-500/5'
               }`}
@@ -612,12 +626,12 @@ export default function OmniChatInput() {
               <Gauge
                 size={15}
                 strokeWidth={1.5}
-                className={`mt-0.5 shrink-0 ${softNotice.kind === 'rate' ? 'text-amber-600' : 'text-violet-600'}`}
+                className={`mt-0.5 shrink-0 ${noticeTone === 'amber' ? 'text-amber-600' : 'text-violet-600'}`}
                 aria-hidden
               />
               <div className="min-w-0 flex-1">
-                <div className={`text-[12.5px] font-medium ${softNotice.kind === 'rate' ? 'text-amber-700' : 'text-violet-700'}`}>
-                  {softNotice.kind === 'rate' ? '提问过快，休息一下' : '额度已用完'}
+                <div className={`text-[12.5px] font-medium ${noticeTone === 'amber' ? 'text-amber-700' : 'text-violet-700'}`}>
+                  {noticeTitle}
                 </div>
                 <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-soft">{softNotice.message}</div>
                 {softNotice.countdown != null && softNotice.countdown > 0 && (

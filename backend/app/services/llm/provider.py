@@ -10,12 +10,26 @@ from __future__ import annotations
 
 import abc
 import json
+import os
 from typing import AsyncIterator
 
 import httpx
 
 from app.core.config import Settings, get_settings
 from app.core.security import assert_safe_url
+
+
+def request_timeout_s() -> float:
+    """单次 LLM 请求超时。
+
+    默认 120s 是为了容忍长回答的首包延迟；有了断路器之后，配更短的超时
+    （如 20s）反而更好——故障被更快地判定为"失败"，断路器更早跳闸，
+    用户不必陪着等满一次超时。
+    """
+    try:
+        return max(1.0, float(os.getenv("LLM_REQUEST_TIMEOUT_S", "120") or 120))
+    except ValueError:
+        return 120.0
 
 
 class BaseLLMProvider(abc.ABC):
@@ -63,7 +77,7 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         payload_messages = ([{"role": "system", "content": system}] if system else []) + messages
         payload = {"model": self._model, "messages": payload_messages, "stream": True}
         headers = {"Authorization": f"Bearer {self._api_key}"}
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=request_timeout_s()) as client:
             async with client.stream(
                 "POST", f"{self._base_url}/chat/completions", json=payload, headers=headers
             ) as resp:
@@ -101,7 +115,7 @@ class AnthropicProvider(BaseLLMProvider):
         if system:
             payload["system"] = system
         headers = {"x-api-key": self._api_key, "anthropic-version": "2023-06-01"}
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=request_timeout_s()) as client:
             async with client.stream(
                 "POST", f"{self._base_url}/v1/messages", json=payload, headers=headers
             ) as resp:
@@ -166,6 +180,40 @@ def available_model_keys(settings: Settings | None = None) -> list[str]:
     return list(_build_from_settings(settings).keys())
 
 
+def _resilient(label: str, primary: BaseLLMProvider, skip_keys: set[str] | None = None) -> BaseLLMProvider:
+    """给主通道套一层候选降级 + 每候选独立熔断。
+
+    候选来自**其他已配置的真实供应商**（gpt → deepseek → qwen → claude）。
+    同一端点同一凭证的通道不参与——它们是同一个故障域，降级过去只会一起挂。
+    只有一家供应商时不包这一层（退无可退，包了纯属徒增调用栈）。
+
+    刻意**不把 Mock 演示引擎纳入候选**：它会编造答案，比报错危险得多。
+    """
+    if isinstance(primary, MockProvider):
+        return primary
+    from app.core.circuit import ResilientLLMProvider, build, fallback_enabled
+
+    if not fallback_enabled():
+        return primary
+    settings = get_settings()
+    real = _build_from_settings(settings)
+    primary_url = str(getattr(primary, "_base_url", "") or "")
+    primary_key = str(getattr(primary, "_api_key", "") or "")
+    candidates = [build(label, primary)]
+    for key in ("gpt", "deepseek", "qwen", "claude"):
+        if (skip_keys and key in skip_keys) or key not in real:
+            continue
+        other = real[key]
+        if str(getattr(other, "_base_url", "") or "") == primary_url and str(
+            getattr(other, "_api_key", "") or ""
+        ) == primary_key:
+            continue
+        candidates.append(build(f"fallback:{key}", other))
+    if len(candidates) == 1:
+        return primary
+    return ResilientLLMProvider(candidates)
+
+
 def get_tier_provider(model_name: str | None) -> BaseLLMProvider:
     """会员档位模型：主通道凭证 + 档位指定模型名；无主通道回落演示引擎。"""
     from app.core import runtime_config
@@ -175,8 +223,10 @@ def get_tier_provider(model_name: str | None) -> BaseLLMProvider:
         return MockProvider()
     model = (model_name or "").strip() or main["model"]
     if main.get("provider") == "anthropic":
-        return AnthropicProvider(main["api_key"], main["base_url"], model)
-    return OpenAICompatibleProvider(f"tier-{model}", main["api_key"], main["base_url"], model)
+        primary = AnthropicProvider(main["api_key"], main["base_url"], model)
+    else:
+        primary = OpenAICompatibleProvider(f"tier-{model}", main["api_key"], main["base_url"], model)
+    return _resilient(f"main:{model}", primary)
 
 
 def get_provider(model_key: str | None = None) -> BaseLLMProvider:
@@ -190,5 +240,8 @@ def get_provider(model_key: str | None = None) -> BaseLLMProvider:
     if not _PROVIDER_CACHE:
         _PROVIDER_CACHE.update(real)
     if model_key and model_key in real:
-        return real[model_key]
-    return _PROVIDER_CACHE.get("main") or MockProvider()
+        return _resilient(str(model_key), real[model_key], skip_keys={str(model_key)})
+    primary = _PROVIDER_CACHE.get("main")
+    if primary is None:
+        return MockProvider()
+    return _resilient("main", primary, skip_keys={"main"})

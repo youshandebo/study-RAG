@@ -23,6 +23,7 @@ from fastapi.responses import StreamingResponse
 import app.db.relational as repo
 from app.api.v1.auth import AuthUser, current_user_optional
 from app.core.billing import DailyCapExceeded, account_key, get_ledger
+from app.core.circuit import LLMUnavailable
 from app.core.membership import daily_cap_for, plan_for
 from app.core.security import SlidingWindowLimiter
 from app.core.tenancy import DEFAULT_TENANT, multi_tenant_enabled, resolve_tenant
@@ -48,7 +49,6 @@ from app.services.rag import packer
 from app.services.rag.chunker import Chunk
 from app.services.rag.retriever import get_retriever
 from app.services.llm.mock_engine import (
-    SOLVE_MARKDOWN,
     SOLVE_PITFALLS,
     SOLVE_STEPS,
 )
@@ -444,10 +444,15 @@ async def _stream_body(
                     break
                 full += piece
                 yield _sse("delta", {"text": piece})
-        except Exception:
-            fallback = SOLVE_MARKDOWN[len(full) :]
-            full += fallback
-            yield _sse("delta", {"text": fallback})
+        except LLMUnavailable as exc:
+            # 不再用演示文案补尾：模型挂了就如实告知。
+            # 旧行为会把硬编码的 SOLVE_MARKDOWN 当成答案吐给用户——
+            # 用户以为拿到了正解，平台还按正常产出计费，两头都不诚实。
+            _logger.error("solve 生成不可用，停止本次回答: %s", exc)
+            yield _sse("error", {"message": "模型服务暂时不可用，本次回答未完整生成"})
+        except Exception as exc:  # noqa: BLE001 - 流式生成异常类型不可枚举
+            _logger.exception("solve 生成异常: %s", exc)
+            yield _sse("error", {"message": "生成过程出错，本次回答未完整生成"})
         u_out = full
 
         pitfalls = extract_from_chunks(chunks)[:3] or SOLVE_PITFALLS
@@ -554,8 +559,12 @@ async def _stream_body(
                     break
                 full += piece
                 yield _sse("delta", {"text": piece})
-        except Exception:
-            pass
+        except LLMUnavailable as exc:
+            _logger.error("general 生成不可用: %s", exc)
+            yield _sse("error", {"message": "模型服务暂时不可用，本次回答未完整生成"})
+        except Exception as exc:  # noqa: BLE001 - 同上
+            _logger.exception("general 生成异常: %s", exc)
+            yield _sse("error", {"message": "生成过程出错，本次回答未完整生成"})
         u_out = full
         assistant.type = MessageType.general_text
         assistant.content = full

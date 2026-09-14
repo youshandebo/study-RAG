@@ -95,4 +95,5 @@ export type StreamEvent =
   | { event: 'track_delta'; data: { index: number; model_name: string; text: string } }
   | { event: 'track_done'; data: { index: number; model_name: string } }
   | { event: 'card'; data: PolymorphicMessage }
+  | { event: 'error'; data: { message: string } }
   | { event: 'done'; data: Record<string, never> };
