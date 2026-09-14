@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 
 import app.db.relational as repo
 from app.api.v1.auth import AuthUser, current_user_optional
+from app.core.gate import DEFAULT_ACQUIRE_TIMEOUT_S, DEFAULT_LEASE_TTL_S, DistributedGate, GateTimeout
 from app.core.membership import plan_for, storage_limit_bytes
 from app.core.tenancy import resolve_tenant
 from app.db.minio_client import put_object
@@ -133,11 +134,18 @@ async def ingest(
     - text   直接提交文字素材（text_content 表单字段，或 .txt/.md 文件）→ 切片入库
     """
     raw = await file.read() if file is not None else b""
-    # ---- 部署档位保命锁：入库全局互斥 ----
-    # 解析 PDF/长录音极耗 CPU。eco 档 Semaphore(1)：有任务在切片向量化时新上传
-    # 排队挂起，禁止并发解压与批量 Embedding，保证主聊天 API 始终拿得到 CPU 时间片。
+    # ---- 部署档位保命锁：入库并发闸门 ----
+    # 解析 PDF/长录音极耗 CPU。eco 档容量 1：有任务在切片向量化时新上传排队，
+    # 禁止并发解压与批量 Embedding，保证主聊天 API 始终拿得到 CPU 时间片。
     # 配额/鉴权等轻量校验在锁外完成，重活（压缩 → ASR/VLM → 切片 → 向量化）入锁。
-    await _ingest_gate().acquire()
+    #
+    # 闸门必须是**跨副本**的：进程内信号量在 N 个 K8s 副本下会放大成 N× 并发，
+    # 档位上限等于失效。Redis 租约版见 core/gate.py（未配 Redis 时自动回落进程内）。
+    gate = _ingest_gate()
+    try:
+        lease = await gate.acquire(timeout_s=DEFAULT_ACQUIRE_TIMEOUT_S)
+    except GateTimeout:
+        raise HTTPException(status_code=503, detail="入库任务排队超时，请稍后重试")
     try:
         return await _ingest_locked(
             user=user, session_id=session_id, media_type=media_type, file=file,
@@ -145,24 +153,28 @@ async def ingest(
             course_id=course_id, chapter=chapter, raw=raw,
         )
     finally:
-        _ingest_gate().release()
+        await gate.release(lease)
 
 
-_ingest_semaphore: asyncio.Semaphore | None = None
+_INGEST_GATE: DistributedGate | None = None
 
 
-def _ingest_gate() -> asyncio.Semaphore:
-    """按部署档位惰性创建入库信号量（容量 = max_concurrent_ingest）。
+def _ingest_gate() -> DistributedGate:
+    """按部署档位惰性创建入库闸门（容量 = max_concurrent_ingest）。
 
-    档位热切换后新容量在进程重启或事件循环轮换后生效——信号量容量
-    创建即固定，热调整需重建，此处取实现简单与运行时安全的折中。
+    容量在首次调用时定型：多副本共享的名额数必须稳定，运行中改会让已经在
+    跑的任务和新任务用不同口径计数。改档位请重启（与 profiles 的其余保命锁一致）。
     """
-    global _ingest_semaphore
-    if _ingest_semaphore is None:
+    global _INGEST_GATE
+    if _INGEST_GATE is None:
         from app.core import profiles
 
-        _ingest_semaphore = asyncio.Semaphore(int(profiles.effective()["max_concurrent_ingest"]))
-    return _ingest_semaphore
+        _INGEST_GATE = DistributedGate(
+            "ingest",
+            int(profiles.effective()["max_concurrent_ingest"]),
+            lease_ttl_s=DEFAULT_LEASE_TTL_S,
+        )
+    return _INGEST_GATE
 
 
 async def _ingest_locked(

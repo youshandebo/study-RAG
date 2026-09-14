@@ -10,8 +10,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.api.v1.auth import AuthUser, current_user_optional
-from app.core.billing import account_key, get_ledger
+from app.core.billing import DailyCapExceeded, account_key, get_ledger
+from app.core.membership import daily_cap_for, plan_for
 from app.core.security import SlidingWindowLimiter
+from app.core.tenancy import multi_tenant_enabled, resolve_tenant
 from app.services.llm.dispatch import TrackDispatcher
 from app.services.tokens import estimate_tokens
 
@@ -62,14 +64,26 @@ async def compare_stream(
 
     # 预冻结：units 条轨道 = units 倍成本，冻结额度同倍——多倍成本在
     # 冻结阶段就如实反映，不会到结算时才暴露"收不抵支"。
+    # 日消耗硬熔断同在这一步生效：N 条轨道会一次性占掉 N×Hold 的日配额，
+    # 比对是最高倍的烧钱入口，不能等到结算才记账。
     ledger = get_ledger()
     account = account_key(None if user.anonymous else user.id, ip)
-    hold = ledger.reserve(
-        account,
-        TRACK_HOLD_AMOUNT,
-        request_id=req.request_id or "",
-        units=units,
-    )
+    try:
+        hold = ledger.reserve(
+            account,
+            TRACK_HOLD_AMOUNT,
+            request_id=req.request_id or "",
+            units=units,
+            daily_cap=daily_cap_for(user.tier),
+            daily_bucket=resolve_tenant(user) if multi_tenant_enabled() else "",
+        )
+    except DailyCapExceeded as exc:
+        label = plan_for(user.tier).get("label") or user.tier
+        raise HTTPException(
+            status_code=429,
+            detail=f"今日额度已用尽（{label} 上限 {exc.cap}），将于次日 00:00 重置",
+            headers={"Retry-After": str(exc.retry_after_s)},
+        )
     if hold is None:
         raise HTTPException(status_code=402, detail="额度不足，无法发起多模型比对")
 

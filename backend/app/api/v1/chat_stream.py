@@ -22,10 +22,10 @@ from fastapi.responses import StreamingResponse
 
 import app.db.relational as repo
 from app.api.v1.auth import AuthUser, current_user_optional
-from app.core.billing import account_key, get_ledger
-from app.core.membership import plan_for
+from app.core.billing import DailyCapExceeded, account_key, get_ledger
+from app.core.membership import daily_cap_for, plan_for
 from app.core.security import SlidingWindowLimiter
-from app.core.tenancy import DEFAULT_TENANT, resolve_tenant
+from app.core.tenancy import DEFAULT_TENANT, multi_tenant_enabled, resolve_tenant
 from app.services.llm.provider import get_tier_provider
 from app.models.domain import (
     ChatRequest,
@@ -274,16 +274,35 @@ async def chat_stream(req: ChatRequest, request: Request, user: AuthUser = Depen
             headers={"Retry-After": str(retry)},
         )
 
+    # 租户：由服务端从签名 JWT + 用户记录解析，客户端不可指定（见 core/tenancy.py）
+    tenant = resolve_tenant(user)
+
     # 额度预冻结：先占用上限，再在流结束时按实际产出结算/退回。
     # 冻结失败（余额不足）直接 402，不进入生成——避免"先干活后收不到钱"。
+    #
+    # 日消耗硬熔断与冻结**同属一次原子动作**：脚本就算并发开成百上千条 SSE，
+    # 也只能在 ceil(cap / 单次冻结) 条之后被挡住。若在冻结之后再数一笔，
+    # 攻击者可以靠"同时在途"把检查架空——这也是不单独加一步"预检查"的原因。
     ledger = get_ledger()
     account = account_key(None if user.anonymous else user.id, ip)
-    hold = ledger.reserve(
-        account,
-        ASK_HOLD_AMOUNT,
-        request_id=req.request_id or "",
-        units=1,
-    )
+    try:
+        hold = ledger.reserve(
+            account,
+            ASK_HOLD_AMOUNT,
+            request_id=req.request_id or "",
+            units=1,
+            daily_cap=daily_cap_for(user.tier),
+            # 多租户模式下按机构共用一份日预算；单租户必须按账户，
+            # 否则所有用户会共享同一份配额、互相挤占。
+            daily_bucket=tenant if multi_tenant_enabled() else "",
+        )
+    except DailyCapExceeded as exc:
+        label = plan_for(user.tier).get("label") or user.tier
+        raise HTTPException(
+            status_code=429,
+            detail=f"今日额度已用尽（{label} 上限 {exc.cap}），将于次日 00:00 重置",
+            headers={"Retry-After": str(exc.retry_after_s)},
+        )
     if hold is None:
         raise HTTPException(
             status_code=402,
@@ -292,8 +311,6 @@ async def chat_stream(req: ChatRequest, request: Request, user: AuthUser = Depen
 
     # 档位模型：plan.model 非空时用主通道凭证换档位模型名（服务端注入，客户端不可选）
     tier_model = str(plan_for(user.tier).get("model") or "")
-    # 租户：由服务端从签名 JWT + 用户记录解析，客户端不可指定（见 core/tenancy.py）
-    tenant = resolve_tenant(user)
     return StreamingResponse(
         _stream(req, tier_model, request, hold=hold, tenant=tenant),
         media_type="text/event-stream",
