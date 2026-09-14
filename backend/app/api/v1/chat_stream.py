@@ -842,5 +842,7 @@ async def socratic_reply(
             context = ""
     payload = await SocraticTutor().start_or_advance(
         session_id, reply, topic=topic or reply, context=context, history=history,
+        tenant_id=resolve_tenant(user),
+        user_id="" if user.anonymous else (user.id or ""),
     )
     return payload

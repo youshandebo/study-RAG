@@ -4,7 +4,8 @@
 
 - 使用 Postgres 需安装驱动：pip install asyncpg "sqlalchemy[asyncio]>=2.0"
 - 表结构首次连接自动 create_all；Postgres 故障自动熔断降级内存（记 ERROR 日志）
-- tutor_state 属瞬态伴学状态，保持内存实现
+- 苏格拉底 FSM 状态见 `services/agent/socratic_store.py`（不再复用本模块的
+  `tutor_state` 进程内字典——阶段必须跨副本一致，放内存会导致负载均衡下漂移）
 """
 from __future__ import annotations
 
@@ -537,15 +538,3 @@ async def storage_used_bytes(owner: str) -> int:
             ).scalar()
         return int(total or 0)
     return sum(int(a.get("size_bytes") or 0) for v in _memory_assets.values() for a in v if a.get("owner") == owner)
-
-
-# ------------------------------------------------------------- tutor state --
-_tutor_state: dict[str, dict[str, Any]] = {}
-
-
-async def get_tutor_state(session_id: str) -> dict[str, Any]:
-    return _tutor_state.get(session_id, {"step_index": -1, "finished": False, "history": []})
-
-
-async def save_tutor_state(session_id: str, state: dict[str, Any]) -> None:
-    _tutor_state[session_id] = state

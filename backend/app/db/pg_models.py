@@ -145,3 +145,36 @@ class FeedbackRow(Base):
     note: Mapped[str] = mapped_column(Text, default="")
     source: Mapped[str] = mapped_column(String(20), default="")    # explicit | implicit
     created_at: Mapped[int] = mapped_column(BigInteger, index=True)
+
+
+# ------------------------------------------------------- 苏格拉底状态机 ----
+# P2-A：把"当前处于哪个引导阶段 / 脚手架升到第几级 / 能否揭晓答案"
+# 变成**可持久化**的一等状态。此前 tutor 状态只存在进程内字典里，
+# 多副本部署下"每个副本各记一份"，学生的引导进度会随负载均衡漂移。
+# 这张表让阶段流转变成跨请求、跨副本一致的权威状态。
+
+
+class SocraticSessionRow(Base):
+    """苏格拉底引导会话的 FSM 状态（每会话一行）。"""
+
+    __tablename__ = "socratic_sessions"
+
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True, default="public")
+    user_id: Mapped[str] = mapped_column(String(64), index=True, default="")
+    course_id: Mapped[str] = mapped_column(String(64), default="")
+    concept_tag: Mapped[str] = mapped_column(String(200), default="")
+
+    phase: Mapped[str] = mapped_column(String(20), default="diagnosing", index=True)
+    hint_level: Mapped[int] = mapped_column(Integer, default=0)
+    turns_in_phase: Mapped[int] = mapped_column(Integer, default=0)
+    stuck_count: Mapped[int] = mapped_column(Integer, default=0)      # 最高级下仍卡住的次数
+    escape_attempts: Mapped[int] = mapped_column(Integer, default=0)  # 越狱尝试次数（可观测）
+    question_count: Mapped[int] = mapped_column(Integer, default=0)
+    converge_failed: Mapped[int] = mapped_column(Integer, default=0)  # 1 = 自测失败过（错题信号）
+    guard_blocked: Mapped[int] = mapped_column(Integer, default=0)
+    last_signal: Mapped[str] = mapped_column(String(20), default="none")
+    history_json: Mapped[str] = mapped_column(Text, default="[]")
+
+    created_at: Mapped[int] = mapped_column(BigInteger, index=True)
+    updated_at: Mapped[int] = mapped_column(BigInteger, default=0)

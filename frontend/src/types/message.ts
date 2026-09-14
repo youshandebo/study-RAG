@@ -59,6 +59,14 @@ export interface PolymorphicMessage extends BaseMessage {
     totalSteps: number;
     guidingQuestion: string;
     hints: string[];
+    /** P2-A 显式状态机：阶段与提示阶梯。流转由服务端 FSM 决定，前端只做展示 */
+    phase?: string;
+    phaseLabel?: string;
+    hintLevel?: number;
+    maxHintLevel?: number;
+    revealed?: boolean;
+    guardBlocked?: boolean;
+    convergeFailed?: boolean;
   };
 
   /** 3. 针对易错点的自测题载荷 */

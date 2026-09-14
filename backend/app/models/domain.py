@@ -48,6 +48,15 @@ class SocraticPayload(BaseModel):
     total_steps: int
     guiding_question: str
     hints: list[str] = []
+    # P2-A 显式状态机载荷：阶段与提示阶梯对前端可见（可选，保持向后兼容）。
+    # 前端据此显隐"提示进度""已揭晓"等，但真正的流转由服务端 FSM 决定。
+    phase: str = ""
+    phase_label: str = ""
+    hint_level: int = 0
+    max_hint_level: int = 3
+    revealed: bool = False
+    guard_blocked: bool = False
+    converge_failed: bool = False
 
 
 class QuizPayload(BaseModel):

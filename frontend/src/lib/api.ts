@@ -128,6 +128,13 @@ export function normalizeCard(raw: Record<string, unknown>): PolymorphicMessage 
       totalSteps: Number(so.total_steps ?? 4),
       guidingQuestion: String(so.guiding_question ?? ''),
       hints: (so.hints as string[]) ?? [],
+      phase: String(so.phase ?? ''),
+      phaseLabel: String(so.phase_label ?? ''),
+      hintLevel: Number(so.hint_level ?? 0),
+      maxHintLevel: Number(so.max_hint_level ?? 3),
+      revealed: Boolean(so.revealed),
+      guardBlocked: Boolean(so.guard_blocked),
+      convergeFailed: Boolean(so.converge_failed),
     };
   }
   const qz = raw.quiz_payload as Record<string, unknown> | undefined | null;
