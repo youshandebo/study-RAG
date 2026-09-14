@@ -273,6 +273,30 @@ class BillingLedger:
             self._balances[account] = self._balances.get(account, 0) + amount
             return self._balances[account]
 
+    def debit(self, account: str, amount: int) -> int:
+        """直接扣减（管理后台人工调减 / 纠错用），夹紧到 0 不允许负余额。
+
+        与 `reserve/settle` 的区别：这条路径**没有冻结凭证**，是运营侧的
+        账务动作，不是一次消费。走同一套原子操作（Redis `DECRBY` / 进程内锁），
+        保证与并发的冻结-结算不会互相覆盖。
+        """
+        amount = max(0, int(amount))
+        if amount <= 0:
+            return self.balance(account)
+        if self._redis is not None:
+            try:
+                left = int(self._redis.decrby(self._rkey("bal", account), amount))
+                if left < 0:
+                    self._redis.incrby(self._rkey("bal", account), -left)  # 回补到 0
+                    return 0
+                return left
+            except Exception as exc:
+                _logger.warning("Redis 扣减失败，降级进程内: %s", exc)
+        with self._lock:
+            left = max(0, self._balances.get(account, 0) - amount)
+            self._balances[account] = left
+            return left
+
     # ---------------------------------------------------------- hold ----
     def reserve(
         self,

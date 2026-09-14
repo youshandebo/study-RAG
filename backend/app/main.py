@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api.v1 import admin, auth, chat_stream, compare, course, evidence, exam, ingest, sessions
+from app.api.v1 import admin, admin_ops, auth, chat_stream, compare, course, evidence, exam, feedback, ingest, sessions
 from app.core.config import get_settings
 from app.db.minio_client import BOARDS_DIR, ensure_static_dirs
 
@@ -51,6 +51,9 @@ app.include_router(admin.router, prefix=prefix, tags=["admin"])
 app.include_router(exam.router, prefix=prefix, tags=["exam"])
 app.include_router(course.router, prefix=prefix, tags=["course"])
 app.include_router(auth.router, prefix=prefix, tags=["auth"])
+# P1-C 运营后台：平台侧（租户/充值/FinOps/全量 bad-case）与租户侧（本租户导出）
+app.include_router(admin_ops.router, prefix=prefix, tags=["ops"])
+app.include_router(feedback.router, prefix=prefix, tags=["ops"])
 
 
 @app.get("/api/v1/health")

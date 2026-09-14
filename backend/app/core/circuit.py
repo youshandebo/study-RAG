@@ -213,6 +213,9 @@ class ResilientLLMProvider:
 
     def __init__(self, candidates: list[_Candidate]) -> None:
         self._candidates = candidates
+        # 实际服务的候选标签（首包产生时写入）。运营侧据此判断
+        # "这次回答是不是走了降级"——它会被写进用量事件与 bad-case。
+        self.last_served: str = ""
 
     @property
     def labels(self) -> list[str]:
@@ -228,7 +231,9 @@ class ResilientLLMProvider:
             started = False
             try:
                 async for piece in cand.provider.stream_chat(messages, system):
-                    started = True
+                    if not started:
+                        started = True
+                        self.last_served = cand.label
                     yield piece
                 cand.breaker.record_success()
                 return

@@ -46,13 +46,16 @@ class AuthUser:
 
     def __init__(self, user_id: str | None, email: str | None, tier: str | None,
                  anonymous: bool = False, is_admin: bool = False,
-                 tenant_id: str | None = None) -> None:
+                 tenant_id: str | None = None, role: str = "member") -> None:
         self.id = user_id
         self.email = email
         self.tier = tier or ("guest" if anonymous else "free")
         self.anonymous = anonymous
         self.is_admin = is_admin
         self.tenant_id = tenant_id
+        # member | tenant_admin（租户内运营权限）。平台超管由 is_admin 表达，
+        # 两者正交：租户管理员绝不等于平台超管。
+        self.role = role or "member"
 
     def to_public(self) -> dict:
         from app.core.tenancy import resolve_tenant
@@ -96,6 +99,8 @@ async def _resolve_user(payload: dict | None) -> AuthUser | None:
         # 租户以**数据库记录**为准，而非 token 里的值——token 可能签发自
         # 迁移之前，且 DB 是唯一可被运营即时变更的权威源
         tenant_id=user.get("tenant_id"),
+        # 角色同理：以 DB 记录为准，避免旧 token 里的过期角色继续生效
+        role=user.get("role") or "member",
     )
 
 

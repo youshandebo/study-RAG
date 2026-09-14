@@ -33,6 +33,7 @@ _memory_users: dict[str, dict[str, Any]] = {}
 # SQLite 与 Postgres 语法一致。
 _SCHEMA_PATCHES: tuple[tuple[str, str, str], ...] = (
     ("users", "tenant_id", "VARCHAR(64)"),
+    ("users", "role", "VARCHAR(20)"),
 )
 
 
@@ -140,6 +141,22 @@ async def _ensure_tables() -> bool:
 async def _pg_session():
     assert _sessionmaker is not None
     return _sessionmaker()
+
+
+def db_ready() -> bool:
+    """对外：存储引擎已就绪（驱动可用 + 驱动已建）。"""
+    return _db_ready()
+
+
+async def db_session():
+    """对外：取一个会话，并**确保表结构已建**。
+
+    运营台账等模块（services/ops）共用同一套引擎与建表逻辑，避免第二套
+    连接方式导致"表在 A 路径建了、B 路径查不到"的漂移。
+    """
+    if not (_db_ready() and await _ensure_tables()):
+        return None
+    return await _pg_session()
 
 
 # ---------------------------------------------------------------- sessions --
@@ -363,6 +380,7 @@ async def create_user(
         "tier": tier,
         "created_at": int(time.time() * 1000),
         "tenant_id": tenant_id or None,
+        "role": "member",
     }
     if _db_ready() and await _ensure_tables():
         from app.db.pg_models import UserRow
@@ -406,7 +424,8 @@ async def get_user_by_id(user_id: str) -> dict[str, Any] | None:
             return None
         return {"id": row.id, "email": row.email, "tier": row.tier,
                 "created_at": row.created_at,
-                "tenant_id": getattr(row, "tenant_id", None)}
+                "tenant_id": getattr(row, "tenant_id", None),
+                "role": getattr(row, "role", None) or "member"}
     u = _memory_users.get(user_id)
     return {k: v for k, v in u.items() if k != "password_hash"} if u else None
 
@@ -433,7 +452,8 @@ async def list_users() -> list[dict[str, Any]]:
             rows = (await s.execute(select(UserRow).order_by(UserRow.created_at.desc()))).scalars().all()
         return [
             {"id": r.id, "email": r.email, "tier": r.tier, "created_at": r.created_at,
-             "tenant_id": getattr(r, "tenant_id", None)}
+             "tenant_id": getattr(r, "tenant_id", None),
+             "role": getattr(r, "role", None) or "member"}
             for r in rows
         ]
     return [
@@ -477,6 +497,29 @@ async def set_user_tenant(user_id: str, tenant_id: str | None) -> bool:
         return bool(result.rowcount)
     if user_id in _memory_users:
         _memory_users[user_id]["tenant_id"] = tenant_id or None
+        return True
+    return False
+
+
+async def set_user_role(user_id: str, role: str) -> bool:
+    """设置用户角色（member / tenant_admin）。
+
+    平台超管不走这张表——它用管理口令换 admin JWT（见 api/v1/admin.py）。
+    此处只授予"能不能导出本租户 bad-case"这类租户内权限。
+    """
+    allowed = {"member", "tenant_admin"}
+    role = role if role in allowed else "member"
+    if _db_ready() and await _ensure_tables():
+        from sqlalchemy import update
+
+        from app.db.pg_models import UserRow
+
+        async with await _pg_session() as s:
+            result = await s.execute(update(UserRow).where(UserRow.id == user_id).values(role=role))
+            await s.commit()
+        return bool(result.rowcount)
+    if user_id in _memory_users:
+        _memory_users[user_id]["role"] = role
         return True
     return False
 

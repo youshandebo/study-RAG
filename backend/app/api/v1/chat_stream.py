@@ -48,6 +48,7 @@ from app.services.extractor.pitfall import extract_from_chunks
 from app.services.rag import packer
 from app.services.rag.chunker import Chunk
 from app.services.rag.retriever import get_retriever
+from app.services.ops import store
 from app.services.llm.mock_engine import (
     SOLVE_PITFALLS,
     SOLVE_STEPS,
@@ -255,6 +256,66 @@ async def _build_usage(session_id: str, system_text: str, retrieval_text: str, o
     )
 
 
+async def _record_usage(
+    *,
+    tenant: str,
+    user_id: str,
+    session_id: str,
+    message_id: str,
+    provider_label: str,
+    model: str,
+    usage,
+) -> None:
+    """用量事件落库（FinOps 数据源）。
+
+    失败只记日志：运营侧写入绝不能反过来拖垮问答主链路——
+    宁可少一条统计，也不能让一次成功的回答因为记账失败而报错。
+    """
+    try:
+        await store.record_usage(
+            tenant_id=tenant, user_id=user_id or "", session_id=session_id,
+            message_id=message_id, provider=provider_label or "main", model=model or "",
+            prompt_tokens=int(getattr(usage, "input", 0) or 0),
+            completion_tokens=int(getattr(usage, "output", 0) or 0),
+            degraded=bool(provider_label.startswith("fallback:")),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("用量事件落库失败（不影响本次回答）: %s", exc)
+
+
+async def _record_defect(
+    *,
+    tenant: str,
+    session_id: str,
+    message_id: str,
+    query: str,
+    refs=None,
+    model: str = "",
+    degraded: bool = False,
+    error_code: str = "",
+) -> None:
+    """隐式 bad-case 登记：熔断（`LLMUnavailable`）/ 生成异常 / 检索零召回。
+
+    显式点踩走 `POST /api/v1/feedback`；这类"系统自己知道出问题了"的场景
+    不需要用户操作，服务端直接入账，否则绝大多数故障根本不会被上报。
+    """
+    try:
+        retrieved = [
+            {
+                "chunk_id": str(getattr(r, "chunk_id", "") or getattr(r, "id", "") or ""),
+                "score": float(getattr(r, "score", 0) or 0),
+            }
+            for r in (refs or [])
+        ][:10]
+        await store.record_feedback(
+            tenant_id=tenant, session_id=session_id, message_id=message_id,
+            trace_id=message_id, query=query, retrieved=retrieved, model=model,
+            degraded=degraded, error_code=error_code, source="implicit",
+        )
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("bad-case 登记失败（不影响本次回答）: %s", exc)
+
+
 @router.post("/chat/stream")
 async def chat_stream(req: ChatRequest, request: Request, user: AuthUser = Depends(current_user_optional)) -> StreamingResponse:
     ip = request.client.host if request.client else "unknown"
@@ -285,13 +346,27 @@ async def chat_stream(req: ChatRequest, request: Request, user: AuthUser = Depen
     # 攻击者可以靠"同时在途"把检查架空——这也是不单独加一步"预检查"的原因。
     ledger = get_ledger()
     account = account_key(None if user.anonymous else user.id, ip)
+    cap = daily_cap_for(user.tier)
+    if multi_tenant_enabled():
+        # 多租户下成员消费的是**机构**那本账——运营后台充值到租户账户
+        # （`POST /admin/ops/tenants/{id}/topup`），成员从这里出账。
+        # 同时生效的是租户级冻结与日上限覆盖：机构欠费/超支时不必逐个封号。
+        ctx = await store.tenant_billing_context(tenant)
+        if ctx.get("frozen"):
+            raise HTTPException(status_code=403, detail="该机构账户已冻结，请联系机构管理员")
+        account = store.tenant_account_key(tenant)
+        override = ctx.get("daily_cap_override")
+        if override is not None:
+            cap = int(override)
+        elif ctx.get("tier_override"):
+            cap = daily_cap_for(ctx["tier_override"])
     try:
         hold = ledger.reserve(
             account,
             ASK_HOLD_AMOUNT,
             request_id=req.request_id or "",
             units=1,
-            daily_cap=daily_cap_for(user.tier),
+            daily_cap=cap,
             # 多租户模式下按机构共用一份日预算；单租户必须按账户，
             # 否则所有用户会共享同一份配额、互相挤占。
             daily_bucket=tenant if multi_tenant_enabled() else "",
@@ -312,7 +387,8 @@ async def chat_stream(req: ChatRequest, request: Request, user: AuthUser = Depen
     # 档位模型：plan.model 非空时用主通道凭证换档位模型名（服务端注入，客户端不可选）
     tier_model = str(plan_for(user.tier).get("model") or "")
     return StreamingResponse(
-        _stream(req, tier_model, request, hold=hold, tenant=tenant),
+        _stream(req, tier_model, request, hold=hold, tenant=tenant,
+                user_id=None if user.anonymous else (user.id or "")),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache"},
     )
@@ -324,6 +400,7 @@ async def _stream(
     request: Request | None = None,
     hold=None,
     tenant: str = DEFAULT_TENANT,
+    user_id: str | None = None,
 ):
     """结算外壳：把生成体包进 try/finally，保证**任何**退出路径都落终态。
 
@@ -338,7 +415,8 @@ async def _stream(
     """
     produced = 0
     try:
-        async for event in _stream_body(req, tier_model, request, hold=hold, tenant=tenant):
+        async for event in _stream_body(req, tier_model, request, hold=hold, tenant=tenant,
+                                        user_id=user_id or ""):
             # 从 delta 事件里累计产出字符数，作为结算依据
             if event.startswith("event: delta"):
                 try:
@@ -368,6 +446,7 @@ async def _stream_body(
     request: Request | None = None,
     hold=None,
     tenant: str = DEFAULT_TENANT,
+    user_id: str = "",
 ):
     """流式生成。request 用于连接存活检测——客户端关页面/点停止后必须中断生成，
     否则 LLM 会在后台跑完全文，白烧 token 且占住连接（Ghost Generation）。
@@ -414,6 +493,10 @@ async def _stream_body(
     )
     yield _sse("meta", {"message_id": assistant.id, "intent": intent.value})
 
+    # 实际服务的模型通道：熔断降级时 `last_served` 会变成 fallback:xxx，
+    # 用量事件与 bad-case 据此标记"这次回答走了降级"。
+    provider = None
+
     # ---------------------------------------------------------- solve ----
     if intent == Intent.solve:
         refs, chunks = await _retrieve_evidence(
@@ -424,6 +507,12 @@ async def _stream_body(
             tenant_id=tenant,
         )
         yield _sse("evidence", {"list": [r.model_dump(mode="json") for r in refs]})
+        if not chunks:
+            # 隐式异常：检索零召回。用户往往不会点踩，但这是最典型的 bad-case。
+            await _record_defect(
+                tenant=tenant, session_id=req.session_id, message_id=assistant.id,
+                query=query, refs=refs, model=tier_model, error_code="zero_recall",
+            )
 
         # Token 预算装箱：按可用窗口贪心选片，并在预算允许时补前后邻近切片，
         # 替代原先"取前 N 条直接拼"——避免长切片顶爆窗口、短句浪费空间。
@@ -449,9 +538,18 @@ async def _stream_body(
             # 旧行为会把硬编码的 SOLVE_MARKDOWN 当成答案吐给用户——
             # 用户以为拿到了正解，平台还按正常产出计费，两头都不诚实。
             _logger.error("solve 生成不可用，停止本次回答: %s", exc)
+            await _record_defect(
+                tenant=tenant, session_id=req.session_id, message_id=assistant.id,
+                query=query, refs=refs, model=tier_model, degraded=True,
+                error_code="llm_unavailable",
+            )
             yield _sse("error", {"message": "模型服务暂时不可用，本次回答未完整生成"})
         except Exception as exc:  # noqa: BLE001 - 流式生成异常类型不可枚举
             _logger.exception("solve 生成异常: %s", exc)
+            await _record_defect(
+                tenant=tenant, session_id=req.session_id, message_id=assistant.id,
+                query=query, refs=refs, model=tier_model, error_code="generation_error",
+            )
             yield _sse("error", {"message": "生成过程出错，本次回答未完整生成"})
         u_out = full
 
@@ -561,9 +659,19 @@ async def _stream_body(
                 yield _sse("delta", {"text": piece})
         except LLMUnavailable as exc:
             _logger.error("general 生成不可用: %s", exc)
+            await _record_defect(
+                tenant=tenant, session_id=req.session_id, message_id=assistant.id,
+                query=req.text or "", refs=relevant, model=tier_model, degraded=True,
+                error_code="llm_unavailable",
+            )
             yield _sse("error", {"message": "模型服务暂时不可用，本次回答未完整生成"})
         except Exception as exc:  # noqa: BLE001 - 同上
             _logger.exception("general 生成异常: %s", exc)
+            await _record_defect(
+                tenant=tenant, session_id=req.session_id, message_id=assistant.id,
+                query=req.text or "", refs=relevant, model=tier_model,
+                error_code="generation_error",
+            )
             yield _sse("error", {"message": "生成过程出错，本次回答未完整生成"})
         u_out = full
         assistant.type = MessageType.general_text
@@ -618,6 +726,14 @@ async def _stream_body(
     # ------------------------------------------------------------ usage --
     usage = await _build_usage(req.session_id, u_sys, u_ret, u_out, int((time.time() - t0) * 1000))
     assistant.usage = usage
+
+    # 用量落库：FinOps 聚合的数据源。放在流结束后一次性写，
+    # 不进生成热路径——运营侧写放大不该拖慢问答延迟。
+    await _record_usage(
+        tenant=tenant, user_id=user_id, session_id=req.session_id, message_id=assistant.id,
+        provider_label=str(getattr(provider, "last_served", "") or ""),
+        model=tier_model, usage=usage,
+    )
 
     await repo.append_message(req.session_id, assistant.to_client())
     yield _sse("usage", {"usage": json.loads(usage.model_dump_json())})
