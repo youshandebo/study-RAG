@@ -19,13 +19,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import threading
+import time
 from datetime import date
 
 from app.core.config import get_settings
 from app.core.tenancy import DEFAULT_TENANT, multi_tenant_enabled
 from app.db.vector_store import _tenant_filter_active, get_vector_store
-from app.services.rag import corpus, embedder
+from app.services.rag import catalog, corpus, embedder
 from app.services.rag.chunker import Chunk
 
 # 此前本模块引用了 `_logger` 却从未定义——两处"优雅降级"分支
@@ -139,6 +141,32 @@ class BM25Index:
         finally:
             self._lock.release_read()
 
+    def remove(self, chunk_ids: list[str]) -> int:
+        """按 id 摘除倒排条目（入库失败回滚 / 跨副本重建索引前的清理）。
+
+        必须把 `_doc_len`、`_tenant_of` 一起摘干净：只删 postings 会留下
+        悬空的文档长度，`_avg_len` 随之偏大、BM25 归一化项失真，
+        表现为"删了切片反而让别的切片打分变低"这种极难归因的偏差。
+        """
+        wanted = [str(c) for c in chunk_ids if c]
+        if not wanted:
+            return 0
+        removed = 0
+        with self._lock:
+            for cid in wanted:
+                if cid not in self._doc_len and cid not in self._tenant_of:
+                    continue
+                for term in list(self._postings):
+                    postings = self._postings[term]
+                    if postings.pop(cid, None) is not None and not postings:
+                        self._postings.pop(term, None)
+                self._doc_len.pop(cid, None)
+                self._tenant_of.pop(cid, None)
+                removed += 1
+            total = sum(self._doc_len.values())
+            self._avg_len = total / max(len(self._doc_len), 1)
+        return removed
+
 
 # 时间偏好默认值按场景走：窄范围复习（周测/单元）保留较高权重——近期内容
 # 与考点高度重合；宽范围复习（月考/期末）跨度大，降到很低但非强制归零。
@@ -189,6 +217,16 @@ class HybridRetriever:
         self._vectors: dict[str, list[float]] = {}
         self._bm25 = BM25Index()
         self._seeded = False
+        # 多副本索引同步（见 services/rag/catalog.py）：记录本进程已同步到的
+        # 目录版本号 + 上次检查时间，把"比对版本"节流到每 N 秒一次。
+        self._synced_versions: dict[str, int] = {}
+        self._last_catalog_check: dict[str, float] = {}
+        try:
+            self._catalog_check_interval_s = float(
+                os.getenv("RAG_CATALOG_SYNC_INTERVAL_S", "3") or 3
+            )
+        except ValueError:
+            self._catalog_check_interval_s = 3.0
 
     async def _ensure_seeded(self) -> None:
         """首次检索前决定是否灌入内置演示语料（每个进程只做一次）。
@@ -315,6 +353,9 @@ class HybridRetriever:
           + 管理后台高级覆盖，热生效
         """
         await self._ensure_seeded()
+        # 多副本一致性：别的 Worker 入库/定版后，本副本的关键词索引会落后。
+        # 这里做一次**节流后**的版本比对，落后才重载（见 catalog.py 的取舍说明）。
+        await self._maybe_sync_catalog(tenant_id)
         from app.core.runtime_config import effective as cfg_effective
 
         weights = cfg_effective("retrieval")
@@ -586,6 +627,104 @@ class HybridRetriever:
                 "embedding 降级：%d 条切片仅进 BM25 稀疏索引、未写向量（接口恢复后需重建）",
                 degraded_skipped,
             )
+        if added:
+            # 通知其他副本"目录变了"（版本号单调递增，落后者下一次查询自然发现）
+            for tenant in {c.tenant_id for c in new_chunks}:
+                catalog.bump(tenant)
+        return added
+
+    async def unregister_chunks(
+        self, chunk_ids: list[str], *, tenants: set[str] | None = None
+    ) -> int:
+        """回滚：把刚写入的切片从**向量库与进程内索引**一并摘除。
+
+        为什么需要它（孤儿数据）
+        ------------------------
+        入库是"先写向量、再写关系库资产记录"。若第二步失败（或进程在两步之间被强杀），
+        向量库里就留下一条**没有任何业务记录指向它**的切片：检索会命中它、
+        后台列表却看不到它，用户点进证据抽屉也找不到来源——比直接报错更难排查。
+        补偿删除必须**同时**清掉向量库与内存索引（只清一边，本进程仍会继续返回幽灵结果）。
+
+        `tenants` 由调用方给出（它知道这批切片属于谁）：删除在向量库里是
+        **受租户条件约束**的，传错 id 也删不到别的租户的数据。
+        """
+        ids = [str(c) for c in chunk_ids if c]
+        if not ids:
+            return 0
+        for cid in ids:
+            self._chunks.pop(cid, None)
+            self._vectors.pop(cid, None)
+        removed_in_mem = self._bm25.remove(ids)
+
+        scope_tenants = tenants or {DEFAULT_TENANT}
+        for tenant in scope_tenants:
+            try:
+                await self._store.delete(ids, tenant_id=tenant)
+            except Exception as exc:  # noqa: BLE001 - 补偿失败不能盖住原始异常
+                _logger.warning("向量回滚删除失败（可能残留孤儿切片，需人工核对）: %s", exc)
+            catalog.bump(tenant)
+        _logger.info("回滚切片：内存 %d 条 / 向量库 %d 条", removed_in_mem, len(ids))
+        return removed_in_mem
+
+    async def _maybe_sync_catalog(self, tenant_id: str) -> None:
+        """按需从共享向量库重建本进程的关键词索引（多副本一致性）。
+
+        检查是**节流**的（默认每 3 秒最多一次版本比对），所以热路径上通常只是一次
+        内存时间比较；只有版本真的变了才会发生一次重载。
+        """
+        if self._catalog_check_interval_s > 0:
+            last = self._last_catalog_check.get(tenant_id, 0.0)
+            if time.monotonic() - last < self._catalog_check_interval_s:
+                return
+        self._last_catalog_check[tenant_id] = time.monotonic()
+
+        version = catalog.current_version(tenant_id)
+        if version <= 0:
+            return  # 无 Redis：单进程部署，本就没有跨进程同步问题
+        if self._synced_versions.get(tenant_id) == version:
+            return
+        await self.sync_catalog(tenant_id, version)
+
+    async def sync_catalog(self, tenant_id: str, version: int = 0) -> int:
+        """从向量库拉取本租户切片元数据，补齐/刷新进程内索引。
+
+        - 缺失的切片：加入 `_chunks` + BM25（关键词通道从此能看到它们）；
+        - 已缓存的切片：只刷新**可变元数据**（定版标志/版本号/取代指针）——
+          定版是写路径会改 payload 的操作，不刷新会让本副本继续按旧权威打分。
+        不拉向量：BM25 用不到向量，而拉取向量会让重载成本成倍上升。
+        """
+        try:
+            rows = await self._store.scroll_chunks(tenant_id=tenant_id)
+        except Exception as exc:  # noqa: BLE001 - 同步失败不该让本次检索失败
+            _logger.warning("目录同步失败（本次仍用已有索引）: %s", exc)
+            return 0
+
+        added = 0
+        for pid, payload in rows:
+            payload = dict(payload or {})
+            existing = self._chunks.get(pid)
+            if existing is not None:
+                existing.is_canonical = bool(payload.get("is_canonical", existing.is_canonical))
+                existing.method_version = int(payload.get("method_version", existing.method_version) or 1)
+                existing.supersedes = payload.get("supersedes", existing.supersedes)
+                continue
+            payload.setdefault("id", pid)
+            try:
+                chunk = Chunk(**payload)
+            except TypeError:
+                continue  # 脏 payload 跳过（与检索路径同一策略）
+            self._chunks[pid] = chunk
+            self._bm25.add(
+                pid,
+                embedder.bm25_tokenize(f"{chunk.exam_point} {chunk.text}"),
+                chunk.tenant_id,
+            )
+            added += 1
+
+        if version > 0:
+            self._synced_versions[tenant_id] = version
+        if added:
+            _logger.info("目录同步完成：新增 %d 条切片进入本副本关键词索引", added)
         return added
 
     async def all_chunks(self, tenant_id: str | None = None) -> list[Chunk]:
@@ -596,6 +735,9 @@ class HybridRetriever:
         机构内容拼进本题上下文（比检索泄漏更隐蔽）。
         """
         await self._ensure_seeded()
+        # 邻近扩展与骨架都读 `_chunks`：本副本缺切片时上下文窗口会不完整，
+        # 所以这里同样做一次同步检查（与 retrieve_scored 同一入口口径）。
+        await self._maybe_sync_catalog(tenant_id or DEFAULT_TENANT)
         chunks = list(self._chunks.values())
         if _tenant_filter_active(tenant_id):
             chunks = [c for c in chunks if c.tenant_id == tenant_id]
@@ -634,6 +776,9 @@ class HybridRetriever:
         vec = self._vectors.get(chunk_id)
         if vec is not None:
             await self._store.upsert(chunk_id, vec, target.to_payload())
+        # 定版会改 payload（is_canonical / method_version / supersedes），
+        # 别的副本必须能发现——否则它们会继续按旧权威给分。
+        catalog.bump(target.tenant_id)
         return target
 
 

@@ -116,6 +116,33 @@ def _split_text_chunks(text: str) -> list[str]:
     return merged[:60]
 
 
+async def _register_with_rollback(
+    retriever, chunks: list[Chunk], session_id: str, asset_meta: dict
+) -> tuple[int, dict]:
+    """写向量 → 写资产记录，**第二步失败则回滚第一步**。
+
+    为什么顺序不能反：资产记录（关系库）是业务可见的"真相源"，向量只是检索索引。
+    先写库后写向量的话，失败会留下"有记录、检索不到"的切片（用户看到素材却问不出内容）；
+    当前顺序失败时留下的是"有向量、无记录"的孤儿切片——检索能命中但任何列表都查不到，
+    更难排查。因此保持"先索引后落库"，并在落库失败时**补偿删除**已写入的向量与内存索引。
+
+    `chunk_count` 由本函数按**实际写入量**填写（调用方拿不到这个值，容易写成
+    "切片总数"从而把被跳过的空切片也算进去）。
+    """
+    added = await retriever.register_chunks(chunks)
+    meta = dict(asset_meta)
+    meta["chunk_count"] = added
+    try:
+        asset = await repo.add_asset(session_id, meta)
+    except Exception:
+        # 补偿：向量库 + 进程内索引一起清，否则本进程仍会继续返回幽灵结果
+        await retriever.unregister_chunks(
+            [c.id for c in chunks], tenants={c.tenant_id for c in chunks}
+        )
+        raise
+    return added, asset
+
+
 @router.post("/ingest")
 async def ingest(
     request: Request,
@@ -297,8 +324,9 @@ async def _ingest_locked(
         pitfalls = extract_from_chunks(chunks)
 
         retriever = await get_retriever()
-        added = await retriever.register_chunks(chunks)
-        asset = await repo.add_asset(
+        added, asset = await _register_with_rollback(
+            retriever,
+            chunks,
             session_id,
             {
                 "owner": None if user.anonymous else user.id,
@@ -307,7 +335,6 @@ async def _ingest_locked(
                 "uri": url,
                 "filename": filename or f"{note_text[:12]}…",
                 "lecture_date": lecture_date,
-                "chunk_count": added,
                 "pitfalls": pitfalls[:3],
             },
         )
@@ -362,9 +389,9 @@ async def _ingest_locked(
         pitfalls = []
 
     retriever = await get_retriever()
-    added = await retriever.register_chunks(chunks)
-
-    asset = await repo.add_asset(
+    added, asset = await _register_with_rollback(
+        retriever,
+        chunks,
         session_id,
         {
             "owner": None if user.anonymous else user.id,
@@ -376,7 +403,6 @@ async def _ingest_locked(
             # 否则多份录音共存时无法判断该放哪一份（历史 bug）
             "audio_id": audio_id,
             "lecture_date": lecture_date,
-            "chunk_count": added,
             "pitfalls": pitfalls[:3],
         },
     )

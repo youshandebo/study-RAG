@@ -42,7 +42,19 @@ def run_ingest_pipeline(session_id: str, media_type: str, raw: bytes, filename: 
         # Embedding 写入向量库(Qdrant/内存)后，register_chunks 内部会同步增量更新
         # 内存 BM25 倒排索引（读写锁保护，写独占/读共享，避免并发检索读到半成品索引）
         added = await retriever.register_chunks(chunks)
-        await repo.add_asset(session_id, {"kind": media_type, "uri": url, "filename": filename, "chunk_count": added})
+        try:
+            await repo.add_asset(
+                session_id,
+                {"kind": media_type, "uri": url, "filename": filename, "chunk_count": added},
+            )
+        except Exception:
+            # 与 API 路径同一口径：落库失败必须补偿删除已写向量，
+            # 否则留下"检索命中、列表查不到"的孤儿切片（worker 进程被杀时同理，
+            # 那种情况只能靠离线核对，见 README 的运维说明）。
+            await retriever.unregister_chunks(
+                [c.id for c in chunks], tenants={c.tenant_id for c in chunks}
+            )
+            raise
         return {"uri": url, "chunks_added": added}
 
     return asyncio.run(_inner())

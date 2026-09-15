@@ -57,6 +57,14 @@ def _install_fake_qdrant(monkeypatch):
         vector: list | None = None
         payload: dict | None = None
 
+    @dataclass
+    class HasIdCondition:
+        has_id: list | None = None
+
+    @dataclass
+    class FilterSelector:
+        filter: object = None
+
     class Distance:
         COSINE = "Cosine"
 
@@ -68,6 +76,7 @@ def _install_fake_qdrant(monkeypatch):
         ("VectorParams", VectorParams), ("HnswConfigDiff", HnswConfigDiff),
         ("PointStruct", PointStruct), ("Distance", Distance),
         ("PayloadSchemaType", PayloadSchemaType),
+        ("HasIdCondition", HasIdCondition), ("FilterSelector", FilterSelector),
     ]:
         setattr(models, _name, _obj)
 
@@ -107,6 +116,14 @@ def _install_fake_qdrant(monkeypatch):
             self.calls.append(("count", kw))
             return SimpleNamespace(count=7)
 
+        async def delete(self, **kw):
+            self.calls.append(("delete", kw))
+            return SimpleNamespace(status="completed")
+
+        async def scroll(self, **kw):
+            self.calls.append(("scroll", kw))
+            return ([], None)
+
     top.AsyncQdrantClient = AsyncQdrantClient
     top.models = models
     monkeypatch.setitem(sys.modules, "qdrant_client", top)
@@ -128,7 +145,8 @@ def _last(kind: str, client):
 
 
 def _cond_keys(filter_obj) -> list[str]:
-    return [cond.key for cond in (filter_obj.must or [])] if filter_obj else []
+    # 只收集带 key 的条件：删除路径会额外挂 HasIdCondition（无 key 字段）
+    return [c.key for c in (filter_obj.must or []) if hasattr(c, "key")] if filter_obj else []
 
 
 # ------------------------------------------------------------ 作用域解析 ----
@@ -300,6 +318,73 @@ class TestMemoryParity:
 
         hits = await store.search([1.0, 0.0], top_k=5, tenant_id="org-a")
         assert [pid for pid, _, _ in hits] == ["p-a"]
+
+    @pytest.mark.asyncio
+    async def test_in_memory_delete_is_tenant_scoped(self, monkeypatch):
+        """删除也必须守租户边界：传错 id 只能"少删"，绝不能删到别人的数据。"""
+        from app.db.vector_store import InMemoryVectorStore
+
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        store = InMemoryVectorStore()
+        await store.upsert("p-a", [1.0, 0.0], {"tenant_id": "org-a"})
+        await store.upsert("p-b", [1.0, 0.0], {"tenant_id": "org-b"})
+
+        assert await store.delete(["p-a"], tenant_id="org-b") == 0
+        assert await store.delete(["p-b"], tenant_id="org-b") == 1
+        assert (await store.search([1.0, 0.0], top_k=5, tenant_id="org-a"))[0][0] == "p-a"
+
+    @pytest.mark.asyncio
+    async def test_in_memory_scroll_is_tenant_scoped(self, monkeypatch):
+        from app.db.vector_store import InMemoryVectorStore
+
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        store = InMemoryVectorStore()
+        await store.upsert("p-a", [1.0, 0.0], {"tenant_id": "org-a"})
+        await store.upsert("p-b", [1.0, 0.0], {"tenant_id": "org-b"})
+
+        rows = await store.scroll_chunks(tenant_id="org-a")
+        assert [pid for pid, _p in rows] == ["p-a"]
+
+
+# ------------------------------------------------- 删除路径的租户约束 ----
+class TestScopedDelete:
+    @pytest.mark.asyncio
+    async def test_delete_requires_tenant_in_multi_tenant_mode(self, fake_qdrant, monkeypatch):
+        from app.db.vector_store import ScopedQdrantClient, TenantScopeRequired, resolve_scope
+
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        client = ScopedQdrantClient("http://q", "study")
+
+        with pytest.raises(TenantScopeRequired):
+            await client.delete(resolve_scope(None, base_collection="study"), ["p-1"])
+
+    @pytest.mark.asyncio
+    async def test_delete_ands_ids_with_tenant_condition(self, fake_qdrant, monkeypatch):
+        """id 与租户条件必须 AND 在一起——用 PointIdsList 的话传错 id 就跨租户删了。"""
+        from app.db.vector_store import ScopedQdrantClient, resolve_scope
+
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        client = ScopedQdrantClient("http://q", "study")
+
+        removed = await client.delete(resolve_scope("org-a", base_collection="study"), ["p-1"])
+
+        assert removed == 1
+        kw = _last("delete", _INSTANCES[-1])
+        selector = kw["points_selector"]
+        assert selector is not None and selector.filter is not None
+        keys = _cond_keys(selector.filter)
+        assert "tenant_id" in keys, "删除必须带租户条件"
+        assert any(getattr(c, "has_id", None) == ["p-1"] for c in selector.filter.must)
+
+    @pytest.mark.asyncio
+    async def test_delete_without_ids_is_noop(self, fake_qdrant, monkeypatch):
+        from app.db.vector_store import ScopedQdrantClient, resolve_scope
+
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        client = ScopedQdrantClient("http://q", "study")
+
+        assert await client.delete(resolve_scope("org-a", base_collection="study"), []) == 0
+        assert [name for name, _kw in _INSTANCES[-1].calls if name == "delete"] == []
 
 
 # -------------------------------------------------------- 源码结构守卫 ----

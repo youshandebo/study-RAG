@@ -123,6 +123,12 @@ class VectorStore(Protocol):
         tenant_id: str | None = None,
     ) -> list[tuple[str, float, dict]]: ...
 
+    async def delete(self, point_ids: list[str], tenant_id: str | None = None) -> int: ...
+
+    async def scroll_chunks(
+        self, tenant_id: str | None = None, limit: int = 2000
+    ) -> list[tuple[str, dict]]: ...
+
 
 class InMemoryVectorStore:
     """零依赖兜底实现：暴力余弦扫描，教学场景数据量级下完全够用。"""
@@ -157,6 +163,32 @@ class InMemoryVectorStore:
             results.append((pid, embedder.cosine(vector, vec), payload))
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
+
+    async def delete(self, point_ids: list[str], tenant_id: str | None = None) -> int:
+        """按点 id 删除，**同时受租户作用域约束**（越权 id 删不掉）。"""
+        if not point_ids:
+            return 0
+        scope = resolve_scope(tenant_id, base_collection="memory")
+        wanted = {str(p) for p in point_ids}
+        removed = 0
+        with self._lock:
+            for pid in list(self._points):
+                if pid not in wanted:
+                    continue
+                payload = self._points[pid][1]
+                if not scope.matches(payload):
+                    continue
+                self._points.pop(pid, None)
+                removed += 1
+        return removed
+
+    async def scroll_chunks(
+        self, tenant_id: str | None = None, limit: int = 2000
+    ) -> list[tuple[str, dict]]:
+        scope = resolve_scope(tenant_id, base_collection="memory")
+        with self._lock:
+            items = list(self._points.items())
+        return [(pid, payload) for pid, (_v, payload) in items if scope.matches(payload)][:limit]
 
 
 class ScopedQdrantClient:
@@ -321,6 +353,61 @@ class ScopedQdrantClient:
         )
         return int(getattr(res, "count", res) or 0)
 
+    async def delete(self, scope: TenantScope, point_ids: list[str]) -> int:
+        """按 id 删除，但**必须同时满足租户条件**。
+
+        为什么不用 `PointIdsList`：那种写法只认 id，若调用方（或未来的某次重构）
+        传进一个属于别的租户的 id，就会跨租户删除——这是比读越权更严重的写越权，
+        而且不可恢复。用 `FilterSelector` 把 id 与租户条件 AND 在一起，
+        就算传错了 id 也删不掉别人的数据（失败方向是"少删"而不是"删错"）。
+        """
+        from qdrant_client import models
+
+        self._require(scope)
+        ids = [str(p) for p in point_ids if str(p or "").strip()]
+        if not ids:
+            return 0
+        must = self._conditions(scope, None)
+        must.append(models.HasIdCondition(has_id=ids))
+        await self._with_shard(
+            self._client.delete,
+            scope,
+            collection_name=scope.collection,
+            points_selector=models.FilterSelector(filter=models.Filter(must=must)),
+        )
+        return len(ids)
+
+    async def scroll_chunks(
+        self, scope: TenantScope, limit: int = 2000, page: int = 256
+    ) -> list[tuple[str, dict]]:
+        """枚举本租户的切片元数据（**不带向量**）。
+
+        用途：多副本下某个 Worker 需要重建自己的 BM25 倒排索引——向量不参与
+        关键词打分，因此 `with_vectors=False` 能显著降低传输量。
+        """
+        from qdrant_client import models
+
+        self._require(scope)
+        must = self._conditions(scope, None)
+        out: list[tuple[str, dict]] = []
+        offset = None
+        while len(out) < limit:
+            points, offset = await self._with_shard(
+                self._client.scroll,
+                scope,
+                collection_name=scope.collection,
+                scroll_filter=models.Filter(must=must) if must else None,
+                limit=min(page, limit - len(out)),
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for p in points or []:
+                out.append((str(p.id), p.payload or {}))
+            if offset is None:
+                break
+        return out
+
 
 class QdrantVectorStore:
     """业务侧入口：只认 tenant_id / course_id 的值，不认 Qdrant 条件。"""
@@ -359,6 +446,15 @@ class QdrantVectorStore:
             self.scope_for(tenant_id),
             extra={COURSE_FIELD: course_id} if course_id else None,
         )
+
+    async def delete(self, point_ids: list[str], tenant_id: str | None = None) -> int:
+        """按 id 删除（受租户条件约束，见 ScopedQdrantClient.delete）。"""
+        return await self._scoped.delete(self.scope_for(tenant_id), point_ids)
+
+    async def scroll_chunks(
+        self, tenant_id: str | None = None, limit: int = 2000
+    ) -> list[tuple[str, dict]]:
+        return await self._scoped.scroll_chunks(self.scope_for(tenant_id), limit=limit)
 
 
 _store: VectorStore | None = None
