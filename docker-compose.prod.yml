@@ -24,6 +24,9 @@ services:
     environment:
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
       - ADMIN_JWT_SECRET=${ADMIN_JWT_SECRET:-}
+      # 生产标记：backend 启动探针据此拒绝"缺 REDIS_URL 的静默降级"。
+      # 无特殊需要不要改成 development，否则配额/闸门/限流会退回进程内口径。
+      - ENV=${ENV:-production}
       - MEMBERSHIP_MODE=${MEMBERSHIP_MODE:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}

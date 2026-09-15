@@ -10,10 +10,16 @@ from app.api.v1 import (
     admin, admin_ops, auth, chat_stream, compare, course, evidence, exam,
     feedback, ingest, notebook, sessions,
 )
+from app.core.boot_probe import enforce_runtime_safety
 from app.core.config import get_settings
 from app.db.minio_client import BOARDS_DIR, ensure_static_dirs
 
 settings = get_settings()
+
+# 启动探针必须跑在**任何组件被使用之前**：多副本 + 无 Redis 时直接拒绝启动，
+# 把"配额被放大 N 倍 / 闸门失效 / 限流互不可见"这类静默故障挡在上线之前。
+# 它只读环境变量与启动参数，不做网络 IO，放在导入期是安全的。
+RUNTIME_SAFETY = enforce_runtime_safety()
 
 app = FastAPI(title=settings.app_name, version="1.0.0")
 
@@ -66,6 +72,14 @@ async def health():
     return {
         "status": "ok",
         "mock_mode": settings.mock_mode,
+        # 共享状态后端必须可观测：运维要能一眼看出"现在跑的是 Redis 还是进程内",
+        # 否则多副本部署是否真的共享了配额，只能靠猜。
+        "state": {
+            "backend": RUNTIME_SAFETY["state_backend"],
+            "environment": RUNTIME_SAFETY["environment"],
+            "replicas": RUNTIME_SAFETY["replicas"],
+            "acknowledged_process_local": RUNTIME_SAFETY["acknowledged"],
+        },
         "real_models": [
             k for k, v in {
                 "openai": settings.openai_api_key,

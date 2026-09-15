@@ -60,8 +60,28 @@ class OkProvider:
             yield piece
 
 
-def _breaker(threshold: int = 2, cooldown: float = 0.3, half_open: int = 1) -> CircuitBreaker:
-    return CircuitBreaker("ut", CircuitConfig(threshold, cooldown, half_open))
+class _Clock:
+    """假时钟：冷却判定不依赖真实时间，用例完全确定。
+
+    原先这两条用例用 `cooldown=0.05` + `sleep(0.06)` 依赖墙钟——
+    在全量套件（400+ 用例）的负载下，50ms 的窗口会因为调度抖动而漂移，
+    表现为"单独跑通过、全量跑偶发失败"。
+    """
+
+    def __init__(self, t: float = 1000.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
+def _breaker(
+    threshold: int = 2, cooldown: float = 0.3, half_open: int = 1, clock: _Clock | None = None
+) -> CircuitBreaker:
+    return CircuitBreaker("ut", CircuitConfig(threshold, cooldown, half_open), clock=clock or _Clock())
 
 
 @pytest.fixture(autouse=True)
@@ -92,24 +112,22 @@ class TestBreaker:
 
     @pytest.mark.asyncio
     async def test_half_open_only_admits_probe(self):
-        b = _breaker(threshold=1, cooldown=0.05, half_open=1)
+        clock = _Clock()
+        b = _breaker(threshold=1, cooldown=0.05, half_open=1, clock=clock)
         b.record_failure("e1")
-        assert b.allows() is False
+        assert b.allows() is False                 # 冷却未到，直接短路
 
-        import asyncio
-
-        await asyncio.sleep(0.06)
+        clock.advance(0.06)                        # 推时钟而非 sleep：确定且不受负载影响
         assert b.state != "closed"
         assert b.allows() is True                  # 冷却到期 → 放行一个探测
         assert b.allows() is False                 # 探测未回来前不放第二个
 
     @pytest.mark.asyncio
     async def test_probe_success_closes_circuit(self):
-        b = _breaker(threshold=1, cooldown=0.05)
+        clock = _Clock()
+        b = _breaker(threshold=1, cooldown=0.05, clock=clock)
         b.record_failure("e1")
-        import asyncio
-
-        await asyncio.sleep(0.06)
+        clock.advance(0.06)
         b.allows()
         b.record_success()
         assert b.state == "closed" and b.allows() is True

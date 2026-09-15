@@ -15,13 +15,14 @@ import io
 import json
 import time
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.api.v1.admin import require_admin
 from app.core.billing import get_ledger
 from app.core.circuit import snapshot as circuit_snapshot
 from app.core.tenancy import is_valid_tenant
+from app.services.ops import audit as audit_log
 from app.services.ops import store
 
 router = APIRouter()
@@ -102,7 +103,7 @@ async def list_tenants(_: str = Depends(require_admin)):
 
 
 @router.post("/admin/ops/tenants")
-async def create_tenant(body: TenantCreate, _: str = Depends(require_admin)):
+async def create_tenant(body: TenantCreate, request: Request, token: str = Depends(require_admin)):
     if not is_valid_tenant(body.tenant_id):
         raise HTTPException(status_code=400, detail="租户 id 只允许字母数字、下划线与短横线（1-64 位）")
     acc = await store.ensure_tenant(body.tenant_id, body.label)
@@ -112,20 +113,36 @@ async def create_tenant(body: TenantCreate, _: str = Depends(require_admin)):
             tier_override=body.tier_override,
             daily_cap_override=body.daily_cap_override,
         )
+    await audit_log.record_admin(
+        "ops.tenant.create", token=token,
+        ip=audit_log.ip_of(request),
+        tenant_id=body.tenant_id, target=body.tenant_id,
+        detail={"label": body.label, "tier_override": body.tier_override,
+                "daily_cap_override": body.daily_cap_override},
+    )
     return {"tenant": acc}
 
 
 @router.patch("/admin/ops/tenants/{tenant_id}")
-async def patch_tenant(tenant_id: str, body: TenantPatch, _: str = Depends(require_admin)):
+async def patch_tenant(
+    tenant_id: str, body: TenantPatch, request: Request, token: str = Depends(require_admin)
+):
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
     if not patch:
         raise HTTPException(status_code=400, detail="没有需要更新的字段")
     acc = await store.update_tenant(tenant_id, **patch)
+    await audit_log.record_admin(
+        "ops.tenant.update", token=token,
+        ip=audit_log.ip_of(request),
+        tenant_id=tenant_id, target=tenant_id, detail=patch,
+    )
     return {"tenant": acc}
 
 
 @router.post("/admin/ops/tenants/{tenant_id}/topup")
-async def top_up(tenant_id: str, body: TopUpBody, operator: str = Depends(require_admin)):
+async def top_up(
+    tenant_id: str, body: TopUpBody, request: Request, token: str = Depends(require_admin)
+):
     """充值 / 人工调减，写**不可变流水**并同步计费账本。
 
     幂等键由调用方给（后台通常用「租户+金额+操作批次」），双击重试只会入账一次。
@@ -138,6 +155,17 @@ async def top_up(tenant_id: str, body: TopUpBody, operator: str = Depends(requir
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # 充值已有不可变流水（钱的部分），审计补的是**操作主体**：
+    # 流水能回答"调了多少"，审计才能回答"谁批的"。重复请求也要记，
+    # 因为"某人重复点了 5 次"本身就是需要被看到的运营事实。
+    await audit_log.record_admin(
+        "ops.tenant.topup", token=token,
+        ip=audit_log.ip_of(request),
+        tenant_id=tenant_id, target=tenant_id,
+        detail={"amount": body.amount, "duplicated": result["duplicated"],
+                "balance_after": result["txn"].get("balance_after"),
+                "memo": body.memo, "idempotency_key": body.idempotency_key.strip()},
+    )
     return {
         "tenant_id": tenant_id,
         "granted_total": result["granted_total"],
@@ -152,13 +180,21 @@ async def tenant_txns(tenant_id: str, limit: int = 200, _: str = Depends(require
 
 
 @router.post("/admin/ops/users/{user_id}/role")
-async def set_role(user_id: str, body: RoleBody, _: str = Depends(require_admin)):
+async def set_role(
+    user_id: str, body: RoleBody, request: Request, token: str = Depends(require_admin)
+):
     """授予/收回租户管理员（只看自己租户数据的权限，不等于平台超管）。"""
     import app.db.relational as repo
 
     ok = await repo.set_user_role(user_id, body.role)
     if not ok:
         raise HTTPException(status_code=404, detail="用户不存在")
+    # 提权/降权是审计里最敏感的一类：它决定"谁能看到机构数据"
+    await audit_log.record_admin(
+        "ops.user.role", token=token,
+        ip=audit_log.ip_of(request),
+        target=user_id, detail={"role": body.role},
+    )
     return {"user_id": user_id, "role": body.role}
 
 
@@ -225,5 +261,44 @@ async def badcases(
 
 @router.get("/admin/ops/circuit")
 async def circuit_state(_: str = Depends(require_admin)):
-    """各上游熔断状态：跳闸次数、当前状态、冷却剩余秒数。"""
+    """各上游熔断状态：跳闸次数、当前状态、冷却剩余秒数。
+
+    LLM 与 Embedding 通道共用同一份注册表，所以这里能同时看到两类上游的健康度。
+    """
     return {"breakers": circuit_snapshot()}
+
+
+# ------------------------------------------------------------------ 审计 ----
+_AUDIT_COLUMNS = ("ts", "action", "actor", "actor_role", "tenant_id", "target", "ip", "detail")
+
+
+@router.get("/admin/ops/audit")
+async def list_audit(
+    tenant_id: str = "",
+    action: str = "",
+    actor: str = "",
+    limit: int = 200,
+    offset: int = 0,
+    format: str = "json",
+    _: str = Depends(require_admin),
+):
+    """敏感操作审计（只读）。
+
+    与业务结果表的分工：`txns` 回答"钱怎么变的"，本接口回答"**谁**改的"。
+    只提供读取——审计表没有任何 update/delete 代码路径，能被改写的日志
+    在合规场景里等于不存在。
+    """
+    rows = await audit_log.list_events(
+        tenant_id=tenant_id, action=action, actor=actor, limit=limit, offset=offset,
+    )
+    if format == "csv":
+        flat = [
+            {
+                "ts": _fmt_time(r["ts"]), "action": r["action"], "actor": r["actor"],
+                "actor_role": r["actor_role"], "tenant_id": r["tenant_id"],
+                "target": r["target"], "ip": r["ip"], "detail": r["detail"],
+            }
+            for r in rows
+        ]
+        return _as_csv(_csv_response("audit_logs.csv", _AUDIT_COLUMNS, flat)["content"])
+    return {"count": len(rows), "items": rows}

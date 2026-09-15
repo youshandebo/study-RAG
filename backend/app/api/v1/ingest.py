@@ -11,7 +11,7 @@ import pathlib
 import re
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
 
 import app.db.relational as repo
 from app.api.v1.auth import AuthUser, current_user_optional
@@ -23,6 +23,7 @@ from app.services.asr.hotwords import correct
 from app.services.asr.transcriber import Transcriber
 from app.services.extractor.difficulty import score
 from app.services.extractor.pitfall import extract_from_chunks
+from app.services.ops import audit as audit_log
 from app.services.rag.aligner import align_boards
 from app.services.rag.chunker import Chunk, chunk_transcript
 from app.services.rag.retriever import get_retriever
@@ -117,6 +118,7 @@ def _split_text_chunks(text: str) -> list[str]:
 
 @router.post("/ingest")
 async def ingest(
+    request: Request,
     user: AuthUser = Depends(current_user_optional),
     session_id: str = Form(...),
     media_type: str = Form("audio"),  # audio | board | text
@@ -147,13 +149,33 @@ async def ingest(
     except GateTimeout:
         raise HTTPException(status_code=503, detail="入库任务排队超时，请稍后重试")
     try:
-        return await _ingest_locked(
+        result = await _ingest_locked(
             user=user, session_id=session_id, media_type=media_type, file=file,
             lecture_date=lecture_date, text_content=text_content, subject=subject,
             course_id=course_id, chapter=chapter, raw=raw,
         )
     finally:
         await gate.release(lease)
+
+    # 审计埋点放在成功后：课件上传是"谁往机构知识库里放了什么"的核心问题，
+    # 机构尽调必问。只记元信息（类型/大小/归属），不记内容——
+    # 内容已经在切片里，审计表是责任记录不是数据仓库。
+    await audit_log.record(
+        "ingest.upload",
+        actor="anonymous" if user.anonymous else user.id,
+        actor_role="anonymous" if user.anonymous else (user.role or "member"),
+        tenant_id=resolve_tenant(user),
+        target=f"{media_type}:{(file.filename if file is not None else 'text')[:120]}",
+        ip=audit_log.ip_of(request),
+        detail={
+            "session_id": session_id,
+            "bytes": len(raw),
+            "subject": subject,
+            "course_id": course_id,
+            "chapter": chapter,
+        },
+    )
+    return result
 
 
 _INGEST_GATE: DistributedGate | None = None

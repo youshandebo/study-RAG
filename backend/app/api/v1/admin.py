@@ -50,6 +50,26 @@ async def require_admin(
     return token
 
 
+async def _audit_admin(
+    action: str,
+    *,
+    token: str,
+    request: Request,
+    target: str = "",
+    detail: dict | None = None,
+) -> None:
+    """记录一次平台管理操作（委托 ops.audit，统一脱敏与容错口径）。"""
+    from app.services.ops import audit as audit_log
+
+    await audit_log.record_admin(
+        action,
+        token=token,
+        ip=audit_log.ip_of(request),
+        target=target,
+        detail=detail,
+    )
+
+
 # ------------------------------------------------------------------- models --
 class LoginBody(BaseModel):
     password: str
@@ -106,7 +126,7 @@ def available_tracks() -> list[dict]:
 
 
 @router.put("/admin/config")
-async def put_admin_config(payload: dict, _: str = Depends(require_admin)):
+async def put_admin_config(payload: dict, request: Request, token: str = Depends(require_admin)):
     patch: dict = {}
     for kind in ("llm", "embedding", "asr", "vlm"):
         section = payload.get(kind)
@@ -136,6 +156,21 @@ async def put_admin_config(payload: dict, _: str = Depends(require_admin)):
         if isinstance(src, dict):
             patch[section] = src
     runtime_config.save_runtime_config(patch)
+    # 只记"改了哪些段 + 换成了哪个模型"，不记 base_url 与 api_key：
+    # 前者是内部基建信息、后者是凭据，都不该进审计（凭据已由 redact 兜底，双重保险）。
+    await _audit_admin(
+        "admin.config.update",
+        token=token,
+        request=request,
+        target=",".join(sorted(patch.keys())),
+        detail={
+            "sections": sorted(patch.keys()),
+            "models": {
+                k: patch[k].get("model", "")
+                for k in ("llm", "embedding") if isinstance(patch.get(k), dict)
+            },
+        },
+    )
     return runtime_config.masked_view()
 
 
@@ -144,22 +179,27 @@ class SectionReset(BaseModel):
 
 
 @router.post("/admin/config/reset")
-async def reset_section(body: SectionReset, _: str = Depends(require_admin)):
+async def reset_section(body: SectionReset, request: Request, token: str = Depends(require_admin)):
     if body.kind not in ("llm", "embedding", "asr", "vlm"):
         raise HTTPException(status_code=400, detail="未知模型类型")
     blank = {"provider": "", "base_url": "", "api_key": "", "model": ""}
     runtime_config.save_runtime_config({body.kind: blank})
+    await _audit_admin(
+        "admin.config.reset", token=token, request=request, target=body.kind,
+    )
     return runtime_config.masked_view()
 
 
 @router.post("/admin/password")
-async def change_password(body: PasswordBody, _: str = Depends(require_admin)):
+async def change_password(body: PasswordBody, request: Request, token: str = Depends(require_admin)):
     new = body.new_password.strip()
     if len(new) < 6:
         raise HTTPException(status_code=400, detail="新密码至少 6 位")
     if not runtime_config.verify_admin_password(body.old_password):
         raise HTTPException(status_code=401, detail="原密码不正确")
     runtime_config.set_admin_password(new)
+    # 记录"密码被改过"这件事本身（合规关注的是变更事实），**不记录任何口令内容**
+    await _audit_admin("admin.password.change", token=token, request=request)
     return {"ok": True, "message": "管理员密码已更新"}
 
 
@@ -333,7 +373,9 @@ async def admin_list_chunks(
 
 
 @router.post("/admin/chunks/{chunk_id}/canonical")
-async def admin_set_canonical(chunk_id: str, body: CanonicalBody, _: str = Depends(require_admin)):
+async def admin_set_canonical(
+    chunk_id: str, body: CanonicalBody, request: Request, token: str = Depends(require_admin)
+):
     """老师"设为标准解法"：自动接管同考点旧定版（旧版降级 + supersedes 指针 + 版本递增）。"""
     from app.services.rag.retriever import get_retriever
 
@@ -341,6 +383,20 @@ async def admin_set_canonical(chunk_id: str, body: CanonicalBody, _: str = Depen
     chunk = await retriever.set_canonical(chunk_id, body.canonical)
     if chunk is None:
         raise HTTPException(status_code=404, detail="切片不存在")
+    # 定版是"教学内容口径"的变更：谁把哪份解法扶正、版本升到几，
+    # 是教研纠纷时唯一能说清责任的记录。
+    await _audit_admin(
+        "chunk.canonical.set" if body.canonical else "chunk.canonical.unset",
+        token=token,
+        request=request,
+        target=chunk_id,
+        detail={
+            "exam_point": chunk.exam_point,
+            "course_id": chunk.course_id,
+            "method_version": chunk.method_version,
+            "supersedes": chunk.supersedes,
+        },
+    )
     return {
         "id": chunk.id,
         "is_canonical": chunk.is_canonical,
@@ -372,7 +428,9 @@ async def admin_plans(_: str = Depends(require_admin)):
 
 
 @router.post("/admin/users/{user_id}/tier")
-async def admin_set_user_tier(user_id: str, body: TierBody, _: str = Depends(require_admin)):
+async def admin_set_user_tier(
+    user_id: str, body: TierBody, request: Request, token: str = Depends(require_admin)
+):
     """开通/变更会员档位（付款对接前的手工开通通道）。"""
     from app.core.membership import plans
 
@@ -381,12 +439,17 @@ async def admin_set_user_tier(user_id: str, body: TierBody, _: str = Depends(req
     ok = await repo.set_user_tier(user_id, body.tier)
     if not ok:
         raise HTTPException(status_code=404, detail="用户不存在")
+    # 手工开通档位 = 白送配额，是"谁给的、给了谁"必须留痕的典型操作
+    await _audit_admin(
+        "user.tier.change", token=token, request=request,
+        target=user_id, detail={"tier": body.tier},
+    )
     return {"ok": True, "tier": body.tier}
 
 
 @router.post("/admin/users/{user_id}/tenant")
 async def admin_set_user_tenant(
-    user_id: str, body: TenantBody, _: str = Depends(require_admin)
+    user_id: str, body: TenantBody, request: Request, token: str = Depends(require_admin)
 ):
     """分配/变更用户的租户归属。
 
@@ -409,6 +472,11 @@ async def admin_set_user_tenant(
     ok = await repo.set_user_tenant(user_id, tenant or None)
     if not ok:
         raise HTTPException(status_code=404, detail="用户不存在")
+    # 租户归属 = 数据边界归属，是合规审计的重点：谁把一个用户挪进了哪个机构
+    await _audit_admin(
+        "user.tenant.change", token=token, request=request,
+        target=user_id, detail={"tenant_id": tenant or DEFAULT_TENANT},
+    )
     return {"ok": True, "tenant_id": tenant or DEFAULT_TENANT}
 
 

@@ -229,3 +229,42 @@ class MistakeNotebookRow(Base):
 
     created_at: Mapped[int] = mapped_column(BigInteger, index=True)
     updated_at: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
+# ------------------------------------------------------------ 审计日志 ----
+# 「谁在什么时间、对哪个租户、做了什么敏感操作」——机构尽调与合规审计的第一问。
+# 此前系统只有**业务结果**（余额流水、用量事件、bad-case），没有**操作主体**：
+# 能查到"某个切片被设为定版"，但查不到"是谁设的"。两者性质完全不同：
+# 前者是账，后者是责。
+#
+# 只追加：本表没有 update/delete 的任何代码路径。改日志 = 毁证据，
+# 所以不提供修改接口本身就是设计要求（而非"暂时没做"）。
+
+
+class AuditLogRow(Base):
+    """敏感操作审计（追加写，只读查询）。"""
+
+    __tablename__ = "audit_logs"
+    __table_args__ = (
+        # 按租户追溯（机构自查 / 平台按客户排查）
+        Index("ix_audit_tenant_ts", "tenant_id", "ts"),
+        # 按操作类型追溯（"所有充值操作" / "所有定版操作"）
+        Index("ix_audit_action_ts", "action", "ts"),
+    )
+
+    # 自增主键：SQLite 只对 `INTEGER PRIMARY KEY` 自增，`BIGINT PRIMARY KEY` 不会
+    # （会以 NULL 插入并撞 NOT NULL 约束）。with_variant 让同一份模型在
+    # SQLite 下退化为 INTEGER、在 Postgres 下保持 BIGINT——这是唯一能
+    # "两边都对"的写法，比在代码里自己生成 id 更不容易出错。
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    ts: Mapped[int] = mapped_column(BigInteger, index=True)
+
+    action: Mapped[str] = mapped_column(String(64), default="")        # 如 ingest.upload / admin.config
+    actor: Mapped[str] = mapped_column(String(128), default="", index=True)   # 用户 id / admin / anon
+    actor_role: Mapped[str] = mapped_column(String(20), default="")    # platform_admin | tenant_admin | member
+    tenant_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    target: Mapped[str] = mapped_column(String(255), default="")       # 对象摘要（切片 id / 配置键 / 文件名）
+    ip: Mapped[str] = mapped_column(String(64), default="")
+    detail_json: Mapped[str] = mapped_column(Text, default="")         # 写时脱敏后的上下文

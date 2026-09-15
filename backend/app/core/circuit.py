@@ -30,7 +30,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 _logger = logging.getLogger("app.core.circuit")
 
@@ -88,6 +88,10 @@ class CircuitBreaker:
     last_error: str = ""
 
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # 可注入时钟：冷却判定本质是"现在几点"。用真实时钟写测试会因为调度抖动
+    # 而假失败（实测全量套件下 50ms 的冷却窗口会漂移），默认走 monotonic，
+    # 测试传入假时钟即可完全确定。
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False)
 
     # ------------------------------------------------------------ 状态 ----
     @property
@@ -95,14 +99,14 @@ class CircuitBreaker:
         with self._lock:
             if self.failures < self.config.failure_threshold:
                 return CLOSED
-            return OPEN if time.monotonic() < self.opened_at + self.config.cooldown_s else HALF_OPEN
+            return OPEN if self.clock() < self.opened_at + self.config.cooldown_s else HALF_OPEN
 
     def allows(self) -> bool:
         """本次请求是否允许打到上游。"""
         with self._lock:
             if self.failures < self.config.failure_threshold:
                 return True
-            st = OPEN if time.monotonic() < self.opened_at + self.config.cooldown_s else HALF_OPEN
+            st = OPEN if self.clock() < self.opened_at + self.config.cooldown_s else HALF_OPEN
             if st == OPEN:
                 return False
             if self.probes_in_flight < self.config.half_open_max:
@@ -126,7 +130,7 @@ class CircuitBreaker:
             self.failures += 1
             self.last_error = str(error)[:300]
             if self.failures >= self.config.failure_threshold:
-                self.opened_at = time.monotonic()
+                self.opened_at = self.clock()
             if self.probes_in_flight > 0:
                 self.probes_in_flight -= 1
         if self.failures == self.config.failure_threshold:
@@ -141,7 +145,7 @@ class CircuitBreaker:
         state = self.state
         retry_in = 0.0
         if state == OPEN:
-            retry_in = max(0.0, opened_at + self.config.cooldown_s - time.monotonic())
+            retry_in = max(0.0, opened_at + self.config.cooldown_s - self.clock())
         return {
             "label": self.label,
             "state": state,

@@ -1,12 +1,34 @@
 # Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
-"""向量化封装：优先 OpenAI 兼容 Embeddings API（管理员面板可配置）；无配置时回落确定性哈希词袋向量（零依赖离线可用）。"""
+"""向量化封装：优先 OpenAI 兼容 Embeddings API（管理员面板可配置）；无配置时回落确定性哈希词袋向量（零依赖离线可用）。
+
+断路器（与 LLM 侧同款）
+------------------------
+上游 embedding 接口 502/504 时，原先的路径是"每次调用重试 2 次 → 失败即降级哈希"。
+问题在于**每次请求都要重走一遍超时等待**：接口挂了 10 分钟，这 10 分钟里每一次
+入库与每一次检索都要白等两个超时周期，请求堆积、网关 504 连锁。
+
+现在接 `core/circuit.CircuitBreaker`（阈值/冷却与 LLM 同源，环境变量可调）：
+连续失败跳闸后，冷却期内**直接走哈希兜底**，不再向上游发起注定失败的调用；
+冷却结束进入半开，放一次探测，成功即闭合恢复真模型。
+
+一个已知残留（诚实记录，本模块未解决）
+--------------------------------------
+哈希向量是 256 维，真实 embedding 通常是 768/1024/1536 维。若语料里已存有真实
+向量，而降级期间又写入了哈希向量，`cosine()` 会按较短维度截断比较——那部分
+相似度不可靠。彻底解法是给向量库标注"空间指纹"并按空间分集合检索（需要动
+Qdrant 集合结构），本轮先保证**降级可见**：跳闸与降级都会打 WARNING，
+`/admin/ops/circuit` 可直接看到 embedding 通道状态。
+"""
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 
 from app.core import runtime_config
 from app.core.config import get_settings
+
+_logger = logging.getLogger("app.rag.embedder")
 
 _DIM = 256
 
@@ -89,32 +111,58 @@ def bm25_tokenize(text: str) -> list[str]:
     return tokens
 
 
+def breaker_label(cfg: dict) -> str:
+    """按 (端点 + 模型) 隔离：换了模型就是换了故障域，不该共用一份失败计数。"""
+    base = str(cfg.get("base_url") or "").rstrip("/")
+    model = str(cfg.get("model") or "")
+    return f"embedding:{base}#{model}"
+
+
+async def _embed_remote(cfg: dict, text: str) -> list[float]:
+    """真实接口调用（拆出来是为了让测试能替换它而不必起 HTTP 服务）。"""
+    import httpx
+
+    from app.core.security import retry_async
+
+    async def _call() -> list[float]:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                f"{cfg['base_url'].rstrip('/')}/embeddings",
+                headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                json={"model": cfg["model"], "input": text},
+            )
+            resp.raise_for_status()
+            return resp.json()["data"][0]["embedding"]
+
+    return await retry_async(_call, attempts=2, exceptions=(httpx.HTTPError,))
+
+
 async def embed(text: str) -> list[float]:
     cfg = runtime_config.effective("embedding")
-    if cfg["api_key"] and cfg["base_url"] and cfg["model"]:
-        import httpx
+    if not (cfg["api_key"] and cfg["base_url"] and cfg["model"]):
+        return _hash_embed(text)
 
-        async def _call() -> list[float]:
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(
-                    f"{cfg['base_url'].rstrip('/')}/embeddings",
-                    headers={"Authorization": f"Bearer {cfg['api_key']}"},
-                    json={"model": cfg["model"], "input": text},
-                )
-                resp.raise_for_status()
-                return resp.json()["data"][0]["embedding"]
+    from app.core.circuit import get_breaker
 
-        from app.core.security import retry_async
+    breaker = get_breaker(breaker_label(cfg))
+    if not breaker.allows():
+        # 冷却期内不再向上游发注定失败的请求——这是断路器最实在的收益：
+        # 把"每次请求白等两个超时周期"换成"立刻降级"。
+        _logger.debug("embedding 通道熔断中，本次直接使用哈希兜底向量")
+        return _hash_embed(text)
 
-        try:
-            return await retry_async(_call, attempts=2, exceptions=(httpx.HTTPError,))
-        except Exception as exc:
-            import logging
+    try:
+        vector = await _embed_remote(cfg, text)
+    except Exception as exc:  # noqa: BLE001 - 上游异常类型不可枚举
+        breaker.record_failure(f"{type(exc).__name__}: {exc}")
+        _logger.warning(
+            "embedding 接口调用失败，降级哈希向量（检索质量下降，且与已存真实向量维度不同）: %s",
+            exc,
+        )
+        return _hash_embed(text)
 
-            logging.getLogger("app.rag.embedder").warning(
-                "embedding 接口调用失败，降级哈希向量（检索质量下降）: %s", exc
-            )
-    return _hash_embed(text)
+    breaker.record_success()
+    return vector
 
 
 def cosine(a: list[float], b: list[float]) -> float:
