@@ -12,6 +12,26 @@ set -e
 # glibc 多 arena 虚拟内存膨胀抑制（多线程 Python 进程实测可省 20%+ RSS）
 export MALLOC_ARENA_MAX=2
 
+# ---- 数据目录归位（修一个静默的数据丢失隐患）----
+# 历史遗留：SQLite 默认落在 /app/backend/data/app.db，而本镜像声明的持久化卷是
+# /app/data —— 也就是"卷里其实是空的"，换容器/重建即丢全部用户与课件数据。
+# 首次启动若旧路径有库、卷上还没有，搬过去（cp 保留权限与时间戳）。
+mkdir -p /app/data
+if [ -f /app/backend/data/app.db ] && [ ! -f /app/data/app.db ]; then
+  echo "[start] 发现旧路径数据库，迁移到持久化卷 /app/data"
+  cp -p /app/backend/data/app.db /app/data/app.db
+fi
+export APP_DB_PATH="${APP_DB_PATH:-/app/data/app.db}"
+
+# ---- schema 对齐（启动前串行执行，失败即退出进入重启循环）----
+cd /app/backend
+if [ "${AUTO_MIGRATE:-1}" = "0" ]; then
+  echo "[start] AUTO_MIGRATE=0，跳过 schema 迁移"
+else
+  echo "[start] 对齐数据库 schema（alembic upgrade head）..."
+  python scripts/migrate.py
+fi
+
 cd /app/backend
 python -m uvicorn app.main:app \
   --host 127.0.0.1 --port 8000 \

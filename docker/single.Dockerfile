@@ -33,6 +33,10 @@ WORKDIR /app
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 COPY backend/app ./backend/app
+# 迁移所需三件套：启动脚本要跑 `alembic upgrade head`（缺任一件都会在启动期报错）
+COPY backend/alembic.ini ./backend/alembic.ini
+COPY backend/migrations ./backend/migrations
+COPY backend/scripts ./backend/scripts
 
 # 前端：standalone 产物（node:20-bookworm-slim 的 nodejs 即 Debian node 18+，兼容）
 COPY --from=fe-builder /app/.next/standalone ./frontend
@@ -42,7 +46,11 @@ COPY docker/start.sh /start.sh
 RUN chmod +x /start.sh && mkdir -p /app/data
 
 VOLUME ["/app/data"]
-ENV BACKEND_ORIGIN=http://127.0.0.1:8000/api/v1 \
+# SQLite 落盘位置必须**指向持久化卷**：默认路径是 backend/data/app.db，
+# 而卷挂在 /app/data —— 不显式指定的话卷永远是空的，重建容器即丢数据。
+# start.sh 里还有一次"旧路径 → 卷"的一次性搬迁，兼容已存在的部署。
+ENV APP_DB_PATH=/app/data/app.db \
+    BACKEND_ORIGIN=http://127.0.0.1:8000/api/v1 \
     PORT=3000 \
     HOSTNAME=0.0.0.0 \
     UVICORN_WORKERS=1 \

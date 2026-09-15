@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,8 @@ _mem_tenants: dict[str, dict[str, Any]] = {}
 _mem_txns: list[dict[str, Any]] = []
 _mem_usage: list[dict[str, Any]] = []
 _mem_feedback: list[dict[str, Any]] = []
+# 体验额度已检查过的租户（只是省掉热路径上的重复查询，权威判定是流水唯一索引）
+_mem_trial_checked: set[str] = set()
 
 
 def _now_ms() -> int:
@@ -67,6 +70,8 @@ def reset_memory() -> None:
     _mem_txns.clear()
     _mem_usage.clear()
     _mem_feedback.clear()
+    # 体验额度的"已检查"标记也要清：否则下一个用例会以为该租户已发过
+    _mem_trial_checked.clear()
 
 
 # ------------------------------------------------------------ 价格估算 ----
@@ -297,6 +302,72 @@ def _sync_ledger(tenant_id: str, amount: int) -> None:
             get_ledger().debit(account, -amount)
     except Exception:  # noqa: BLE001 - 账本不可用不该让台账写入失败
         _logger.warning("账本同步失败（台账已记账，需人工核对）: tenant=%s amount=%s", tenant_id, amount)
+
+
+# ------------------------------------------------- 新租户体验额度 ----
+# 「新注册机构开箱即 402」是最伤交付体验的一种死锁：租户刚建好、成员一点提问
+# 就被余额拦下。根因是余额只由充值注入，而充值需要平台超管手动操作——
+# 交付演示时没人会先去后台充一笔。这里给每个租户一次性体验额度，把死锁消除。
+#
+# 三个设计取舍：
+# 1. **复用 top_up 的不可变流水**（唯一幂等键 `trial:<tenant>`），而不是直接
+#    调 ledger.grant：这样额度有台账、可审计、可对账，且天然防双发
+#    （并发/重试/多副本都由唯一索引兜底），不需要发明第二套幂等机制。
+# 2. **幂等键不含时间戳**：体验额度是"一次性"而不是"每天一次"，否则等于
+#    给每个租户无限免费额度，成本敞口不可控。
+# 3. **进程内已检查集合**只是省掉热路径上的重复查询；权威判定始终是流水唯一索引
+#    ——多副本下每个副本各查一次，但仍只会入账一笔。
+
+TRIAL_OPERATOR = "system:trial"
+TRIAL_MEMO = "新租户体验额度（系统一次性发放）"
+_DEFAULT_TRIAL_CREDITS = 50_000
+
+
+def trial_credits() -> int:
+    """体验额度大小：`TENANT_TRIAL_CREDITS` 环境变量，默认 50000；0 表示关闭。"""
+    raw = (os.getenv("TENANT_TRIAL_CREDITS") or "").strip()
+    if not raw:
+        return _DEFAULT_TRIAL_CREDITS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        _logger.warning("TENANT_TRIAL_CREDITS=%r 不是整数，按默认 %d 处理", raw, _DEFAULT_TRIAL_CREDITS)
+        return _DEFAULT_TRIAL_CREDITS
+
+
+async def grant_trial_quota(tenant_id: str, credits: int | None = None) -> dict[str, Any]:
+    """为新租户发放一次性体验额度（幂等）。
+
+    返回 `{granted, duplicated, skipped, txn}`：`granted` 为本次实际入账额度，
+    重复调用时为 0 且 `duplicated=True`。
+    """
+    amount = trial_credits() if credits is None else max(0, int(credits))
+    if amount <= 0:
+        return {"granted": 0, "duplicated": False, "skipped": True, "txn": None}
+
+    if tenant_id in _mem_trial_checked:
+        return {"granted": 0, "duplicated": True, "skipped": False, "txn": None}
+
+    key = f"trial:{tenant_id}"
+    hit = await _txn_by_idem(key)
+    if hit is not None:
+        _mem_trial_checked.add(tenant_id)
+        return {"granted": 0, "duplicated": True, "skipped": False, "txn": hit}
+
+    try:
+        res = await top_up(
+            tenant_id, amount,
+            operator_id=TRIAL_OPERATOR, idempotency_key=key, memo=TRIAL_MEMO,
+        )
+    except ValueError:
+        # 极少数并发竞态（唯一索引已在别处抢先入账）——不影响业务，视为已发放
+        _mem_trial_checked.add(tenant_id)
+        return {"granted": 0, "duplicated": True, "skipped": False, "txn": None}
+
+    _mem_trial_checked.add(tenant_id)
+    granted = 0 if res["duplicated"] else amount
+    _logger.info("租户 %s 体验额度发放：%d（重复=%s）", tenant_id, granted, res["duplicated"])
+    return {"granted": granted, "duplicated": res["duplicated"], "skipped": False, "txn": res["txn"]}
 
 
 async def list_txns(tenant_id: str, limit: int = 200) -> list[dict[str, Any]]:

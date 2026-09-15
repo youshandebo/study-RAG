@@ -27,6 +27,10 @@ services:
       # 生产标记：backend 启动探针据此拒绝"缺 REDIS_URL 的静默降级"。
       # 无特殊需要不要改成 development，否则配额/闸门/限流会退回进程内口径。
       - ENV=${ENV:-production}
+      # 启动即对齐 schema（容器入口串行跑 alembic upgrade head）；0 关闭。
+      - AUTO_MIGRATE=${AUTO_MIGRATE:-1}
+      # 新机构一次性体验额度（0 = 关闭，改为纯后台充值模式）
+      - TENANT_TRIAL_CREDITS=${TENANT_TRIAL_CREDITS:-50000}
       - MEMBERSHIP_MODE=${MEMBERSHIP_MODE:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}

@@ -354,6 +354,10 @@ async def chat_stream(req: ChatRequest, request: Request, user: AuthUser = Depen
         ctx = await store.tenant_billing_context(tenant)
         if ctx.get("frozen"):
             raise HTTPException(status_code=403, detail="该机构账户已冻结，请联系机构管理员")
+        # 体验额度兜底：覆盖「先于本功能就已存在」或「绕过创建接口隐式产生」的租户。
+        # 幂等由流水唯一键（trial:<tenant>）保证，进程内已检查集合只负责省掉重复查询，
+        # 所以放在热路径上也只是一次集合查找。
+        await store.grant_trial_quota(tenant)
         account = store.tenant_account_key(tenant)
         override = ctx.get("daily_cap_override")
         if override is not None:

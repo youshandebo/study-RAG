@@ -11,13 +11,19 @@
 连续失败跳闸后，冷却期内**直接走哈希兜底**，不再向上游发起注定失败的调用；
 冷却结束进入半开，放一次探测，成功即闭合恢复真模型。
 
-一个已知残留（诚实记录，本模块未解决）
---------------------------------------
-哈希向量是 256 维，真实 embedding 通常是 768/1024/1536 维。若语料里已存有真实
-向量，而降级期间又写入了哈希向量，`cosine()` 会按较短维度截断比较——那部分
-相似度不可靠。彻底解法是给向量库标注"空间指纹"并按空间分集合检索（需要动
-Qdrant 集合结构），本轮先保证**降级可见**：跳闸与降级都会打 WARNING，
-`/admin/ops/circuit` 可直接看到 embedding 通道状态。
+向量空间一致性（本模块最容易被忽略的约束）
+------------------------------------------
+哈希向量是 256 维词袋，真实 embedding 通常是 768/1024/1536 维——两者是**不同的
+向量空间**。混进同一集合的后果不是"略有影响"，而是：Qdrant 维度不符直接 400，
+或（集合恰为 256 维时）主空间几何拓扑被永久污染且无法区分污染点；检索侧
+`cosine()` 又按短维度截断比较，稳定地返回错误结果——比"检索不到"更糟。
+
+因此本模块把"是否降级"作为**一等返回值**（`embed_with_status`），由调用方决定
+降级期怎么办：`retriever` 在写入侧跳过向量落库（只进 BM25）、在查询侧跳过 dense
+通道。宁可降级到稀疏检索，也不写一个不同空间的向量进去。
+
+仍需注意的边界：本模块的 breaker 状态是**进程内**的，多副本下各副本独立判定降级；
+这不影响正确性（每个副本各自决定自己那条链路），但意味着降级恢复时间不完全同步。
 """
 from __future__ import annotations
 
@@ -137,10 +143,28 @@ async def _embed_remote(cfg: dict, text: str) -> list[float]:
     return await retry_async(_call, attempts=2, exceptions=(httpx.HTTPError,))
 
 
-async def embed(text: str) -> list[float]:
+async def embed_with_status(text: str) -> tuple[list[float], bool]:
+    """返回 `(向量, 是否降级)`。
+
+    **为什么必须把"降级"透出来，而不是悄悄返回一个哈希向量**
+    ------------------------------------------------------
+    哈希向量是 256 维词袋，真实 embedding 通常是 768/1024/1536 维。两者是
+    **不同的向量空间**，一旦混进同一个集合：
+
+    - Qdrant 侧：维度不符直接 400（写入失败），或集合恰为 256 维时被当成
+      合法向量写入 → 主空间的几何拓扑被永久污染，且不可逆（无法区分哪些点
+      是污染点，除非重建集合）；
+    - 检索侧：cosine 会按较短维度截断比较，得分完全是无意义的噪声——
+      比"检索不到"更糟：它会稳定地返回错误结果。
+
+    所以调用方必须知道"这次向量不可信"：写入路径据此**跳过向量落库**
+    （只进 BM25 稀疏索引），查询路径据此**跳过 dense 通道**。降级期检索质量
+    下降，但结果是诚实的；污染是永久且隐蔽的。
+    """
     cfg = runtime_config.effective("embedding")
     if not (cfg["api_key"] and cfg["base_url"] and cfg["model"]):
-        return _hash_embed(text)
+        # 未配置接口 = 本部署就以哈希为正式方案（零依赖演示），不算"降级"
+        return _hash_embed(text), False
 
     from app.core.circuit import get_breaker
 
@@ -149,7 +173,7 @@ async def embed(text: str) -> list[float]:
         # 冷却期内不再向上游发注定失败的请求——这是断路器最实在的收益：
         # 把"每次请求白等两个超时周期"换成"立刻降级"。
         _logger.debug("embedding 通道熔断中，本次直接使用哈希兜底向量")
-        return _hash_embed(text)
+        return _hash_embed(text), True
 
     try:
         vector = await _embed_remote(cfg, text)
@@ -159,9 +183,15 @@ async def embed(text: str) -> list[float]:
             "embedding 接口调用失败，降级哈希向量（检索质量下降，且与已存真实向量维度不同）: %s",
             exc,
         )
-        return _hash_embed(text)
+        return _hash_embed(text), True
 
     breaker.record_success()
+    return vector, False
+
+
+async def embed(text: str) -> list[float]:
+    """只要向量、不关心是否降级的调用方（如纯查询、演示语料灌入）走这里。"""
+    vector, _degraded = await embed_with_status(text)
     return vector
 
 

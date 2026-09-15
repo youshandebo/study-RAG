@@ -15,6 +15,7 @@ from app.core.membership import daily_cap_for, plan_for
 from app.core.security import SlidingWindowLimiter
 from app.core.tenancy import multi_tenant_enabled, resolve_tenant
 from app.services.llm.dispatch import TrackDispatcher
+from app.services.ops import store
 from app.services.tokens import estimate_tokens
 
 
@@ -69,9 +70,27 @@ async def compare_stream(
     ledger = get_ledger()
     account = account_key(None if user.anonymous else user.id, ip)
     compare_cap = daily_cap_for(user.tier)
-    # 与 /chat/stream 同口径：单租户/演示部署下，免费档的日上限就是它的预算，
-    # 必须发到余额上才可能通过 reserve 的余额校验（否则一律 402）。
-    if not multi_tenant_enabled() and compare_cap > 0:
+    tenant_bucket = ""
+    if multi_tenant_enabled():
+        # 与 /chat/stream 完全同口径：多租户下成员消费的是**机构**那本账。
+        # 此前比对走的是用户账户 + 租户日桶，等于"余额查个人、配额扣机构"——
+        # 个人账户没有充值入口 → 多租户下比对入口恒 402（体验额度也救不到，
+        # 因为额度发在租户账户上）。这里统一到租户账户。
+        tenant = resolve_tenant(user)
+        ctx = await store.tenant_billing_context(tenant)
+        if ctx.get("frozen"):
+            raise HTTPException(status_code=403, detail="该机构账户已冻结，请联系机构管理员")
+        await store.grant_trial_quota(tenant)
+        account = store.tenant_account_key(tenant)
+        tenant_bucket = tenant
+        override = ctx.get("daily_cap_override")
+        if override is not None:
+            compare_cap = int(override)
+        elif ctx.get("tier_override"):
+            compare_cap = daily_cap_for(ctx["tier_override"])
+    elif compare_cap > 0:
+        # 单租户/演示部署：免费档的日上限就是它的预算，必须发到余额上
+        # 才可能通过 reserve 的余额校验（否则一律 402）。
         ledger.ensure_daily_allowance(account, compare_cap)
     try:
         hold = ledger.reserve(
@@ -80,7 +99,7 @@ async def compare_stream(
             request_id=req.request_id or "",
             units=units,
             daily_cap=compare_cap,
-            daily_bucket=resolve_tenant(user) if multi_tenant_enabled() else "",
+            daily_bucket=tenant_bucket,
         )
     except DailyCapExceeded as exc:
         label = plan_for(user.tier).get("label") or user.tier

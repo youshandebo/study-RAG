@@ -13,4 +13,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 EXPOSE 8000
+
+# 启动即对齐 schema：ENTRYPOINT 串行执行 alembic upgrade head（见 docker-entrypoint.sh），
+# 失败则容器退出进入重启循环（明确暴露），而不是带着旧 schema 对外服务。
+# AUTO_MIGRATE=0 可关闭（交给手工控库的部署）。
+RUN chmod +x docker-entrypoint.sh
+ENTRYPOINT ["./docker-entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

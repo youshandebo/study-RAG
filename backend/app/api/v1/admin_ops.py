@@ -113,14 +113,19 @@ async def create_tenant(body: TenantCreate, request: Request, token: str = Depen
             tier_override=body.tier_override,
             daily_cap_override=body.daily_cap_override,
         )
+    # 体验额度：新机构如果没有这笔钱，成员第一次提问就被 402 拦下——
+    # "机构已建好却开箱不可用"是最伤交付的死锁（充值要平台超管手动做，
+    # 演示时没人会先去充）。一次性发放，幂等靠流水唯一键，多副本也只会入账一笔。
+    trial = await store.grant_trial_quota(body.tenant_id)
     await audit_log.record_admin(
         "ops.tenant.create", token=token,
         ip=audit_log.ip_of(request),
         tenant_id=body.tenant_id, target=body.tenant_id,
         detail={"label": body.label, "tier_override": body.tier_override,
-                "daily_cap_override": body.daily_cap_override},
+                "daily_cap_override": body.daily_cap_override,
+                "trial_granted": trial["granted"]},
     )
-    return {"tenant": acc}
+    return {"tenant": acc, "trial": trial}
 
 
 @router.patch("/admin/ops/tenants/{tenant_id}")

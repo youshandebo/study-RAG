@@ -326,3 +326,72 @@ class TestPlatformEndpoints:
         with pytest.raises(HTTPException) as ei:
             await create_tenant(TenantCreate(tenant_id="坏 id/含斜杠"), "tok")
         assert ei.value.status_code == 400
+
+
+# ----------------------------------------------- 新租户体验额度 ----
+class TestTenantTrialQuota:
+    """「新机构开箱即 402」是最伤交付的死锁：租户建好了，成员一问就被余额拦下。
+
+    权威幂等判定必须是**流水唯一索引**（`trial:<tenant>`），不是"先查一遍余额"——
+    后者在并发/多副本下会双发，等于凭空多发钱。
+    """
+
+    @pytest.mark.asyncio
+    async def test_new_tenant_gets_trial_credit(self, db_env):
+        from app.api.v1.admin_ops import TenantCreate, create_tenant
+
+        out = await create_tenant(TenantCreate(tenant_id="org-new", label="新机构"), None, "tok")
+
+        assert out["trial"]["granted"] == store.trial_credits() > 0
+        assert get_ledger().balance(store.tenant_account_key("org-new")) == store.trial_credits()
+        txns = await store.list_txns("org-new")
+        assert len(txns) == 1
+        assert txns[0]["idempotency_key"] == "trial:org-new"
+        assert txns[0]["operator_id"] == store.TRIAL_OPERATOR
+
+    @pytest.mark.asyncio
+    async def test_trial_is_granted_at_most_once(self, db_env):
+        from app.api.v1.admin_ops import TenantCreate, create_tenant
+
+        await create_tenant(TenantCreate(tenant_id="org-new"), None, "tok")
+        again = await create_tenant(TenantCreate(tenant_id="org-new"), None, "tok")
+
+        assert again["trial"]["granted"] == 0 and again["trial"]["duplicated"] is True
+        assert get_ledger().balance(store.tenant_account_key("org-new")) == store.trial_credits()
+        assert len(await store.list_txns("org-new")) == 1, "体验额度只能有一笔流水"
+
+    @pytest.mark.asyncio
+    async def test_trial_can_be_disabled_by_env(self, db_env, monkeypatch):
+        monkeypatch.setenv("TENANT_TRIAL_CREDITS", "0")
+
+        res = await store.grant_trial_quota("org-x")
+
+        assert res["skipped"] is True and res["granted"] == 0
+        assert await store.list_txns("org-x") == []
+        assert get_ledger().balance(store.tenant_account_key("org-x")) == 0
+
+    @pytest.mark.asyncio
+    async def test_trial_amount_is_configurable(self, db_env, monkeypatch):
+        monkeypatch.setenv("TENANT_TRIAL_CREDITS", "1234")
+
+        res = await store.grant_trial_quota("org-x")
+
+        assert res["granted"] == 1234
+        assert get_ledger().balance(store.tenant_account_key("org-x")) == 1234
+
+    @pytest.mark.asyncio
+    async def test_lazy_grant_heals_preexisting_tenant(self, db_env):
+        """早于本功能创建的租户（或绕过创建接口隐式产生的租户）也要能自愈。"""
+        await store.ensure_tenant("org-old", "历史机构")
+        assert get_ledger().balance(store.tenant_account_key("org-old")) == 0
+
+        res = await store.grant_trial_quota("org-old")
+
+        assert res["granted"] == store.trial_credits()
+        assert get_ledger().balance(store.tenant_account_key("org-old")) == store.trial_credits()
+
+    @pytest.mark.asyncio
+    async def test_trial_credits_survives_bad_env_value(self, db_env, monkeypatch):
+        monkeypatch.setenv("TENANT_TRIAL_CREDITS", "not-a-number")
+
+        assert store.trial_credits() == 50_000, "脏配置应按默认值处理而不是崩溃或归零"

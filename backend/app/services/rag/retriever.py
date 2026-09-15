@@ -206,14 +206,17 @@ class HybridRetriever:
             chunk = Chunk(**item)
             chunk.tenant_id = DEFAULT_TENANT
             self._chunks[chunk.id] = chunk
-            vec = await embedder.embed(f"{chunk.exam_point} {chunk.text}")
-            self._vectors[chunk.id] = vec
-            await self._store.upsert(chunk.id, vec, chunk.to_payload())
+            vec, degraded = await embedder.embed_with_status(f"{chunk.exam_point} {chunk.text}")
             self._bm25.add(
                 chunk.id,
                 embedder.bm25_tokenize(f"{chunk.exam_point} {chunk.text}"),
                 chunk.tenant_id,
             )
+            if degraded:
+                # 与 register_chunks 同一口径：降级期不把哈希向量写进主空间
+                continue
+            self._vectors[chunk.id] = vec
+            await self._store.upsert(chunk.id, vec, chunk.to_payload())
 
     @staticmethod
     def _lexical_overlap(query_tokens: set[str], text: str) -> float:
@@ -315,7 +318,11 @@ class HybridRetriever:
         from app.core.runtime_config import effective as cfg_effective
 
         weights = cfg_effective("retrieval")
-        qvec = await embedder.embed(query)
+        # 查询向量的**降级状态必须向下传递**：降级时拿到的是 256 维哈希向量，
+        # 与集合里的真实向量不同空间。此时若继续走 dense 通道，cosine 会按短维度
+        # 截断比较，稳定返回错误结果——宁可退化成纯稀疏检索（BM25 + 词面），
+        # 也不要一个"看起来有分、实则无关"的排序。
+        qvec, q_degraded = await embedder.embed_with_status(query)
         qtokens = embedder.bm25_tokenize(query)
         # 租户过滤必须在**召回**与**打分**两端同时生效，缺任一端都可能越权：
         # 只过滤召回，则 BM25 打分仍会看到跨租户文档的 tf/idf 统计；
@@ -354,23 +361,33 @@ class HybridRetriever:
         # 候选池经 store.search（Qdrant 带 tenant_id + course_id payload filter /
         # 内存库等价余弦），多副本部署时结果由共享向量库决定，不依赖进程内字典。
         # 远端命中的切片若不在本进程缓存，用 payload 重建元数据。
-        try:
-            hits = await self._store.search(
-                qvec, top_k=recall_depth, course_id=course_id or None,
-                tenant_id=tenant_id,
+        if q_degraded:
+            # 降级：查询向量不可信 → 完全不进 dense 通道。融合里 sim 恒为 0，
+            # 语义锚点按设计保留 ANCHOR 比例（"无语义证据"而非"语义无关"）。
+            _logger.warning(
+                "查询 embedding 处于降级（哈希空间），本次跳过向量通道，仅用 BM25 + 词面召回"
             )
-        except Exception as exc:
-            _logger.warning("store.search 失败，回退进程内候选池: %s", exc)
-            hits = [
-                (cid, embedder.cosine(qvec, self._vectors[cid]), self._chunks[cid].to_payload())
-                for cid in self._vectors
-                if not course_id or self._chunks[cid].course_id == course_id
-            ]
-            if scoped_tenant:
+            hits: list[tuple[str, float, dict]] = []
+        else:
+            try:
+                hits = await self._store.search(
+                    qvec, top_k=recall_depth, course_id=course_id or None,
+                    tenant_id=tenant_id,
+                )
+            except Exception as exc:
+                _logger.warning("store.search 失败，回退进程内候选池: %s", exc)
+                # 进程内兜底只用 `_vectors` 里**同空间**的向量：降级期间的切片
+                # 本就不写向量（见 register_chunks），所以这里不会混入哈希向量。
                 hits = [
-                    (pid, sim, pl) for pid, sim, pl in hits
-                    if str((pl or {}).get("tenant_id") or DEFAULT_TENANT) == scoped_tenant
+                    (cid, embedder.cosine(qvec, self._vectors[cid]), self._chunks[cid].to_payload())
+                    for cid in self._vectors
+                    if not course_id or self._chunks[cid].course_id == course_id
                 ]
+                if scoped_tenant:
+                    hits = [
+                        (pid, sim, pl) for pid, sim, pl in hits
+                        if str((pl or {}).get("tenant_id") or DEFAULT_TENANT) == scoped_tenant
+                    ]
 
         candidate_map: dict[str, tuple[float, Chunk]] = {}
         for pid, sim, payload in hits:
@@ -535,24 +552,40 @@ class HybridRetriever:
 
         向量与倒排各自持有锁；先索引后可见，避免并发读写冲突。返回新增数量。
         租户归属由调用方（ingest）在 `_tag_scope` 阶段服务端注入，此处只做落库。
+
+        **降级期不写向量**：embedding 接口挂掉时拿到的是 256 维哈希向量，与集合里的
+        真实向量不同空间——写进去就是永久污染（且无法区分污染点）。此时只把切片
+        放进 BM25 稀疏索引与进程内缓存：检索仍能通过关键词通道命中它，
+        语义通道等接口恢复后重建即可。
         """
         await self._ensure_seeded()
         added = 0
+        degraded_skipped = 0
         for chunk in new_chunks:
             if chunk.id in self._chunks:
                 continue
             if not (chunk.text or "").strip():
                 continue  # 兜底：任何来源的空切片都不入向量库（占位 top_k 且拉低检索信噪比）
-            vec = await embedder.embed(f"{chunk.exam_point} {chunk.text}")
+            vec, degraded = await embedder.embed_with_status(f"{chunk.exam_point} {chunk.text}")
             self._chunks[chunk.id] = chunk
-            self._vectors[chunk.id] = vec
-            await self._store.upsert(chunk.id, vec, chunk.to_payload())
             self._bm25.add(
                 chunk.id,
                 embedder.bm25_tokenize(f"{chunk.exam_point} {chunk.text}"),
                 chunk.tenant_id,
             )
+            if degraded:
+                # 不进 `_vectors`、不进向量库：避免污染主空间
+                degraded_skipped += 1
+                added += 1
+                continue
+            self._vectors[chunk.id] = vec
+            await self._store.upsert(chunk.id, vec, chunk.to_payload())
             added += 1
+        if degraded_skipped:
+            _logger.warning(
+                "embedding 降级：%d 条切片仅进 BM25 稀疏索引、未写向量（接口恢复后需重建）",
+                degraded_skipped,
+            )
         return added
 
     async def all_chunks(self, tenant_id: str | None = None) -> list[Chunk]:
