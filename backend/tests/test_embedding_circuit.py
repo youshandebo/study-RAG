@@ -122,7 +122,13 @@ async def test_half_open_probe_recovers(monkeypatch):
         await embedder.embed("触发跳闸")
 
     breaker = circuit.get_breaker(label)
-    breaker.opened_at = 0.0  # 模拟冷却期已过 → 半开
+    # 让"冷却已过"这件事**与绝对时钟无关**：opened_at=0 且 cooldown=0 时，
+    # `clock() < opened_at + cooldown` 对任何非负时钟都为假 → 判定 HALF_OPEN。
+    # 之前只把 opened_at 设成 0、保留 cooldown=60，等价于赌 `time.monotonic() > 60`；
+    # 刚启动的容器/CI runner 上 monotonic 可能小于 60，于是仍被当成 OPEN、不放行探测
+    # （本机 uptime 大时却会通过——典型的墙钟依赖测试）。
+    breaker.opened_at = 0.0
+    breaker.config.cooldown_s = 0.0
 
     remote = _Remote(vector=[0.3] * 768)
     monkeypatch.setattr(embedder, "_embed_remote", remote)
