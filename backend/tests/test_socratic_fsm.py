@@ -353,6 +353,11 @@ class TestSchemaAndMigration:
     def test_migration_revision_chain(self):
         import importlib.util
 
+        # 迁移脚本本身 `from alembic import op`，而 alembic 属可选依赖
+        # （只列在 requirements-dev.txt）。缺它就跳过而不是报错——
+        # 否则任何"只装运行时依赖"的环境（含此前的 CI）都会整条变红。
+        pytest.importorskip("alembic")
+
         path = Path(__file__).resolve().parent.parent / "migrations" / "versions" / "0004_socratic_fsm.py"
         spec = importlib.util.spec_from_file_location("mig_0004", path)
         mod = importlib.util.module_from_spec(spec)

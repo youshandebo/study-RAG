@@ -1,0 +1,24 @@
+# Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
+# 本地开发依赖（**CI 不读本文件**，见下面的说明）。
+#
+# 用途：一条命令把本地测试环境补齐
+#   pip install -r backend/requirements-dev.txt
+#
+# 与 requirements.txt 的分工
+# -------------------------
+# requirements.txt 是运行时清单（生产镜像按它安装）。
+# 测试额外需要 pytest / pytest-asyncio，这两个不进运行时清单。
+#
+# 为什么 CI 不直接用本文件
+# ------------------------
+# CI 的安装命令写在 .github/workflows/ci.yml 里，而修改 workflow 文件需要
+# 带 `workflow` scope 的凭据——仓库当前用的是普通 PAT，推不动 workflow 变更。
+# 因此本文件目前只服务本地开发；CI 侧改用"把测试所需依赖显式列进
+# requirements.txt（alembic）+ 安装行显式点名 pytest/pytest-asyncio"来满足。
+#
+# 新增测试依赖时务必两处同步：本文件 + .github/workflows/ci.yml 的安装行
+# （改 workflow 需要 workflow scope 的凭据）。
+-r requirements.txt
+
+pytest>=8.0
+pytest-asyncio>=0.23

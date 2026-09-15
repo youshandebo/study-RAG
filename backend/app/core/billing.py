@@ -124,6 +124,16 @@ end
 return 0
 """
 
+# 免费档的「每日额度」发放：一天一次，幂等靠 SETNX 占位。
+# 两步必须原子——先 SETNX 再 INCRBY，中间崩掉会导致"标记已发但余额没加"，
+# 用户当天再也拿不到额度（比多发一次更糟，且无法自愈）。
+_ALLOWANCE_LUA = """
+if redis.call('SET', KEYS[2], '1', 'NX', 'EX', ARGV[2]) then
+  return tonumber(redis.call('INCRBY', KEYS[1], ARGV[1]))
+end
+return -1
+"""
+
 
 def utc8_today() -> str:
     """当日 UTC+8 日期戳（YYYYMMDD），日计数的分桶键。"""
@@ -210,8 +220,11 @@ class BillingLedger:
         self._redis = self._init_redis()
         # 日配额计数：key = f"{date}:{bucket}"；同上，配置 Redis 时以 Redis 为准
         self._daily: dict[str, int] = {}
+        # 已发放过每日额度的 (date, account)，防止同一天重复发放
+        self._allowance_days: set[str] = set()
         self._reserve_lua = None      # 懒加载，避免无 Redis 时也去建 Script 对象
         self._decr_lua = None
+        self._allowance_lua = None
         # 可注入的时钟钩子：生产走真实时间，测试用它模拟跨日重置
         self._today_fn = utc8_today
         self._ttl_fn = seconds_to_midnight
@@ -247,6 +260,62 @@ class BillingLedger:
         if self._decr_lua is None:
             self._decr_lua = self._redis.register_script(_DAILY_DECR_LUA)
         return self._decr_lua
+
+    def _get_allowance_script(self):
+        if self._allowance_lua is None:
+            self._allowance_lua = self._redis.register_script(_ALLOWANCE_LUA)
+        return self._allowance_lua
+
+    # ------------------------------------------------- daily allowance ----
+    def ensure_daily_allowance(self, account: str, amount: int, date: str | None = None) -> int:
+        """把档位的**每日免费额度**发放到账户余额上（一天一次，幂等）。
+
+        为什么需要它
+        ------------
+        `reserve()` 的口径是"余额是唯一资金来源，日上限只是天花板"（见
+        `test_insufficient_balance_below_cap_still_blocks`）。但余额只由
+        `grant()` 注入，而 grant 的唯一调用方是**租户充值**。结果是：
+        单租户/演示部署里没有任何人给免费档用户发钱 → 每次提问都 402
+        → 全新部署开箱即不可用。而 `membership.daily_cap_for` 的注释明确写着
+        "12 万 ≈ 免费用户约 100 问/天"——即日上限**本来就该是**免费档的预算。
+
+        这里把两者的关系显式接上：日额度 → 余额（每天发一次），再由日上限
+        兜住"一天最多烧多少"。两道闸门各司其职：
+        - 本次发放决定"能不能开始问"（余额）
+        - 日上限决定"一天最多问多少"（成本熔断）
+
+        未用完的额度**不跨日结转**：缺口由每日重发补足，无需清账；
+        这是"日额度"而非"充值"的关键区别。
+
+        返回本次实际发放的额度；当天已发过返回 0。
+        """
+        amount = int(amount or 0)
+        if amount <= 0:
+            return 0
+        date = date or self._today_fn()
+        key = f"{date}:{account}"
+
+        if self._redis is not None:
+            try:
+                # TTL 多留 60 秒兜底时钟漂移，与日计数同口径
+                got = int(self._get_allowance_script()(
+                    keys=[self._rkey("bal", account), self._rkey("allow", date, account)],
+                    args=[amount, self._ttl_fn() + 60],
+                ))
+                return max(0, got)
+            except Exception as exc:
+                _logger.warning("Redis 每日额度发放失败，降级进程内: %s", exc)
+
+        with self._lock:
+            if key in self._allowance_days:
+                return 0
+            self._allowance_days.add(key)
+            if len(self._allowance_days) > _MAX_DAILY_ENTRIES:
+                # 只保留当日：昨天的额度标记本就该随 TTL 失效，留着只会泄漏内存
+                for k in [k for k in self._allowance_days if not k.startswith(f"{date}:")]:
+                    self._allowance_days.discard(k)
+            self._balances[account] = self._balances.get(account, 0) + amount
+            return amount
 
     # ------------------------------------------------------- balance ----
     def balance(self, account: str) -> int:
@@ -562,6 +631,7 @@ class BillingLedger:
             self._holds.clear()
             self._settled_ids.clear()
             self._daily.clear()
+            self._allowance_days.clear()
 
 
 _ledger: BillingLedger | None = None

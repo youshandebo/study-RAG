@@ -237,6 +237,83 @@ class TestPlanDefaults:
         assert daily_cap_for("max") == 2_000_000
         assert daily_cap_for("guest") == 20_000
 
+
+# ----------------------------------------------------- 每日免费额度 ----
+class TestDailyAllowance:
+    """免费档的每日额度发放。
+
+    要钉死的一条：**没有这道发放，全新部署开箱即 402**。
+    `reserve` 的口径是"余额覆盖冻结额"，而余额只由租户充值注入——
+    单租户/演示部署没有充值入口，免费档用户的余额恒为 0。
+    """
+
+    def test_zero_balance_account_can_ask_after_allowance(self):
+        led = _ledger()
+        assert led.balance("u:1") == 0
+
+        granted = led.ensure_daily_allowance("u:1", 20_000)
+
+        assert granted == 20_000
+        assert led.balance("u:1") == 20_000
+        # 关键：这次 reserve 不会再 402
+        assert led.reserve("u:1", 4000, daily_cap=20_000) is not None
+
+    def test_allowance_is_granted_once_per_day(self):
+        led = _ledger()
+        assert led.ensure_daily_allowance("u:1", 20_000) == 20_000
+        assert led.ensure_daily_allowance("u:1", 20_000) == 0, "同日重复调用不得叠发"
+        assert led.balance("u:1") == 20_000
+
+    def test_allowance_reissued_next_day(self):
+        led = _ledger()
+        led.ensure_daily_allowance("u:1", 20_000, date="20260915")
+        assert led.ensure_daily_allowance("u:1", 20_000, date="20260916") == 20_000
+
+    def test_allowance_is_per_account(self):
+        led = _ledger()
+        led.ensure_daily_allowance("u:1", 20_000)
+        led.ensure_daily_allowance("u:2", 20_000)
+        assert led.balance("u:1") == 20_000
+        assert led.balance("u:2") == 20_000
+
+    def test_zero_or_negative_amount_is_noop(self):
+        led = _ledger()
+        assert led.ensure_daily_allowance("u:1", 0) == 0
+        assert led.ensure_daily_allowance("u:1", -5) == 0
+        assert led.balance("u:1") == 0
+
+    def test_allowance_bounded_by_daily_cap(self):
+        """发放额度之后，真正的上限仍由日熔断兜住——两道闸门都有效。"""
+        led = _ledger()
+        led.ensure_daily_allowance("u:1", 8_000)
+
+        assert led.reserve("u:1", 4000, daily_cap=8_000) is not None
+        assert led.reserve("u:1", 4000, daily_cap=8_000) is not None
+        with pytest.raises(DailyCapExceeded):
+            led.reserve("u:1", 4000, daily_cap=8_000)
+
+    def test_topup_adds_on_top_of_allowance(self):
+        """充值是在每日额度之上叠加，不是替换。"""
+        led = _ledger()
+        led.ensure_daily_allowance("u:1", 20_000)
+        led.grant("u:1", 100_000)
+        assert led.balance("u:1") == 120_000
+
+    def test_redis_failure_still_gives_allowance_locally(self):
+        """Redis 抖动不能让用户当天彻底用不了（与"降级不放行"不同：
+        这里降级的是**发放**，仍走进程内账本，不是绕过校验）。"""
+        led = _ledger()
+        led._redis = BoomRedis()
+        assert led.ensure_daily_allowance("u:1", 20_000) == 20_000
+        assert led.balance("u:1") == 20_000
+
+    def test_reset_clears_allowance_markers(self):
+        led = _ledger()
+        led.ensure_daily_allowance("u:1", 20_000)
+        led.reset()
+        assert led.balance("u:1") == 0
+        assert led.ensure_daily_allowance("u:1", 20_000) == 20_000
+
     def test_unknown_tier_falls_back_to_free(self):
         from app.core.membership import daily_cap_for
 

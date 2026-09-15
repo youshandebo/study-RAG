@@ -36,6 +36,12 @@ export default function MessageCardRenderer({
   message: PolymorphicMessage;
   streaming: boolean;
 }) {
+  // Hook 必须在任何 early return **之前**调用：下方 user 分支会提前 return，
+  // 若把 useCitationOpener() 放在其后，用户消息与助教消息的 Hook 数量不同，
+  // 一旦同一位置复用组件实例（列表重排/消息角色变化）就会错位读状态。
+  // 这不是风格问题——`next build` 会以 react-hooks/rules-of-hooks 直接构建失败。
+  const citationOpener = useCitationOpener();
+
   // 用户消息：右侧对齐的墨绿气泡 + 「我」头像
   if (message.role === 'user') {
     return (
@@ -54,7 +60,6 @@ export default function MessageCardRenderer({
   }
 
   // 助教消息：左侧 🎓 头像 + 多态卡片本体 + 用量小字
-  const citationOpener = useCitationOpener();
   const onCite = citationOpener(message);
   return (
     <div className="msg-enter flex items-start gap-2.5">

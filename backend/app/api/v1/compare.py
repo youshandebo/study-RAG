@@ -68,13 +68,18 @@ async def compare_stream(
     # 比对是最高倍的烧钱入口，不能等到结算才记账。
     ledger = get_ledger()
     account = account_key(None if user.anonymous else user.id, ip)
+    compare_cap = daily_cap_for(user.tier)
+    # 与 /chat/stream 同口径：单租户/演示部署下，免费档的日上限就是它的预算，
+    # 必须发到余额上才可能通过 reserve 的余额校验（否则一律 402）。
+    if not multi_tenant_enabled() and compare_cap > 0:
+        ledger.ensure_daily_allowance(account, compare_cap)
     try:
         hold = ledger.reserve(
             account,
             TRACK_HOLD_AMOUNT,
             request_id=req.request_id or "",
             units=units,
-            daily_cap=daily_cap_for(user.tier),
+            daily_cap=compare_cap,
             daily_bucket=resolve_tenant(user) if multi_tenant_enabled() else "",
         )
     except DailyCapExceeded as exc:

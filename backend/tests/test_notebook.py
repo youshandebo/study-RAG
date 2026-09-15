@@ -501,6 +501,10 @@ class TestSchemaAndMigration:
     def test_migration_revision_chain(self):
         import importlib.util
 
+        # alembic 是可选依赖（只列在 requirements-dev.txt）；缺它时跳过，
+        # 避免"只装运行时依赖"的环境把整条 CI 拖红。
+        pytest.importorskip("alembic")
+
         path = Path(__file__).resolve().parent.parent / "migrations" / "versions" / "0005_mistake_notebook.py"
         spec = importlib.util.spec_from_file_location("mig_0005", path)
         mod = importlib.util.module_from_spec(spec)

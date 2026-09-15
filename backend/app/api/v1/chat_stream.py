@@ -360,6 +360,14 @@ async def chat_stream(req: ChatRequest, request: Request, user: AuthUser = Depen
             cap = int(override)
         elif ctx.get("tier_override"):
             cap = daily_cap_for(ctx["tier_override"])
+    else:
+        # 免费档的每日额度必须显式发到余额上：`reserve` 要求余额覆盖冻结额，
+        # 而余额只由 `grant` 注入（唯一调用方是**租户充值**）。单租户/演示部署
+        # 没有机构充值入口 → 不发额度就会每次提问 402，开箱即不可用。
+        # 多租户下刻意不发：机构才是付费方（后台充值到租户账户），
+        # 成员的消耗从机构那本账出，日上限负责兜住机构的最大日支出。
+        if cap > 0:
+            ledger.ensure_daily_allowance(account, cap)
     try:
         hold = ledger.reserve(
             account,

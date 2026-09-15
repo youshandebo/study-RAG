@@ -107,7 +107,7 @@ export default function SocraticDialogueCard({
       {payload?.guardBlocked && (
         <div className="mb-2.5 flex items-start gap-2 rounded-lg border border-warn/40 bg-warn-soft/50 px-3 py-2 text-[12.5px] text-ink-soft">
           <span aria-hidden>🛡️</span>
-          <span>已拦下"直接要答案"的请求——咱们把这一步再拆小一点，你自己推出来会更牢。</span>
+          <span>已拦下“直接要答案”的请求——咱们把这一步再拆小一点，你自己推出来会更牢。</span>
         </div>
       )}
 

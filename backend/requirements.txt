@@ -11,7 +11,10 @@ sqlalchemy[asyncio]>=2.0  # 关系库引擎：SQLite(默认)与 Postgres 共用�
 # ---- 可选重型依赖（生产部署按需启用，启用对应配置项时必须安装）----
 # qdrant-client>=1.9          # 配置 QDRANT_URL 时必须（检索候选真正走 Qdrant payload filter）
 # asyncpg>=0.29               # 配置 POSTGRES_DSN 时必须（Postgres 异步驱动）
-# alembic>=1.13               # 需要可追溯的 schema 迁移时（未装则用内置自动建表 + 幂等补列）
+alembic>=1.13                 # schema 迁移：migrations/ 是随仓库交付的，容器内需要能跑
+                              # `alembic upgrade head`；测试也会 import 迁移脚本
+                              # （缺它 → ModuleNotFoundError → CI 后端整条红）。
+                              # 体积只有 alembic + mako，代价可忽略。
 # celery[redis]>=5.3
 # redis>=5.0
 # minio>=7.2
