@@ -1,11 +1,24 @@
 # Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 """复习卷批改流水线：上传卷子 → 拆题 → 考点匹配定版解法 → 批改 → 生成变式新卷。
 
-流程（两期规划的第一期全量 + 第二期的过程比对模块）：
+流程（两期规划的第一期全量 + 第二期的过程比对模块 + Rubric 分步采分）：
   1. OCR（图片卷）或直接文本 → paper_splitter 拆题
   2. 每题 match_from_text 向量匹配考点 → 检索老师定版解法（review 模式）
-  3. 有学生过程 → process_diff 逐步比对（LLM 不可用自动降级整体判分）
+  3. 有学生过程 → 三级判分（见下方"判分层级"）
   4. 客观题 grade_objective 先判对错 → 每题生成同考点同难度变式新卷
+
+判分层级（逐级回落，越靠前越可靠）
+--------------------------------
+  ① 确定性判分 `grade_objective_by_canonical`：结论词/末位数值与定版直接比对，
+     不依赖 LLM，能判就判。
+  ② **Rubric 分步采分** `rubric.rubric_grade`：拆解采分点 → 逐点比对 →
+     按点给分 + 错因归因。这是理科阅卷的正确口径：方法对、中间算错一步
+     应拿 7 分而不是 0 分。分数算术在 Python 侧完成，模型只做语义判定。
+  ③ 整体判分 `diff_process`：Rubric 不可用时（无定版解法 / LLM 故障）的
+     兜底，只回答"对不对、第一处偏离在哪"。
+
+三级都判不出来时 `correct=None` → 计入 `needs_review` 交老师复核；
+**绝不因为批改器故障把学生判成错**。
 """
 from __future__ import annotations
 
@@ -18,6 +31,12 @@ from app.api.v1.auth import AuthUser, current_user_optional
 from app.core.tenancy import resolve_tenant
 from app.services.agent.process_diff import diff_process, socratic_followup
 from app.services.agent.quiz_generator import QuizGenerator, grade_objective
+from app.services.agent.rubric import (
+    DEFAULT_FULL_SCORE,
+    rubric_attribution,
+    rubric_followup,
+    rubric_grade,
+)
 from app.services.extractor.difficulty import score
 from app.services.extractor.exam_point import match_from_text
 from app.services.extractor.paper_splitter import ExamQuestion, split_paper
@@ -27,6 +46,9 @@ from app.services.vlm.ocr_engine import OCREngine
 router = APIRouter()
 
 MAX_QUESTIONS = 12  # 单卷批改上限（演示规模，防止 LLM 费用失控）
+# 每题满分。真实场景应由卷面/配置给定，此处统一按 10 分制——
+# Rubric 会把模型拆出的采分点**归一化**到这个满分，避免"11/10 分"。
+FULL_SCORE = DEFAULT_FULL_SCORE
 
 
 @router.post("/exam/grade")
@@ -86,19 +108,30 @@ async def grade_exam(
         canonical = [c for c in canonical_hits if c.exam_point == point.name] or canonical_hits[:1]
         q.canonical_chunk_ids = [c.id for c in canonical]
 
-        # 批改：客观题先精确判分；有学生过程再做步骤比对（可降级）
+        # ---- 三级判分：确定性 → Rubric 分步采分 → 整体判分 ----
         correct: bool | None = None
         attribution = ""
         followup: str | None = None
         diff_dict: dict | None = None
+        rubric_dict: dict | None = None
         if q.student_answer:
             correct, attribution = grade_objective_by_canonical(q, canonical)
             if correct is None:
-                diff = await diff_process(q.student_answer, q.question_text, canonical)
-                diff_dict = diff.to_dict()
-                correct = diff.is_final_answer_correct
-                attribution = diff.deviation_desc or attribution
-                followup = socratic_followup(diff)
+                rres = await rubric_grade(
+                    q.student_answer, q.question_text, canonical, full_score=FULL_SCORE
+                )
+                if not rres.degraded:
+                    rubric_dict = rres.to_dict()
+                    correct = rres.final_answer_correct
+                    attribution = rubric_attribution(rres) or rres.summary
+                    followup = rubric_followup(rres)
+                else:
+                    # Rubric 不可用 → 退回整体判分（其 deviated 结果仍是有效信息）
+                    diff = await diff_process(q.student_answer, q.question_text, canonical)
+                    diff_dict = diff.to_dict()
+                    correct = diff.is_final_answer_correct
+                    attribution = diff.deviation_desc or attribution
+                    followup = socratic_followup(diff)
         else:
             attribution = "卷面未作答"
 
@@ -110,6 +143,7 @@ async def grade_exam(
             "attribution": attribution,
             "socratic_followup": followup,
             "process_diff": diff_dict,
+            "rubric": rubric_dict,
         })
 
         # 变式新卷：同考点同难度，优先覆盖本次暴露的薄弱点
@@ -124,13 +158,30 @@ async def grade_exam(
             **variant.model_dump(),
         })
 
+    # 错因归因回填：优先用 Rubric 的根因类型（可聚合统计），
+    # 没有分步结果时退到归因文本。错题本据此做"计算失误"vs"概念不清"的区分补救。
+    pitfalls = [
+        (r.get("rubric") or {}).get("error_label")
+        or r["attribution"]
+        for r in report if r["correct"] is False
+    ]
     await repo.add_asset(session_id, {
         "kind": "exam",
         "uri": "",
         "filename": (file.filename if file else "") or f"复习卷·{len(questions)}题",
         "chunk_count": len(questions),
-        "pitfalls": [r["attribution"] for r in report if r["correct"] is False][:3],
+        "pitfalls": [p for p in pitfalls if p][:3],
     })
+
+    scored = [r["rubric"] for r in report if r.get("rubric")]
+    earned = sum(s["score"] for s in scored)
+    possible = sum(s["full_score"] for s in scored)
+    # 错因分布：运营端看的是"计算错误占比"这种可聚合信号，
+    # 而不是一叠自由文本评语。
+    dist: dict[str, int] = {}
+    for s in scored:
+        key = s.get("error_type") or "none"
+        dist[key] = dist.get(key, 0) + 1
 
     return {
         "summary": {
@@ -139,6 +190,13 @@ async def grade_exam(
             "correct": len([r for r in report if r["correct"] is True]),
             "wrong": len([r for r in report if r["correct"] is False]),
             "needs_review": len([r for r in report if r["correct"] is None and r["student_answer"]]),
+            # 分步采分统计：只有走通 Rubric 的题才计入，避免用
+            # "未批改题=0 分" 拉低得分率（那会把批改器故障算成学生失分）。
+            "graded_by_rubric": len(scored),
+            "score_earned": round(earned, 2),
+            "score_possible": round(possible, 2),
+            "score_rate": round(earned / possible, 3) if possible else None,
+            "error_distribution": dist,
         },
         "report": report,
         "new_paper": new_paper,
