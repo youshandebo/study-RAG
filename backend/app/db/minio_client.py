@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import pathlib
+import re
 import uuid
 
 from app.core.config import get_settings
@@ -66,3 +67,78 @@ async def put_object(kind: str, filename: str, content_b64: str) -> str:
     if url:
         return url
     return await asyncio.to_thread(_write_local, kind, raw, name)
+
+
+async def delete_object(url: str) -> bool:
+    """删除 `put_object` 上传的对象（MinIO 对象或本地静态文件），返回是否删除成功。
+
+    给入库失败补偿用，三条契约必须钉死：
+
+    1. **永不抛异常**。调用方一定在 `except` 分支里——清理动作自身失败（MinIO
+       抖动、权限不足）再抛一个错，就会把真正要看的原始异常顶掉，排障时看到的
+       变成"错误的原因的原因"。所以这里任何异常都吞掉，只以返回值表态。
+    2. **幂等**。重复补偿（如重试路径两次进入 except）不能炸，删了和没得删
+       都返回成功语义。
+    3. **白名单**。本地分支只认 `_write_local` 生成的 `/static/{audio|boards}/<name>`
+       形态，文件名限定安全字符集；任何带分隔符或相对路径成分的 URL 一律拒绝。
+       补偿入口一旦变成"任意路径删除"，就是比资源泄漏严重得多的安全漏洞。
+
+    MinIO 不可达时返回 False：残留对象只能靠离线 GC 兜底，本接口保证的是
+    **正常路径零泄漏**，不承诺异常 infrastructure 下的绝对一致性。
+    """
+    if not url:
+        return False
+    if url.startswith(("http://", "https://")):
+        return await asyncio.to_thread(_delete_minio, url)
+    return await asyncio.to_thread(_delete_local, url)
+
+
+# put_object 生成的本地文件名形态：`{uuid10}{ext}`，一律安全字符集。
+# 补偿入口是唯一能根据 URL 删文件的地方，字符集白名单是它的边界。
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def _delete_local(url: str) -> bool:
+    """删除本地静态文件；只接受白名单前缀 + 安全文件名，其余一律不动。"""
+    for prefix, directory in (("/static/audio/", AUDIO_DIR), ("/static/boards/", BOARDS_DIR)):
+        if url.startswith(prefix):
+            name = url[len(prefix):]
+            # 含 `/` 或 `..` 的名称直接拒：宁可留下孤儿，也不能让补���路径越界删文件
+            if not _SAFE_NAME.fullmatch(name):
+                return False
+            try:
+                (directory / name).unlink(missing_ok=True)  # missing_ok=True → 幂等
+            except OSError:
+                return False
+            return True
+    return False
+
+
+def _delete_minio(url: str) -> bool:
+    """按 `put_object` 生成的 URL 反解 bucket/对象键并删除。
+
+    只认当前配置端点下的 URL：端点被改过（URL 与配置不匹配）时宁可不删，
+    也不要拿着旧路径去动一个我们不认识的桶。
+    """
+    settings = get_settings()
+    if not settings.minio_endpoint:
+        return False
+    marker = f"http://{settings.minio_endpoint}/"
+    if not url.startswith(marker):
+        return False
+    bucket, sep, obj_path = url[len(marker):].partition("/")
+    if not sep or not bucket or not obj_path:
+        return False
+    try:
+        from minio import Minio
+
+        client = Minio(
+            settings.minio_endpoint,
+            access_key=settings.minio_access_key,
+            secret_key=settings.minio_secret_key,
+            secure=False,
+        )
+        client.remove_object(bucket, obj_path)
+        return True
+    except Exception:
+        return False

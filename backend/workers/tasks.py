@@ -13,7 +13,7 @@ def run_ingest_pipeline(session_id: str, media_type: str, raw: bytes, filename: 
     import asyncio
 
     async def _inner() -> dict:
-        from app.db.minio_client import put_object
+        from app.db.minio_client import delete_object, put_object
         from app.db import relational as repo
         from app.services.asr.hotwords import correct
         from app.services.asr.transcriber import Transcriber
@@ -30,30 +30,40 @@ def run_ingest_pipeline(session_id: str, media_type: str, raw: bytes, filename: 
         if media_type != "audio":
             return {"uri": url, "note": "board assets handled via ingest API"}
 
-        segments = await Transcriber().transcribe(raw, filename)
-        for seg in segments:
-            seg.text = correct(seg.text)
-        chunks = chunk_transcript(f"task-{abs(hash(filename)) % 10_000}", segments)
-        chunks = align_boards(chunks, board_count=12)
-        for c in chunks:
-            c.difficulty = score(c.text)
-
-        retriever = await get_retriever()
-        # Embedding 写入向量库(Qdrant/内存)后，register_chunks 内部会同步增量更新
-        # 内存 BM25 倒排索引（读写锁保护，写独占/读共享，避免并发检索读到半成品索引）
-        added = await retriever.register_chunks(chunks)
+        # 对象已上传到存储，此后的 ASR / 切片 / 向量化 / 落库任一步失败都会留下
+        # 没有任何资产记录指向它的孤儿文件（与 API 路径同一口径，必须同步补偿）。
         try:
-            await repo.add_asset(
-                session_id,
-                {"kind": media_type, "uri": url, "filename": filename, "chunk_count": added},
-            )
+            segments = await Transcriber().transcribe(raw, filename)
+            for seg in segments:
+                seg.text = correct(seg.text)
+            chunks = chunk_transcript(f"task-{abs(hash(filename)) % 10_000}", segments)
+            chunks = align_boards(chunks, board_count=12)
+            for c in chunks:
+                c.difficulty = score(c.text)
+
+            retriever = await get_retriever()
+            # Embedding 写入向量库(Qdrant/内存)后，register_chunks 内部会同步增量更新
+            # 内存 BM25 倒排索引（读写锁保护，写独占/读共享，避免并发检索读到半成品索引）
+            added = await retriever.register_chunks(chunks)
+            try:
+                await repo.add_asset(
+                    session_id,
+                    {"kind": media_type, "uri": url, "filename": filename, "chunk_count": added},
+                )
+            except Exception:
+                # 与 API 路径同一口径：落库失败必须补偿删除已写向量，
+                # 否则留下"检索命中、列表查不到"的孤儿切片（worker 进程被杀时同理，
+                # 那种情况只能靠离线核对，见 README 的运维说明）。
+                await retriever.unregister_chunks(
+                    [c.id for c in chunks], tenants={c.tenant_id for c in chunks}
+                )
+                raise
         except Exception:
-            # 与 API 路径同一口径：落库失败必须补偿删除已写向量，
-            # 否则留下"检索命中、列表查不到"的孤儿切片（worker 进程被杀时同理，
-            # 那种情况只能靠离线核对，见 README 的运维说明）。
-            await retriever.unregister_chunks(
-                [c.id for c in chunks], tenants={c.tenant_id for c in chunks}
-            )
+            # 对象文件补偿：碎不掉地把刚上传的归档删掉；删除自身失败不得掩盖原始异常
+            try:
+                await delete_object(url)
+            except Exception:
+                pass
             raise
         return {"uri": url, "chunks_added": added}
 

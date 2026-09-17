@@ -18,7 +18,7 @@ from app.api.v1.auth import AuthUser, current_user_optional
 from app.core.gate import DEFAULT_ACQUIRE_TIMEOUT_S, DEFAULT_LEASE_TTL_S, DistributedGate, GateTimeout
 from app.core.membership import plan_for, storage_limit_bytes
 from app.core.tenancy import resolve_tenant
-from app.db.minio_client import put_object
+from app.db.minio_client import delete_object, put_object
 from app.services.asr.hotwords import correct
 from app.services.asr.transcriber import Transcriber
 from app.services.extractor.difficulty import score
@@ -141,6 +141,27 @@ async def _register_with_rollback(
         )
         raise
     return added, asset
+
+
+async def _compensate_object(url: str) -> None:
+    """对象存储侧补偿：上传成功但后续入库失败时，把文件物理删掉。
+
+    为什么必须有这一步：`_register_with_rollback` 只回滚**向量**，而文件在更早的
+    `put_object` 就已经落盘/落桶了。assets 表是素材列表与存储配额的唯一真相源，
+    落库失败后这个对象再没有任何记录指向它——不可见、不计费、用户删不掉，
+    每次失败必然累积一个，直到磁盘或桶被撑爆。这是**确定性**泄漏，不是概率问题。
+
+    为什么包一层而不是直接 await delete_object：补偿动作必须**无法抛出异常**。
+    本函数运行在 except 分支里，若清理自身再抛错（MinIO 抖动、权限不足），
+    原始异常就被顶掉了——排障时看到的是"错误的原因的原因"。
+    残留（删不掉的对象）只能靠离线 GC 兜底；这里保证的是正常路径零泄漏。
+    """
+    if not url:
+        return
+    try:
+        await delete_object(url)
+    except Exception:
+        pass
 
 
 @router.post("/ingest")
@@ -319,25 +340,32 @@ async def _ingest_locked(
 
         url = await put_object("boards", filename or f"note-{uuid.uuid4().hex[:6]}.txt",
                                base64.b64encode(note_text.encode()).decode())
-        chunks = _build_text_chunks(note_text, filename or "文字笔记")
-        _tag_scope(chunks)
-        pitfalls = extract_from_chunks(chunks)
+        # 从这里开始，任何一步失败都已留下一个"没有资产记录指向它"的对象文件，
+        # 必须补偿删除；成功路径则原样保留（补偿只在 except 分支触发）。
+        try:
+            chunks = _build_text_chunks(note_text, filename or "文字笔记")
+            _tag_scope(chunks)
+            pitfalls = extract_from_chunks(chunks)
 
-        retriever = await get_retriever()
-        added, asset = await _register_with_rollback(
-            retriever,
-            chunks,
-            session_id,
-            {
-                "owner": None if user.anonymous else user.id,
-                "size_bytes": len(note_text.encode()),
-                "kind": "text",
-                "uri": url,
-                "filename": filename or f"{note_text[:12]}…",
-                "lecture_date": lecture_date,
-                "pitfalls": pitfalls[:3],
-            },
-        )
+            retriever = await get_retriever()
+            added, asset = await _register_with_rollback(
+                retriever,
+                chunks,
+                session_id,
+                {
+                    "owner": None if user.anonymous else user.id,
+                    "size_bytes": len(note_text.encode()),
+                    "kind": "text",
+                    "uri": url,
+                    "filename": filename or f"{note_text[:12]}…",
+                    "lecture_date": lecture_date,
+                    "pitfalls": pitfalls[:3],
+                },
+            )
+        except Exception:
+            await _compensate_object(url)
+            raise
+
         return {
             "asset": asset,
             "chunks_added": added,
@@ -356,56 +384,63 @@ async def _ingest_locked(
     )
 
 
-    if media_type == "audio":
-        segments = await Transcriber().transcribe(raw, file.filename or "")  # raw=16k PCM
-        for seg in segments:
-            seg.text = correct(seg.text)
-        audio_id = f"ing-{abs(hash(file.filename + course_id)) % 10_000}"
-        chunks = chunk_transcript(audio_id, segments)
-        chunks = align_boards(chunks, board_count=12)
-        for c in chunks:
-            c.difficulty = score(c.text)
-            c.pitfalls = []
-        _tag_scope(chunks)
-        pitfalls = extract_from_chunks(chunks)
-    else:
-        ocr = await OCREngine().recognize(recognize_b64)
-        text = ocr.get("problem_text") or ocr.get("latex", "")
-        audio_id = "board-only"
-        chunks = [
-            Chunk(
-                id=f"bd-{uuid.uuid4().hex[:10]}",
-                audio_id=audio_id,
-                start="00:00",
-                end="00:00",
-                text=text,
-                board_index=1,
-                board_caption=f"板书上传 · {file.filename or ''}",
-                exam_point="板书推导要点",
-                difficulty=score(text),
-            )
-        ]
-        _tag_scope(chunks)
-        pitfalls = []
+    # 与文本分支同一口径：对象已落存储之后（含 ASR/VLM 识别本身失败）
+    # 的任何异常都必须把文件删掉，否则留下无记录指向的孤儿对象。
+    try:
+        if media_type == "audio":
+            segments = await Transcriber().transcribe(raw, file.filename or "")  # raw=16k PCM
+            for seg in segments:
+                seg.text = correct(seg.text)
+            audio_id = f"ing-{abs(hash(file.filename + course_id)) % 10_000}"
+            chunks = chunk_transcript(audio_id, segments)
+            chunks = align_boards(chunks, board_count=12)
+            for c in chunks:
+                c.difficulty = score(c.text)
+                c.pitfalls = []
+            _tag_scope(chunks)
+            pitfalls = extract_from_chunks(chunks)
+        else:
+            ocr = await OCREngine().recognize(recognize_b64)
+            text = ocr.get("problem_text") or ocr.get("latex", "")
+            audio_id = "board-only"
+            chunks = [
+                Chunk(
+                    id=f"bd-{uuid.uuid4().hex[:10]}",
+                    audio_id=audio_id,
+                    start="00:00",
+                    end="00:00",
+                    text=text,
+                    board_index=1,
+                    board_caption=f"板书上传 · {file.filename or ''}",
+                    exam_point="板书推导要点",
+                    difficulty=score(text),
+                )
+            ]
+            _tag_scope(chunks)
+            pitfalls = []
 
-    retriever = await get_retriever()
-    added, asset = await _register_with_rollback(
-        retriever,
-        chunks,
-        session_id,
-        {
-            "owner": None if user.anonymous else user.id,
-            "size_bytes": len(raw),
-            "kind": media_type,
-            "uri": url,
-            "filename": file.filename or "",
-            # 音频与切片组的关联键：切片回听时据此精确定位录音文件，
-            # 否则多份录音共存时无法判断该放哪一份（历史 bug）
-            "audio_id": audio_id,
-            "lecture_date": lecture_date,
-            "pitfalls": pitfalls[:3],
-        },
-    )
+        retriever = await get_retriever()
+        added, asset = await _register_with_rollback(
+            retriever,
+            chunks,
+            session_id,
+            {
+                "owner": None if user.anonymous else user.id,
+                "size_bytes": len(raw),
+                "kind": media_type,
+                "uri": url,
+                "filename": file.filename or "",
+                # 音频与切片组的关联键：切片回听时据此精确定位录音文件，
+                # 否则多份录音共存时无法判断该放哪一份（历史 bug）
+                "audio_id": audio_id,
+                "lecture_date": lecture_date,
+                "pitfalls": pitfalls[:3],
+            },
+        )
+    except Exception:
+        await _compensate_object(url)
+        raise
+
     return {
         "asset": asset,
         "chunks_added": added,
