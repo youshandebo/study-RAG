@@ -55,6 +55,23 @@ async function toApiError(resp: Response): Promise<ApiError> {
   return new ApiError(detail || `后端响应 ${resp.status}`, resp.status, retryAfter);
 }
 
+/** 批改报告使用普通 JSON 回执，不伪装成 SSE；复用鉴权与消息归一化。 */
+export async function gradeExamCard(sessionId: string, courseId: string, text: string, file?: File, signal?: AbortSignal): Promise<PolymorphicMessage> {
+  const body = new FormData();
+  body.append('session_id', sessionId);
+  body.append('course_id', courseId);
+  body.append('text_content', text);
+  if (file) body.append('file', file);
+  const resp = await fetch(`${API_BASE}/exam/grade-card`, authInit({ method: 'POST', body, signal }));
+  handleAuthError(resp.status);
+  if (!resp.ok) throw await toApiError(resp);
+  const result = await resp.json();
+  if (result.card_payload?.type !== 'exam_report_card' || !result.card_payload.exam_report_payload) {
+    throw new Error('批改响应缺少报告，请刷新会话核对。');
+  }
+  return normalizeCard(result.card_payload);
+}
+
 /** 解析单条 SSE 帧 */
 function parseSSEChunk(chunk: string): { event: string; data: string } | null {
   const lines = chunk.split('\n');
@@ -166,7 +183,12 @@ export function normalizeCard(raw: Record<string, unknown>): PolymorphicMessage 
       })),
     };
   }
-  for (const k of ['session_id', 'created_at', 'solve_payload', 'socratic_payload', 'quiz_payload', 'compare_payload']) {
+  // 复习卷批改报告：后端 ExamReportPayload 的键名与前端类型定义
+  // 逐字一致（含嵌套 summary/questions/rubric/steps），整体透传即可，
+  // 不做逐字段转换——转换越少，契约漂移面越小。
+  const ex = raw.exam_report_payload as PolymorphicMessage['examReportPayload'] | undefined | null;
+  if (ex) msg.examReportPayload = ex;
+  for (const k of ['session_id', 'created_at', 'solve_payload', 'socratic_payload', 'quiz_payload', 'compare_payload', 'exam_report_payload']) {
     delete msg[k];
   }
   return msg as unknown as PolymorphicMessage;

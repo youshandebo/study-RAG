@@ -15,7 +15,7 @@ const COURSES = [
   { courseId: '', subject: '通识', name: '不绑定课程（全库检索）' },
 ];
 
-export default function SessionSidebar() {
+export default function SessionSidebar({ onSelectSession }: { onSelectSession?: () => void }) {
   const { sessions, activeSessionId, createSession, switchSession, removeSession, renameSession, updateSessionMeta } =
     useSessionStore();
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -66,7 +66,7 @@ export default function SessionSidebar() {
   };
 
   return (
-    <aside className="flex h-full w-64 shrink-0 flex-col border-r border-rule bg-[#101013] text-paper">
+    <aside className="flex h-full w-full xl:w-64 shrink-0 flex-col border-r border-rule bg-[#101013] text-paper">
       {/* 品牌区 */}
       <div className="border-b border-white/10 px-5 py-5">
         <div className="flex items-center gap-2.5">
@@ -151,7 +151,12 @@ export default function SessionSidebar() {
                     className={`group relative flex cursor-pointer items-center gap-2 rounded-lg px-3 py-2.5 text-sm transition ${
                       active ? 'bg-white/[0.08] text-paper' : 'text-paper/60 hover:bg-white/[0.04] hover:text-paper'
                     }`}
-                    onClick={() => editingId !== s.id && switchSession(s.id)}
+                    onClick={() => {
+                      if (editingId !== s.id) {
+                        switchSession(s.id);
+                        onSelectSession?.();
+                      }
+                    }}
                   >
                     {active && <span className="absolute left-0 top-2 bottom-2 w-[2px] rounded-full bg-blue-500" />}
                     <FileText

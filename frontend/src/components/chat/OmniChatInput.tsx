@@ -16,6 +16,7 @@ import { useSessionStore } from '@/stores/useSessionStore';
 import { ApiError, streamChat } from '@/lib/api';
 import type { PolymorphicMessage, UsageInfo } from '@/types/message';
 import ContextMeter from './ContextMeter';
+import ExamUpload from './ExamUpload';
 
 /** 柔性提示卡片（限流/额度）：显示在输入框下方，不打断、不弹 Toast */
 interface SoftNotice {
@@ -286,6 +287,7 @@ export default function OmniChatInput() {
               socraticPayload: card.socraticPayload,
               quizPayload: card.quizPayload,
               comparePayload: card.comparePayload,
+              examReportPayload: card.examReportPayload,
               intent: card.intent,
               usage: card.usage,
               evidenceList: keepEvidence,
@@ -339,8 +341,9 @@ export default function OmniChatInput() {
   const sceneLabel = SCENE_PRESETS.find((p) => p.key === scene)?.label ?? '随堂模式';
 
   return (
-    <div className="border-t border-rule bg-paper px-6 py-4">
+    <div className="border-t border-rule bg-paper px-3 py-3 sm:px-6 sm:py-4">
       <div className="mx-auto max-w-3xl">
+        <ExamUpload />
         {/* Chip 弹层打开时的点击捕获层（点外部关闭） */}
         {popoverOpen && (
           <div className="fixed inset-0 z-20" onClick={() => { setChapterOpen(false); setSceneOpen(false); }} aria-hidden />

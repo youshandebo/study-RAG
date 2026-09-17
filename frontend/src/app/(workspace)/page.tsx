@@ -5,13 +5,14 @@
 /** 统一主工作台：左会话栏 + 中全能对话画布 + 右证据抽屉 */
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { BookMarked, BookOpen, ChevronRight, LogIn, LogOut, NotebookPen, Settings, User } from 'lucide-react';
+import { BookMarked, BookOpen, ChevronRight, LogIn, LogOut, Menu, NotebookPen, Settings, User } from 'lucide-react';
 import { fetchMe, getSassToken, setSassToken, setSassUser, type MeInfo } from '@/lib/api';
 import SessionSidebar from '@/components/chat/SessionSidebar';
 import UnifiedMessageList from '@/components/chat/UnifiedMessageList';
 import OmniChatInput from '@/components/chat/OmniChatInput';
 import EvidenceDrawer from '@/components/drawer/EvidenceDrawer';
 import NotebookDrawer from '@/components/notebook/NotebookDrawer';
+import MobileDrawer from '@/components/MobileDrawer';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useEvidenceStore } from '@/stores/useEvidenceStore';
 import { useNotebookStore } from '@/stores/useNotebookStore';
@@ -42,6 +43,7 @@ export default function WorkspacePage() {
   const [me, setMe] = useState<MeInfo | null>(null);
   const hydratedFor = useRef<Set<string>>(new Set());
   const { openDrawer: openNotebook, dueCount, refreshDue } = useNotebookStore();
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
   // 当前会员身份：有 token 时拉 /auth/me（失效自动清本地态）
   useEffect(() => {
@@ -99,12 +101,23 @@ export default function WorkspacePage() {
 
   return (
     <div className="flex h-screen overflow-hidden">
-      <SessionSidebar />
+      {/* 大屏常驻三列之一；xl 以下隐藏，改由头部菜单按钮唤出左侧抽屉 */}
+      <div className="hidden h-full xl:block">
+        <SessionSidebar />
+      </div>
 
       <main className="flex min-w-0 flex-1 flex-col">
         {/* 顶部工具栏 */}
-        <header className="flex items-center justify-between border-b border-rule bg-white/85 px-6 py-3 backdrop-blur-sm">
-          <div className="min-w-0">
+        <header className="flex flex-wrap items-center justify-between gap-2 border-b border-rule bg-white/85 px-4 py-3 backdrop-blur-sm sm:px-6">
+          <button
+            type="button"
+            onClick={() => setMobileNavOpen(true)}
+            aria-label="打开会话列表"
+            className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-rule/60 bg-white/70 text-ink-soft transition hover:border-rule hover:text-ink xl:hidden"
+          >
+            <Menu size={18} strokeWidth={1.5} aria-hidden />
+          </button>
+          <div className="min-w-0 flex-1">
             <h1 className="flex items-center gap-2 truncate text-[15px] font-semibold text-ink">
               <BookOpen size={16} strokeWidth={1.5} className="shrink-0 text-chalk" aria-hidden />
               {activeSession?.title ?? '统一工作台'}
@@ -122,7 +135,7 @@ export default function WorkspacePage() {
               拍照解题 · 老师原法 RAG · 音画溯源 · 苏格拉底伴学 · 多模型比对
             </p>
           </div>
-          <div className="flex items-center gap-2.5">
+          <div className="flex flex-wrap items-center justify-end gap-2.5 xl:flex-nowrap">
             <span
               className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11.5px] font-medium ${
                 backendOk === null
@@ -224,6 +237,10 @@ export default function WorkspacePage() {
       </main>
 
       <EvidenceDrawer />
+      {/* xl 以下：头部菜单唤出的左侧会话抽屉（选会话后关闭） */}
+      <MobileDrawer open={mobileNavOpen} onClose={() => setMobileNavOpen(false)} ariaLabel="会话列表">
+        <SessionSidebar onSelectSession={() => setMobileNavOpen(false)} />
+      </MobileDrawer>
       {/* 错题本抽屉：租户管理员 / 平台超管额外可见"机构卡点"页签 */}
       <NotebookDrawer canManage={!!(me?.is_admin || me?.role === 'tenant_admin')} />
     </div>

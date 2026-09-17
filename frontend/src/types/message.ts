@@ -6,6 +6,7 @@ export type MessageType =
   | 'socratic_card'
   | 'quiz_card'
   | 'parallel_compare'
+  | 'exam_report_card'
   | 'general_text';
 
 export type Intent = 'solve' | 'socratic' | 'quiz' | 'compare' | 'general';
@@ -86,6 +87,66 @@ export interface PolymorphicMessage extends BaseMessage {
       content: string;
       status: 'streaming' | 'done';
     }[];
+  };
+
+  /** 5. 复习卷批改报告载荷（后端 ExamReportPayload，键名与后端一致） */
+  examReportPayload?: {
+    summary: {
+      total: number;
+      answered: number;
+      correct: number;
+      wrong: number;
+      needs_review: number;
+      graded_by_rubric: number;
+      score_earned: number;
+      score_possible: number;
+      score_rate: number | null;
+      error_distribution: Record<string, number>;
+    };
+    questions: Array<{
+      index: number;
+      question_text: string;
+      student_answer: string | null;
+      exam_point: string | null;
+      difficulty: number;
+      correct: boolean | null;
+      attribution: string;
+      socratic_followup: string | null;
+      rubric: {
+        full_score: number;
+        score: number;
+        ratio: number;
+        steps: Array<{
+          no: number;
+          name: string;
+          points: number;
+          hit: 'hit' | 'partial' | 'miss' | '';
+          awarded: number;
+          evidence: string;
+          error_type: string | null;
+          follow_through: boolean;
+        }>;
+        final_answer_correct: boolean | null;
+        first_missed: number | null;
+        root_cause_step: number | null;
+        affected_steps: number[];
+        error_type: string | null;
+        error_label: string;
+        summary: string;
+        degraded: boolean;
+        degraded_reason: string;
+      } | null;
+    }>;
+    variants: Array<{
+      for_question: number;
+      exam_point: string;
+      question_text: string;
+      options: string[] | null;
+      answer: string | null;
+      target_pitfall: string;
+      explanation: string;
+      difficulty: number;
+    }>;
   };
 
   /** 本轮 Token 用量（完成后由 usage 事件 / 最终卡片携带） */

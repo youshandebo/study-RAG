@@ -40,7 +40,7 @@ export default function UnifiedMessageList() {
     <div
       ref={scrollRef}
       onScroll={onScroll}
-      className={`flex-1 overflow-y-auto px-6 ${messages.length === 0 ? 'flex flex-col py-5' : 'py-5'}`}
+      className={`flex-1 overflow-y-auto px-4 sm:px-6 ${messages.length === 0 ? 'flex flex-col py-5' : 'py-5'}`}
     >
       {messages.length === 0 ? (
         <div className="m-auto w-full">

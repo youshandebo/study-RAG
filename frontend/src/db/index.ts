@@ -47,6 +47,7 @@ export async function hydrateMessages(sessionId: string): Promise<PolymorphicMes
         !!m.solvePayload ||
         !!m.socraticPayload ||
         !!m.quizPayload ||
-        !!m.comparePayload,
+        !!m.comparePayload ||
+        !!m.examReportPayload,
     );
 }

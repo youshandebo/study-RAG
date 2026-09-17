@@ -9,6 +9,7 @@ import SolveSolutionCard from './SolveSolutionCard';
 import SocraticDialogueCard from './SocraticDialogueCard';
 import QuizInteractiveCard from './QuizInteractiveCard';
 import MultiModelSplitTrack from './MultiModelSplitTrack';
+import ExamReportCard from './ExamReportCard';
 import type { PolymorphicMessage } from '@/types/message';
 import { fetchEvidence } from '@/lib/api';
 import { useEvidenceStore } from '@/stores/useEvidenceStore';
@@ -117,6 +118,8 @@ function renderAssistantCard(message: PolymorphicMessage, streaming: boolean, on
       return <QuizInteractiveCard message={message} streaming={streaming} />;
     case 'parallel_compare':
       return <MultiModelSplitTrack message={message} streaming={streaming} />;
+    case 'exam_report_card':
+      return <ExamReportCard message={message} streaming={streaming} />;
     default:
       return (
         <div className="paper-card margin-rule msg-enter px-5 py-4">

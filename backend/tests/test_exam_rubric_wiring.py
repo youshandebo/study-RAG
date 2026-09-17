@@ -72,7 +72,8 @@ def no_net(monkeypatch):
         async def generate_variant(self, **k):
             class V:
                 def model_dump(self):
-                    return {"stem": "变式题", "options": [], "answer": "A"}
+                    return {"question_text": "变式题", "options": None, "answer": None,
+                            "target_pitfall": "计算失误", "explanation": "核对计算", "difficulty": 3}
             return V()
 
     monkeypatch.setattr(exam, "match_from_text", _fake_match)
@@ -233,3 +234,64 @@ class TestTieredGrading:
         with pytest.raises(HTTPException) as ei:
             await exam.grade_exam(user=_user(False), session_id="s1", file=None, text_content="1. 求极限")
         assert ei.value.status_code == 403
+
+
+class TestGradeExamCard:
+    """卡片出口契约：判分口径与 /exam/grade 一致，载荷随消息落库。"""
+
+    @pytest.mark.asyncio
+    async def test_card_persisted_with_report_payload(self, no_net, monkeypatch):
+        monkeypatch.setattr(exam, "grade_objective_by_canonical", lambda q, c: (True, "结论一致"))
+        captured = {}
+
+        async def _capture(sid, message):
+            captured.update(message)
+            return None
+
+        monkeypatch.setattr(exam.repo, "append_message", _capture)
+        out = await exam.grade_exam_card(
+            user=_user(), session_id="s1", file=None, text_content="1. 判断敛散性\n解：收敛"
+        )
+        # 卡片以 assistant 消息形态落库，且带完整报告载荷
+        assert captured["role"] == "assistant"
+        assert captured["type"] == "exam_report_card"
+        payload = captured["exam_report_payload"]
+        assert payload["summary"]["total"] == 1
+        assert payload["summary"]["correct"] == 1
+        assert payload["questions"][0]["correct"] is True
+        assert payload["questions"][0]["rubric"] is None
+        assert payload["variants"][0]["for_question"] == 1
+        # 出口回执与落库消息同 id，前端据此对齐时间线
+        assert out["message_id"] == captured["id"]
+        assert out["session_id"] == "s1"
+
+    @pytest.mark.asyncio
+    async def test_rubric_step_views_flow_into_payload(self, no_net, monkeypatch):
+        """分步采分结果完整透传：steps/awarded/follow_through 是前端步骤条的数据源。"""
+        monkeypatch.setattr(exam, "grade_objective_by_canonical", lambda q, c: (None, ""))
+
+        async def _ok(*a, **k):
+            return rubric.parse_rubric({
+                "full_score": 10, "final_answer_correct": False,
+                "steps": [
+                    {"no": 1, "name": "设元", "points": 5, "hit": "hit"},
+                    {"no": 2, "name": "求解", "points": 5, "hit": "partial",
+                     "error_type": "computation", "awarded": 2.5},
+                ],
+                "summary": "方法对，算错",
+            })
+
+        monkeypatch.setattr(exam, "rubric_grade", _ok)
+        async def _noop(sid, message):
+            return None
+
+        monkeypatch.setattr(exam.repo, "append_message", _noop)
+        out = await exam.grade_exam_card(
+            user=_user(), session_id="s1", file=None, text_content="1. 求极限\n解：x=2"
+        )
+        q0 = out["card_payload"]["exam_report_payload"]["questions"][0]
+        assert q0["rubric"]["score"] == pytest.approx(7.5)
+        steps = q0["rubric"]["steps"]
+        assert steps[0]["hit"] == "hit" and steps[1]["hit"] == "partial"
+        assert steps[1]["awarded"] == pytest.approx(2.5)
+        assert q0["rubric"]["error_type"] == "computation"
