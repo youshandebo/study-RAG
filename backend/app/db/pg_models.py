@@ -268,3 +268,48 @@ class AuditLogRow(Base):
     target: Mapped[str] = mapped_column(String(255), default="")       # 对象摘要（切片 id / 配置键 / 文件名）
     ip: Mapped[str] = mapped_column(String(64), default="")
     detail_json: Mapped[str] = mapped_column(Text, default="")         # 写时脱敏后的上下文
+
+
+# ------------------------------------------------------------ 入库任务 ----
+# 长耗时流水线（ASR/VLM/向量化）不能挂在 HTTP 请求上，必须任务化：
+# 提交即返回句柄，进度与结果落到这张表，客户端轮询或收 SSE 即可。
+#
+# 为什么连幂等键都要持久化：断连重传是这条链路的常态（文件上传比任何
+# RPC 都容易超时），没有去重依据就会出现"同一份讲义入库两次"——双份切片
+# 不仅污染检索（重复召回同一段话占 top_k 名额），还要双倍扣配额。
+# 内存 dict 挡不住多副本：副本 A 收下任务、副本 B 收到重传，必须靠库去重。
+
+
+class IngestTaskRow(Base):
+    """入库任务状态机：queued → running → succeeded / failed。"""
+
+    __tablename__ = "ingest_tasks"
+    __table_args__ = (
+        # 幂等去重：同一客户端对同一次上传的重传必须命中同一行。
+        # 唯一索引才是幂等的闸——"先查一遍再写"在并发下必然漏。
+        Index("ix_ingest_tasks_idem", "tenant_id", "idempotency_key", unique=True),
+        # 会话维度查任务（前端展示"本次上传进度"）
+        Index("ix_ingest_tasks_session", "session_id", "created_at"),
+        # 收尸扫描：找出 running 但心跳已过期（进程被杀）的僵尸任务
+        Index("ix_ingest_tasks_status_updated", "status", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(32))
+    owner: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), default="")
+    idempotency_key: Mapped[str] = mapped_column(String(64), default="")
+
+    media_type: Mapped[str] = mapped_column(String(20), default="text")
+    filename: Mapped[str] = mapped_column(String(255), default="")
+
+    # queued | running | succeeded | failed。终态不可逆：只允许从非终态流转，
+    # 否则迟到的工作进程会把 failed 覆盖成 succeeded（幽灵成功）。
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+
+    created_at: Mapped[int] = mapped_column(BigInteger)
+    updated_at: Mapped[int] = mapped_column(BigInteger, default=0)
+    finished_at: Mapped[int] = mapped_column(BigInteger, default=0)
+
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_json: Mapped[str] = mapped_column(Text, default="")  # 成功后的处理摘要

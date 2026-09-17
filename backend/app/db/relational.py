@@ -346,6 +346,162 @@ async def list_assets(session_id: str) -> list[dict[str, Any]]:
     return list(_memory_assets.get(session_id, []))
 
 
+# ------------------------------------------------------------ 入库任务 ----
+# 任务化是长耗时流水线的唯一出路：状态必须落库而不是放进程内存——
+# 内存 dict 在多副本下会让"提交在 A、轮询打到 B"直接查不到任务，
+# 且进程重启会丢掉全部进行中的任务。
+_memory_ingest_tasks: dict[str, dict[str, Any]] = {}
+
+_TERMINAL_TASK_STATES = ("succeeded", "failed")
+
+
+async def create_ingest_task(task: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """登记一个新任务。返回 (记录, 是否新建)。
+
+    **唯一索引冲突 = 重传命中既有任务**，此时返回已有记录且 `created=False`
+    ——调用方据此跳过再次启动流水线。判断交给数据库而不是"先查一遍"：
+    并发重传时两个请求都会查不到、都去写，必然重复入库。
+    """
+    if _db_ready() and await _ensure_tables():
+        from sqlalchemy.exc import IntegrityError
+
+        from app.db.pg_models import IngestTaskRow
+
+        row = IngestTaskRow(**task)
+        async with await _pg_session() as s:
+            s.add(row)
+            try:
+                await s.commit()
+            except IntegrityError:
+                await s.rollback()
+                existing = await get_ingest_task_by_key(
+                    task.get("tenant_id", ""), task.get("idempotency_key", "")
+                )
+                if existing is not None:
+                    return existing, False
+                raise
+        return task, True
+
+    key = (task.get("tenant_id", ""), task.get("idempotency_key", ""))
+    for existing in _memory_ingest_tasks.values():
+        if (existing.get("tenant_id", ""), existing.get("idempotency_key", "")) == key:
+            return existing, False
+    _memory_ingest_tasks[task["id"]] = dict(task)
+    return task, True
+
+
+async def get_ingest_task(task_id: str) -> dict[str, Any] | None:
+    if _db_ready() and await _ensure_tables():
+        from sqlalchemy import select
+
+        from app.db.pg_models import IngestTaskRow
+
+        async with await _pg_session() as s:
+            row = (await s.execute(
+                select(IngestTaskRow).where(IngestTaskRow.id == task_id)
+            )).scalars().first()
+        return _task_to_dict(row) if row is not None else None
+    return dict(_memory_ingest_tasks.get(task_id)) if task_id in _memory_ingest_tasks else None
+
+
+async def get_ingest_task_by_key(tenant_id: str, key: str) -> dict[str, Any] | None:
+    """按幂等键查任务（唯一索引冲突后的回查、重连续传的命中复用）。"""
+    if _db_ready() and await _ensure_tables():
+        from sqlalchemy import select
+
+        from app.db.pg_models import IngestTaskRow
+
+        async with await _pg_session() as s:
+            row = (await s.execute(
+                select(IngestTaskRow).where(IngestTaskRow.tenant_id == tenant_id,
+                                            IngestTaskRow.idempotency_key == key)
+            )).scalars().first()
+        return _task_to_dict(row) if row is not None else None
+    for existing in _memory_ingest_tasks.values():
+        if existing.get("tenant_id") == tenant_id and existing.get("idempotency_key") == key:
+            return dict(existing)
+    return None
+
+
+async def update_ingest_task(task_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
+    """更新任务状态。**终态不可逆**：不允许把 succeeded/failed 改回或改掉。
+
+    原因：迟到的重试（网络分区后两个副本都在跑同一个任务）可能把失败结果
+    覆盖成成功，产生"幽灵成功"——用户看到成功但素材根本没入库。
+    """
+    patch = dict(patch)
+    patch["updated_at"] = int(time.time() * 1000)
+
+    if _db_ready() and await _ensure_tables():
+        from sqlalchemy import select
+
+        from app.db.pg_models import IngestTaskRow
+
+        async with await _pg_session() as s:
+            row = (await s.execute(
+                select(IngestTaskRow).where(IngestTaskRow.id == task_id)
+            )).scalars().first()
+            if row is None:
+                return None
+            if row.status in _TERMINAL_TASK_STATES:
+                return _task_to_dict(row)
+            for field, value in patch.items():
+                if hasattr(row, field):
+                    setattr(row, field, value)
+            await s.commit()
+            await s.refresh(row)
+            return _task_to_dict(row)
+
+    record = _memory_ingest_tasks.get(task_id)
+    if record is None:
+        return None
+    if record.get("status") in _TERMINAL_TASK_STATES:
+        return dict(record)
+    record.update(patch)
+    return dict(record)
+
+
+async def list_zombie_ingest_tasks(older_than_ms: int) -> list[dict[str, Any]]:
+    """找出 `running` 但心跳已停摆的任务（持有者进程被杀 / OOM / 滚动发布）。
+
+    这类任务永远不会自己变终态，客户端会一直轮询到超时——必须显式收尸，
+    把它们标记成失败并给出可读原因。
+    """
+    cutoff = int(time.time() * 1000) - older_than_ms
+    if _db_ready() and await _ensure_tables():
+        from sqlalchemy import select
+
+        from app.db.pg_models import IngestTaskRow
+
+        async with await _pg_session() as s:
+            rows = (await s.execute(
+                select(IngestTaskRow).where(IngestTaskRow.status == "running",
+                                            IngestTaskRow.updated_at < cutoff)
+            )).scalars().all()
+        return [_task_to_dict(r) for r in rows]
+    return [dict(t) for t in _memory_ingest_tasks.values()
+            if t.get("status") == "running" and (t.get("updated_at") or 0) < cutoff]
+
+
+def _task_to_dict(row: Any) -> dict[str, Any]:
+    result_raw = getattr(row, "result_json", "") or ""
+    return {
+        "id": row.id,
+        "session_id": row.session_id,
+        "owner": row.owner,
+        "tenant_id": row.tenant_id,
+        "idempotency_key": row.idempotency_key,
+        "media_type": row.media_type,
+        "filename": row.filename,
+        "status": row.status,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        "finished_at": row.finished_at,
+        "error": row.error,
+        "result": json.loads(result_raw) if result_raw else None,
+    }
+
+
 async def count_assets() -> int:
     """素材总数（管理后台统计；PG/内存双实现）。"""
     if _db_ready() and await _ensure_tables():

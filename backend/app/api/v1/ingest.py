@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import pathlib
 import re
+import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 
 import app.db.relational as repo
 from app.api.v1.auth import AuthUser, current_user_optional
@@ -177,11 +180,12 @@ async def ingest(
     course_id: str = Form("default"),  # 课程唯一标识，检索强作用域
     chapter: str = Form(""),          # 章节
 ):
-    """同步执行轻量流水线（演示规模），返回处理摘要。重型部署走 workers/tasks.py 的 Celery 版本。
+    """同步执行轻量流水线（**遗留契约**），返回处理摘要。
 
-    - audio  上传录音文件 → ASR 转录 → 切片对齐
-    - board  上传板书图片 → VLM 识别 → 入库
-    - text   直接提交文字素材（text_content 表单字段，或 .txt/.md 文件）→ 切片入库
+    ⚠️ 生产入口请走 `POST /ingest/tasks`：本端点会在整个流水线期间独占 HTTP
+    连接，链路动辄数十秒到数分钟，必然撞网关超时（Nginx/CDN 默认 60s 断连），
+    且断连后结果无人接收也无法找回。保留它是为了兼容既有调用方与测试，
+    不是推荐路径。
     """
     raw = await file.read() if file is not None else b""
     # ---- 部署档位保命锁：入库并发闸门 ----
@@ -224,6 +228,218 @@ async def ingest(
         },
     )
     return result
+
+
+# ------------------------------------------------------------ 任务化入库 ----
+# 后台任务的强引用池：`asyncio.create_task` 返回的 Task 若不被引用，可能在
+# GC 时被提前回收（官方文档明确点名的坑）。任务结束即自动摘除，池子不会膨胀。
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+# 心跳超时阈值：running 任务超过这么久没更新即视为僵尸（持有者进程已死）。
+# 这个值必须远大于单次管线的合理耗时，否则一个正常的长录音会被误判收尸。
+_TASK_HEARTBEAT_TIMEOUT_MS = 30 * 60 * 1000
+
+# 任务状态阶段文案：给前端进度条和 SSE 用，避免各端各写一套。
+_STAGE_HINTS = {
+    "queued": "已排队，等待计算资源",
+    "running": "正在处理（转录/识别/切片/向量化）",
+    "succeeded": "入库完成",
+    "failed": "入库失败",
+}
+
+
+def _task_store():
+    """任务读写模块（repo）。抽出来是为了让测试能整体替换 storage 实现。"""
+    return repo
+
+
+@router.post("/ingest/tasks")
+async def submit_ingest_task(
+    request: Request,
+    user: AuthUser = Depends(current_user_optional),
+    session_id: str = Form(...),
+    media_type: str = Form("audio"),  # audio | board | text
+    file: UploadFile | None = File(None),
+    lecture_date: str = Form(""),
+    text_content: str = Form(""),
+    subject: str = Form("未分类"),
+    course_id: str = Form("default"),
+    chapter: str = Form(""),
+    idempotency_key: str = Form(""),
+) -> dict:
+    """提交入库任务，**立即返回句柄**，流水线转入后台执行。
+
+    为什么端点要做成任务化：压缩 → ASR/VLM → 切片 → 向量化这条链路耗时
+    数十秒到数分钟，挂在 HTTP 请求上有三个无解的后果——网关必然超时、
+    断连后结果丢失、重传没有去重依据。任务化后：
+
+    - 响应在登记完任务后立刻返回（毫秒级），不再陪流水线耗到超时
+    - 进度与结果落 `ingest_tasks` 表，客户端可轮询或收 SSE
+    - `idempotency_key` 相同即复用同一任务，重传不会重复入库
+
+    `idempotency_key` 由客户端为"同一次上传"生成并重试保持不变（典型做法：
+    上传前生成 UUID 存本地）。未提供时按 tenant+文件名+大小派生一个，
+    至少挡住最机械的双击重复提交。
+    """
+    raw = await file.read() if file is not None else b""
+    tenant = resolve_tenant(user)
+    now = int(time.time() * 1000)
+    key = idempotency_key or f"auto:{tenant}:{file.filename if file is not None else 'text'}:{len(raw)}"
+
+    task_id = uuid.uuid4().hex[:16]
+    record = {
+        "id": task_id,
+        "session_id": session_id,
+        "owner": None if user.anonymous else user.id,
+        "tenant_id": tenant,
+        "idempotency_key": key,
+        "media_type": media_type,
+        "filename": (file.filename if file is not None else "") or "",
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "finished_at": 0,
+        "error": None,
+        "result_json": "",
+    }
+    stored, created = await _task_store().create_ingest_task(record)
+
+    if created:
+        _spawn_pipeline(
+            task_id=stored["id"], user=user, session_id=session_id, media_type=media_type,
+            file=file, lecture_date=lecture_date, text_content=text_content,
+            subject=subject, course_id=course_id, chapter=chapter, raw=raw,
+        )
+
+    return {"task_id": stored["id"], "status": stored["status"],
+            "stage": _STAGE_HINTS.get(stored["status"], "")}
+
+
+def _spawn_pipeline(**kwargs) -> None:
+    """在后台执行流水线，并把 Task 放进模块级池持有强引用。
+
+    用进程内 Task 而不是 Celery：单机/单容器部署无需 Redis 即可获得完整的
+    任务语义（状态、幂等、失败可见）。代价是**进程重启会丢进行中的任务**——
+    这类任务由 `reap_zombie_tasks()` 标记失败，客户端不会无限等待。
+    """
+    coro = _run_pipeline(**kwargs)
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_type: str,
+                        file: UploadFile | None, lecture_date: str, text_content: str,
+                        subject: str, course_id: str, chapter: str, raw: bytes) -> None:
+    """后台流水线包装：无论成败都要把终态写回任务表。
+
+    为什么失败也要写：这里没有调用栈可见性——后台任务抛出的异常只会打到日志，
+    客户端看不到任何东西。不落库的话，用户只会看到任务永远停在 running，
+    而不知道是 ASR 挂了还是参数错了。
+    """
+    store = _task_store()
+    await store.update_ingest_task(task_id, {"status": "running"})
+    try:
+        gate = _ingest_gate()
+        try:
+            lease = await gate.acquire(timeout_s=DEFAULT_ACQUIRE_TIMEOUT_S)
+        except GateTimeout:
+            raise RuntimeError("入库任务排队超时，请稍后重试")
+        try:
+            result = await _ingest_locked(
+                user=user, session_id=session_id, media_type=media_type, file=file,
+                lecture_date=lecture_date, text_content=text_content, subject=subject,
+                course_id=course_id, chapter=chapter, raw=raw,
+            )
+        finally:
+            await gate.release(lease)
+    except Exception as exc:
+        await store.update_ingest_task(task_id, {
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "finished_at": int(time.time() * 1000),
+        })
+        return
+    await store.update_ingest_task(task_id, {
+        "status": "succeeded",
+        "result_json": json.dumps(result, ensure_ascii=False),
+        "finished_at": int(time.time() * 1000),
+    })
+
+
+@router.get("/ingest/tasks/{task_id}")
+async def get_ingest_task(task_id: str, user: AuthUser = Depends(current_user_optional)) -> dict:
+    """查询单个入库任务状态（含失败原因与成功摘要）。
+
+    越权保护：任务记录带 owner，匿名任务（演示模式）才允许跨会话读取；
+    登录用户只能查自己的任务——否则任务 id 就成了遍历他人素材的入口。
+    """
+    record = await _task_store().get_ingest_task(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    if not user.anonymous and record.get("owner") and record["owner"] != user.id:
+        raise HTTPException(status_code=403, detail="无权查看该任务")
+    return {**record, "stage": _STAGE_HINTS.get(record["status"], "")}
+
+
+@router.get("/ingest/tasks/{task_id}/events")
+async def stream_ingest_task(task_id: str, user: AuthUser = Depends(current_user_optional)):
+    """任务进度的 SSE 流：状态变化时推送一次，终态后关闭连接。
+
+    轮询表而非订阅 Pub/Sub：任务以分钟计，1 秒轮询的延迟完全可以接受，
+    换来的是不用管订阅连接的重连与消息丢失——丢了就不会自愈，而
+    "状态停在 running"是持续的错误结果。
+    """
+    async def _gen():
+        last = ""
+        deadline = time.time() + _TASK_HEARTBEAT_TIMEOUT_MS / 1000
+        while time.time() < deadline:
+            record = await _task_store().get_ingest_task(task_id)
+            if record is None:
+                yield _sse("task", {"task_id": task_id, "status": "not_found"})
+                return
+            if not user.anonymous and record.get("owner") and record["owner"] != user.id:
+                yield _sse("task", {"task_id": task_id, "status": "forbidden"})
+                return
+            payload = json.dumps({
+                "task_id": task_id, "status": record["status"],
+                "stage": _STAGE_HINTS.get(record["status"], ""),
+                "error": record.get("error"), "result": record.get("result"),
+            }, ensure_ascii=False)
+            if payload != last:
+                yield _sse("task", json.loads(payload))
+                last = payload
+            if record["status"] in ("succeeded", "failed"):
+                return
+            await asyncio.sleep(1.0)
+
+    return StreamingResponse(
+        _gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def reap_zombie_tasks(older_than_ms: int = _TASK_HEARTBEAT_TIMEOUT_MS) -> int:
+    """收尸：把running 但心跳停摆的任务标记失败（进程重启/被杀后的残留）。
+
+    这些任务永远等不到回调——持有它们的进程已经不在了。不处理的话客户端会
+    一直轮询到超时，且状态表里永远留着running 僵尸，运维无法判断真实负载。
+    返回被收尸的任务数。
+    """
+    store = _task_store()
+    zombies = await store.list_zombie_ingest_tasks(older_than_ms)
+    now = int(time.time() * 1000)
+    for task in zombies:
+        await store.update_ingest_task(task["id"], {
+            "status": "failed",
+            "error": "任务执行进程中断（重启或被杀），请重新提交",
+            "finished_at": now,
+        })
+    return len(zombies)
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 _INGEST_GATE: DistributedGate | None = None

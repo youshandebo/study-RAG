@@ -21,6 +21,15 @@ BACKEND = Path(__file__).resolve().parent.parent
 MIGRATE = BACKEND / "scripts" / "migrate.py"
 
 
+def _head_revision() -> str:
+    """从 alembic 自身读取当前 head——避免把版本号写死在测试里。"""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    cfg = Config(str(BACKEND / "alembic.ini"))
+    return ScriptDirectory.from_config(cfg).get_current_head()
+
+
 def _run(db: Path, **env_extra) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["APP_DB_PATH"] = str(db)
@@ -66,7 +75,9 @@ def test_empty_database_gets_migrated_to_head(tmp_path):
         version = con.execute("select version_num from alembic_version").fetchone()[0]
     finally:
         con.close()
-    assert version == "0006"
+    # head 随业务演进前移（0007 = 入库任务表）；这里断言的是"迁移到了最新"，
+    # 不是某个固定版本号——写死具体数字会在每次加迁移时制造无意义红灯。
+    assert version == _head_revision()
 
 
 def test_legacy_database_is_adopted_not_rebuilt(tmp_path):
