@@ -45,3 +45,26 @@ jobs:
       - name: Build
         working-directory: frontend
         run: npm run build
+
+  # 迁移链校验上云：本地不再手工跑 alembic upgrade head。
+  # SQLite 临时库走到 head + 防漂移测试（模型列必须都在迁移历史里），
+  # 忘写迁移的提交在这里直接红，而不是等部署时才炸。
+  migrations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt pytest alembic
+      - name: Migrate a fresh database to head
+        working-directory: backend
+        env:
+          APP_DB_PATH: ${{ runner.temp }}/_ci_migrate.db
+        run: python -m alembic upgrade head
+      - name: Model/migration drift guard
+        working-directory: backend
+        run: python -m pytest tests/test_core_logic.py -q -k migrations
