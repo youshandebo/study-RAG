@@ -2,8 +2,11 @@
 """FastAPI 应用入口：统一挂载 v1 路由与静态资源。"""
 from __future__ import annotations
 
-from fastapi import FastAPI
+import time
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1 import (
@@ -32,6 +35,54 @@ async def license_fingerprint_headers(request, call_next):
     response.headers["X-License-Type"] = "AGPL-3.0-or-Commercial"
     response.headers["X-Commercial-License-Contact"] = "fennengxiong@qq.com"
     return response
+
+
+@app.middleware("http")
+async def golden_signals(request: Request, call_next):
+    """黄金信号采集：流量、错误、延迟（饱和度与上游延迟在各自模块埋点）。
+
+    两个必须守住的约束：
+
+    1. **端点标签取路由模板，不取原始路径**。用 `request.url.path` 会让
+       `/ingest/tasks/{task_id}` 这类路径为**每个任务**生成一条时间序列，
+       基数随用户量线性增长——这是 Prometheus 客户端把 1C2G 拖垮的典型方式。
+       匹配不到路由时回落 "unhandled"，而不是把路径塞进标签。
+    2. **监控不得改变业务语义**：异常一律向上抛，只记录状态码后原样返回。
+    """
+    from app.core import metrics
+
+    route = request.scope.get("route")
+    endpoint = getattr(route, "path", None) or "unhandled"
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+        status = str(response.status_code)
+    except Exception:
+        duration = time.perf_counter() - started
+        metrics.inc("http_requests_total",
+                    {"method": request.method, "endpoint": endpoint, "status": "500"})
+        metrics.observe("http_request_duration_seconds", duration, {"endpoint": endpoint})
+        raise
+    duration = time.perf_counter() - started
+    metrics.inc("http_requests_total",
+                {"method": request.method, "endpoint": endpoint, "status": status})
+    metrics.observe("http_request_duration_seconds", duration, {"endpoint": endpoint})
+    return response
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics_endpoint():
+    """Prometheus Pull 端点：只在被拉取时渲染一次文本，无后台采集、无常驻开销。
+
+    公开可读（不含密钥/用户数据），由网关侧按需限制来源 IP 即可。
+    """
+    from app.core import metrics
+    from app.api.v1 import ingest
+
+    # 饱和度：入库积压。放这里实时算而不是后台定时采样——省一个常驻任务，
+    # 且 /metrics 的拉取频率（通常 15~60s）本身就够用。
+    metrics.set_gauge("ingest_tasks_active", float(await ingest.active_task_count()))
+    return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 app.add_middleware(

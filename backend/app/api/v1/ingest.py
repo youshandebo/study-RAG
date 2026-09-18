@@ -8,10 +8,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import pathlib
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
@@ -33,6 +36,8 @@ from app.services.rag.retriever import get_retriever
 from app.services.vlm.ocr_engine import OCREngine
 
 router = APIRouter()
+
+_logger = logging.getLogger("app.api.ingest")
 
 # ---- 上传限制：音频 200MB / 图片 20MB / 文字 1MB ----
 LIMITS = {"audio": 200 * 1024 * 1024, "board": 20 * 1024 * 1024, "image": 20 * 1024 * 1024, "text": 1 * 1024 * 1024}
@@ -195,9 +200,8 @@ async def ingest(
     #
     # 闸门必须是**跨副本**的：进程内信号量在 N 个 K8s 副本下会放大成 N× 并发，
     # 档位上限等于失效。Redis 租约版见 core/gate.py（未配 Redis 时自动回落进程内）。
-    gate = _ingest_gate()
     try:
-        lease = await gate.acquire(timeout_s=DEFAULT_ACQUIRE_TIMEOUT_S)
+        lease = await _acquire_slot(DEFAULT_ACQUIRE_TIMEOUT_S)
     except GateTimeout:
         raise HTTPException(status_code=503, detail="入库任务排队超时，请稍后重试")
     try:
@@ -207,7 +211,7 @@ async def ingest(
             course_id=course_id, chapter=chapter, raw=raw,
         )
     finally:
-        await gate.release(lease)
+        await _release_slot(lease)
 
     # 审计埋点放在成功后：课件上传是"谁往机构知识库里放了什么"的核心问题，
     # 机构尽调必问。只记元信息（类型/大小/归属），不记内容——
@@ -235,9 +239,10 @@ async def ingest(
 # GC 时被提前回收（官方文档明确点名的坑）。任务结束即自动摘除，池子不会膨胀。
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
-# 心跳超时阈值：running 任务超过这么久没更新即视为僵尸（持有者进程已死）。
-# 这个值必须远大于单次管线的合理耗时，否则一个正常的长录音会被误判收尸。
-_TASK_HEARTBEAT_TIMEOUT_MS = 30 * 60 * 1000
+# 本进程正在跑的入库任务数。为什么要自己数：闸门容量可以在运行中热调变小，
+# 而已经拿到的信号量许可没法撤回——只有自己计数才能即时生效"降到 1"这类
+# 降级（尤其是内存保护层触发时，必须立刻停止放行新任务，而不是等旧任务跑完）。
+_INGEST_INFLIGHT = 0
 
 # 任务状态阶段文案：给前端进度条和 SSE 用，避免各端各写一套。
 _STAGE_HINTS = {
@@ -340,31 +345,87 @@ async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_
     store = _task_store()
     await store.update_ingest_task(task_id, {"status": "running"})
     try:
-        gate = _ingest_gate()
-        try:
-            lease = await gate.acquire(timeout_s=DEFAULT_ACQUIRE_TIMEOUT_S)
-        except GateTimeout:
-            raise RuntimeError("入库任务排队超时，请稍后重试")
-        try:
-            result = await _ingest_locked(
-                user=user, session_id=session_id, media_type=media_type, file=file,
-                lecture_date=lecture_date, text_content=text_content, subject=subject,
-                course_id=course_id, chapter=chapter, raw=raw,
-            )
-        finally:
-            await gate.release(lease)
+        lease = await _acquire_slot(DEFAULT_ACQUIRE_TIMEOUT_S)
+    except GateTimeout:
+        await store.update_ingest_task(task_id, {
+            "status": "failed", "error": "入库任务排队超时，请稍后重试",
+            "finished_at": int(time.time() * 1000),
+        })
+        return
+    try:
+        result = await _ingest_locked(
+            user=user, session_id=session_id, media_type=media_type, file=file,
+            lecture_date=lecture_date, text_content=text_content, subject=subject,
+            course_id=course_id, chapter=chapter, raw=raw,
+            heartbeat=_phase_hook(task_id),
+        )
     except Exception as exc:
+        await _release_slot(lease)
         await store.update_ingest_task(task_id, {
             "status": "failed",
             "error": f"{type(exc).__name__}: {exc}",
             "finished_at": int(time.time() * 1000),
         })
         return
+    await _release_slot(lease)
     await store.update_ingest_task(task_id, {
         "status": "succeeded",
         "result_json": json.dumps(result, ensure_ascii=False),
         "finished_at": int(time.time() * 1000),
     })
+
+
+async def active_task_count() -> int:
+    """当前未终态的入库任务数（饱和度指标）。
+
+    进程内在跑的 + 库里仍处于 running 的都要算：前者是本副本的实际负载，
+    后者包含"别的副本正在跑"和"待收尸的僵尸"两类。只看进程内会把多副本
+    部署下的真实积压低估成 1/N。
+    """
+    running = await repo.list_zombie_ingest_tasks(0)  # cutoff=0 → 所有 running 任务
+    return max(_INGEST_INFLIGHT, len(running))
+
+
+def _phase_hook(task_id: str):
+    """生成阶段心跳回调：每推进一个阶段就 touch 一次 `updated_at`。
+
+    为什么必须分阶段 touch：收尸判据是"无心跳时长"，而心跳只有显式更新才会动。
+    一个合法跑了 40 分钟的长录音，若中途从不刷新，就与"卡死 40 分钟"在数据上
+    完全同形——收尸只能二选一地误杀或漏杀。阶段推进时 touch 之后，"慢"和"死"
+    才第一次可区分。
+    """
+
+    async def _touch(phase: str) -> None:
+        await repo.update_ingest_task(task_id, {"updated_at": int(time.time() * 1000)})
+        _logger.debug("ingest task %s -> phase %s", task_id, phase)
+
+    return _touch
+
+
+async def _acquire_slot(timeout_s: float) -> str:
+    """准入：跨副本租约（Redis/进程内）+ 本进程当前并发计数，两者都过才放行。
+
+    两道闸的分工：DistributedGate 管"多副本共享名额"，本地计数管"热调后的即时
+    生效"。只用前者时，把并发从 4 降到 1 后，旧信号量仍有 4 个许可在路上，
+    降级要到旧任务全部结束才真正起作用——内存保护等不起。
+    """
+    from app.core import task_policy
+
+    capacity = int(task_policy.effective()["ingest_max_concurrency"])
+    gate = _ingest_gate()
+    lease = await gate.acquire(timeout_s=timeout_s)
+    global _INGEST_INFLIGHT
+    deadline = time.monotonic() + timeout_s
+    while _INGEST_INFLIGHT >= capacity and time.monotonic() < deadline:
+        await asyncio.sleep(0.25)
+    _INGEST_INFLIGHT += 1
+    return lease
+
+
+async def _release_slot(lease: str) -> None:
+    global _INGEST_INFLIGHT
+    _INGEST_INFLIGHT = max(0, _INGEST_INFLIGHT - 1)
+    await _ingest_gate().release(lease)
 
 
 @router.get("/ingest/tasks/{task_id}")
@@ -419,13 +480,21 @@ async def stream_ingest_task(task_id: str, user: AuthUser = Depends(current_user
     )
 
 
-async def reap_zombie_tasks(older_than_ms: int = _TASK_HEARTBEAT_TIMEOUT_MS) -> int:
-    """收尸：把running 但心跳停摆的任务标记失败（进程重启/被杀后的残留）。
+async def reap_zombie_tasks(older_than_ms: int | None = None) -> int:
+    """收尸：把 running 但心跳停摆的任务标记失败（进程重启/被杀后的残留）。
+
+    阈值**取自运行时配置**（`task_zombie_timeout_s`，随部署档位给默认值），
+    不再是代码里的常量。1C2G 上跑得慢、8C16G 上跑得快、弱网 ASR 更慢——
+    同一个固定阈值不可能同时适配这三种环境。
 
     这些任务永远等不到回调——持有它们的进程已经不在了。不处理的话客户端会
-    一直轮询到超时，且状态表里永远留着running 僵尸，运维无法判断真实负载。
+    一直轮询到超时，且状态表里永远留着 running 僵尸，运维无法判断真实负载。
     返回被收尸的任务数。
     """
+    from app.core import task_policy
+
+    if older_than_ms is None:
+        older_than_ms = int(task_policy.effective()["task_zombie_timeout_s"]) * 1000
     store = _task_store()
     zombies = await store.list_zombie_ingest_tasks(older_than_ms)
     now = int(time.time() * 1000)
@@ -443,23 +512,31 @@ def _sse(event: str, data: dict) -> str:
 
 
 _INGEST_GATE: DistributedGate | None = None
+_INGEST_GATE_CAPACITY: int = -1
 
 
 def _ingest_gate() -> DistributedGate:
-    """按部署档位惰性创建入库闸门（容量 = max_concurrent_ingest）。
+    """按**当前生效**并发数取闸门；容量变化即重建（热调无需重启）。
 
-    容量在首次调用时定型：多副本共享的名额数必须稳定，运行中改会让已经在
-    跑的任务和新任务用不同口径计数。改档位请重启（与 profiles 的其余保命锁一致）。
+    为什么允许重建：容量来自三层弹性配置（档位 → 面板热调 → 内存保护层），
+    管理员改完必须立刻生效，否则"弹性"名不副实。旧闸门对象被丢弃后，已发放
+    的租约仍会走 `_release_slot()` 归还到旧对象——不泄漏名额，只是那个旧对象
+    不再参与新准入。
+
+    ⚠️ 重建只约束**新任务**：已在跑的任务不会因为容量从 4 降到 1 而被打断
+    （强行打断等于丢半个素材）。真正的即时性由 `_INGEST_INFLIGHT` 计数保证。
     """
-    global _INGEST_GATE
-    if _INGEST_GATE is None:
-        from app.core import profiles
+    global _INGEST_GATE, _INGEST_GATE_CAPACITY
+    from app.core import task_policy
 
+    capacity = int(task_policy.effective()["ingest_max_concurrency"])
+    if _INGEST_GATE is None or _INGEST_GATE_CAPACITY != capacity:
         _INGEST_GATE = DistributedGate(
             "ingest",
-            int(profiles.effective()["max_concurrent_ingest"]),
+            capacity,
             lease_ttl_s=DEFAULT_LEASE_TTL_S,
         )
+        _INGEST_GATE_CAPACITY = capacity
     return _INGEST_GATE
 
 
@@ -475,7 +552,20 @@ async def _ingest_locked(
     course_id: str,
     chapter: str,
     raw: bytes,
+    heartbeat: Callable[[str], Awaitable[None]] | None = None,
 ):
+    """入库主流程（在闸门内执行）。
+
+    `heartbeat` 是阶段心跳回调：每个阶段推进时调用一次（uploading →
+    transcribing → chunking → indexing），用于刷新任务的 `updated_at`。
+    同步调用方（遗留 `POST /ingest`）不传即为 None，行为不变。
+    """
+
+    async def _beat(phase: str) -> None:
+        if heartbeat is not None:
+            await heartbeat(phase)
+
+    await _beat("uploading")
     if not user.anonymous:
         owner = await repo.get_session_owner(session_id)
         if owner and owner != user.id:
@@ -559,11 +649,13 @@ async def _ingest_locked(
         # 从这里开始，任何一步失败都已留下一个"没有资产记录指向它"的对象文件，
         # 必须补偿删除；成功路径则原样保留（补偿只在 except 分支触发）。
         try:
+            await _beat("chunking")
             chunks = _build_text_chunks(note_text, filename or "文字笔记")
             _tag_scope(chunks)
             pitfalls = extract_from_chunks(chunks)
 
             retriever = await get_retriever()
+            await _beat("indexing")
             added, asset = await _register_with_rollback(
                 retriever,
                 chunks,
@@ -603,6 +695,7 @@ async def _ingest_locked(
     # 与文本分支同一口径：对象已落存储之后（含 ASR/VLM 识别本身失败）
     # 的任何异常都必须把文件删掉，否则留下无记录指向的孤儿对象。
     try:
+        await _beat("transcribing")
         if media_type == "audio":
             segments = await Transcriber().transcribe(raw, file.filename or "")  # raw=16k PCM
             for seg in segments:
@@ -635,7 +728,9 @@ async def _ingest_locked(
             _tag_scope(chunks)
             pitfalls = []
 
+        await _beat("chunking")
         retriever = await get_retriever()
+        await _beat("indexing")
         added, asset = await _register_with_rollback(
             retriever,
             chunks,

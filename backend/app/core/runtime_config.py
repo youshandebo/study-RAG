@@ -56,10 +56,13 @@ def _blank() -> dict:
         "plans": {},
         # 部署档位：eco/standard/performance + 可选单项覆盖（overrides 留空=跟随预设）
         "deployment": {"profile": "", "overrides": {}},
+        # 入库任务弹性参数（留空=跟随部署档位默认）；数值约束见 core/task_policy.RANGES
+        "tasks": {"ingest_max_concurrency": "", "task_zombie_timeout_s": "", "task_phase_timeout_s": ""},
     }
 
 
 _MEDIA_KEYS = ("image_quality", "image_max_edge", "audio_bitrate", "audio_max_mb")
+_TASK_KEYS = ("ingest_max_concurrency", "task_zombie_timeout_s", "task_phase_timeout_s")
 
 
 def _normalize(raw: dict | None) -> dict:
@@ -121,6 +124,16 @@ def _normalize(raw: dict | None) -> dict:
             cfg["deployment"]["overrides"] = {
                 str(k): v for k, v in ov.items() if v not in (None, "")
             }
+    tasks_src = raw.get("tasks")
+    if isinstance(tasks_src, dict):
+        for key in _TASK_KEYS:
+            val = tasks_src.get(key)
+            if val is None or str(val).strip() == "":
+                continue
+            try:
+                cfg["tasks"][key] = str(int(val))
+            except (TypeError, ValueError):
+                continue  # 非法数值丢弃：由 task_policy 的档位默认兜底
     return cfg
 
 
@@ -174,7 +187,7 @@ def save_runtime_config(patch: dict) -> dict:
                 else:
                     merged[str(k)] = v
             target["overrides"] = merged
-    for section in ("llm", "embedding", "asr", "vlm", "media", "retrieval", "rerank"):
+    for section in ("llm", "embedding", "asr", "vlm", "media", "retrieval", "rerank", "tasks"):
         src = patch.get(section)
         if not isinstance(src, dict):
             continue
@@ -200,6 +213,14 @@ def save_runtime_config(patch: dict) -> dict:
                     int(val)
                 except (TypeError, ValueError):
                     continue  # 非法数值直接忽略，保持现值
+                target[key] = str(int(val))
+            elif section == "tasks":
+                # 越界值不在这里夹断：夹紧规则属于 task_policy.RANGES（单一真源），
+                # 这里只保证落盘的是个整数，避免把 "abc" 写进配置文件。
+                try:
+                    int(val)
+                except (TypeError, ValueError):
+                    continue
                 target[key] = str(int(val))
             elif isinstance(val, str):
                 target[key] = val.strip()
@@ -424,6 +445,11 @@ def masked_view() -> dict:
     from app.core.profiles import effective as profile_effective
 
     view["deployment"] = profile_effective()
+    # 入库任务弹性参数：下发"生效值 + 档位默认值 + 边界"，供面板渲染滑块上下限。
+    # 必须给边界——否则前端只能把范围写死，与后端的 RANGES 二次漂移。
+    from app.core.task_policy import effective as task_effective
+
+    view["tasks"] = task_effective()
     # rerank 段含 api_key，同样必须打码后再下发前端
     rr = effective("rerank")
     rr["api_key"] = mask_key(rr.get("api_key", ""))

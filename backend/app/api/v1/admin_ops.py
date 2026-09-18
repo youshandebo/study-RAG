@@ -273,6 +273,37 @@ async def circuit_state(_: str = Depends(require_admin)):
     return {"breakers": circuit_snapshot()}
 
 
+# -------------------------------------------------------- 入库任务弹性参数 ----
+@router.get("/admin/ops/tasks")
+async def task_policy_view(_: str = Depends(require_admin)):
+    """入库任务的生效参数：并发槽位、收尸阈值、阶段超时 + 边界与降级状态。
+
+    为什么把边界一起下发：前端滑块若把范围写死，就会与后端 RANGES 二次漂移
+    （后端改了上下限，前端还在渲染旧区间）。这里让后端成为唯一真源。
+    """
+    from app.core.task_policy import effective
+
+    return {"tasks": effective()}
+
+
+@router.post("/admin/ops/tasks")
+async def task_policy_update(patch: dict, _: str = Depends(require_admin)):
+    """热调入库任务参数，落盘即生效（无需重启进程）。
+
+    越界值由 `task_policy.RANGES` 夹紧而不是报错——管理员在面板上调到 8 是
+    常见操作，"保存失败"比"自动夹到上限"更难理解。但**内存保护层不受此影响**：
+    宿主机可用内存低于安全线时，无论这里写多少，实际并发仍会是 1。
+    """
+    from app.core import runtime_config
+    from app.core.task_policy import effective
+
+    section = patch.get("tasks") if isinstance(patch, dict) else None
+    if not isinstance(section, dict):
+        raise HTTPException(status_code=400, detail="请求体需包含 tasks 段")
+    saved = runtime_config.save_runtime_config({"tasks": section})
+    return {"tasks": effective(), "stored": saved.get("tasks", {})}
+
+
 # ------------------------------------------------------------------ 审计 ----
 _AUDIT_COLUMNS = ("ts", "action", "actor", "actor_role", "tenant_id", "target", "ip", "detail")
 

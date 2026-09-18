@@ -138,6 +138,15 @@ class CircuitBreaker:
                 "上游 %s 连续失败 %d 次，断路器跳闸（冷却 %.0fs）: %s",
                 self.label, self.failures, self.config.cooldown_s, self.last_error,
             )
+            # 跳闸是可观测性的关键事件：它意味着"上游已经不可用、请求被本地
+            # 直接拒绝"。没有计数就只能翻日志，无法回答"今天熔断了几次"。
+            # 埋点失败绝不能影响熔断逻辑本身，所以用 try 包住。
+            try:
+                from app.core import metrics
+
+                metrics.inc("circuit_breaker_tripped_total", {"service": self.label})
+            except Exception:
+                pass
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -227,6 +236,7 @@ class ResilientLLMProvider:
 
     async def stream_chat(self, messages: list[dict], system: str = "") -> AsyncIterator[str]:
         errors: list[str] = []
+        t0 = time.monotonic()
         for cand in self._candidates:
             if not cand.breaker.allows():
                 snap = cand.breaker.snapshot()
@@ -238,7 +248,11 @@ class ResilientLLMProvider:
                     if not started:
                         started = True
                         self.last_served = cand.label
+                        # 首字延迟（TTFB）：用户感知的"卡不卡"几乎完全由它决定，
+                        # 与总耗时分开记，否则长回答会把首字慢掩盖掉。
+                        _observe_llm(cand.label, time.monotonic() - t0, "first_token")
                     yield piece
+                _observe_llm(cand.label, time.monotonic() - t0, "total")
                 cand.breaker.record_success()
                 return
             except Exception as exc:  # noqa: BLE001 - 上游异常类型不可枚举
@@ -256,6 +270,17 @@ class ResilientLLMProvider:
         async for piece in self.stream_chat(messages, system):
             chunks.append(piece)
         return "".join(chunks)
+
+
+def _observe_llm(label: str, seconds: float, kind: str) -> None:
+    """埋点上游延迟。埋点自身的任何失败都不能影响对话链路。"""
+    try:
+        from app.core import metrics
+
+        metrics.observe("llm_provider_latency_seconds", seconds,
+                        {"provider": label, "model": label, "kind": kind})
+    except Exception:
+        pass
 
 
 def build(label: str, provider: object) -> _Candidate:

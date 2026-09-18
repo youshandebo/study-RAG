@@ -70,8 +70,7 @@ def _patch_slow_pipeline(monkeypatch, result: dict | None = None):
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def _slow(*, user, session_id, media_type, file, lecture_date, text_content,
-                    subject, course_id, chapter, raw):
+    async def _slow(*, heartbeat=None, **kwargs):
         started.set()
         await release.wait()
         return result or {"asset": {"id": "asset-async"}, "chunks_added": 3}
@@ -127,8 +126,7 @@ class TestIdempotency:
         calls = {"n": 0}
         started = asyncio.Event()
 
-        async def _counting(*, user, session_id, media_type, file, lecture_date, text_content,
-                            subject, course_id, chapter, raw):
+        async def _counting(*, heartbeat=None, **kwargs):
             calls["n"] += 1
             started.set()
             return {"chunks_added": 1}
@@ -154,8 +152,7 @@ class TestFailureVisibility:
     async def test_pipeline_failure_is_recorded_not_lost(self, db_env, monkeypatch):
         """后台任务没有调用栈可见性：失败原因必须写进任务记录，否则永远查不到。"""
 
-        async def _boom(*, user, session_id, media_type, file, lecture_date, text_content,
-                        subject, course_id, chapter, raw):
+        async def _boom(*, heartbeat=None, **kwargs):
             raise RuntimeError("ASR 服务不可用")
 
         monkeypatch.setattr(ingest_api, "_ingest_locked", _boom)
