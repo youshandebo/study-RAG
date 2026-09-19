@@ -9,7 +9,13 @@ aiosqlite>=0.20   # SQLite 异步驱动（单容器默认持久化）
 sqlalchemy[asyncio]>=2.0  # 关系库引擎：SQLite(默认)与 Postgres 共用；缺失会静默降级内存存储导致重启丢用户
 
 # ---- 可选重型依赖（生产部署按需启用，启用对应配置项时必须安装）----
-# qdrant-client>=1.9          # 配置 QDRANT_URL 时必须（检索候选真正走 Qdrant payload filter）
+qdrant-client>=1.9            # 配置 QDRANT_URL 时必须（检索候选真正走 Qdrant payload filter）。
+                              # 这行自初始提交（e39b30f）起一直是注释状态，而
+                              # docker-compose.prod.yml 默认就设了 QDRANT_URL ——
+                              # 结果是线上静默退回进程内内存库（多副本各存一份、
+                              # 重启即失，且绕过租户作用域层）。现在
+                              # get_vector_store() 对"配了 URL 却缺包"硬失败，
+                              # 故该依赖必须随默认交付装上。
 # asyncpg>=0.29               # 配置 POSTGRES_DSN 时必须（Postgres 异步驱动）
 alembic>=1.13                 # schema 迁移：migrations/ 是随仓库交付的，容器内需要能跑
                               # `alembic upgrade head`；测试也会 import 迁移脚本

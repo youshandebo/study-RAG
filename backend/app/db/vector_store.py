@@ -107,6 +107,23 @@ def resolve_scope(tenant_id: str | None, *, base_collection: str) -> TenantScope
     return TenantScope(tenant, base_collection, tenant if sharding_enabled() else None)
 
 
+def _require_tenant(tenant_id: str | None) -> None:
+    """失败关闭的唯一实现：多租户模式下拿不到租户就拒绝本次数据访问。
+
+    为什么必须是**所有路径共用**的一个函数，而不是只写在 Qdrant 侧：
+    本机、CI、以及未装 `qdrant_client` 的部署跑的都是内存库——它是很多环境里
+    **唯一真实执行**的那条路径。把"拒绝"只建在 Qdrant 侧，等于把多租户防御
+    挂在一条永远不会被走到的分支上：配置看着是安全的，实际是筛子。
+
+    失败方向：宁可本次请求报错，也不放宽为全库——后者是"宁可泄漏也要可用"，
+    对承载考题与客户课件的系统是错误取舍。
+    """
+    if multi_tenant_enabled() and not str(tenant_id or "").strip():
+        raise TenantScopeRequired(
+            "多租户模式下访问向量库必须携带有效 tenant_id（失败关闭，不放宽为全库）"
+        )
+
+
 def _tenant_filter_active(tenant_id: str | None) -> bool:
     """兼容旧口径（retriever 的 BM25 分区等处仍在用）。"""
     return bool(tenant_id) and multi_tenant_enabled()
@@ -138,6 +155,8 @@ class InMemoryVectorStore:
         self._lock = threading.Lock()
 
     async def upsert(self, point_id: str, vector: list[float], payload: dict) -> None:
+        # 写入归属取自 payload：与 Qdrant 路径同口径，没有租户归属就拒绝写入
+        _require_tenant((payload or {}).get(TENANT_FIELD))
         with self._lock:
             self._points[point_id] = (vector, payload)
 
@@ -148,6 +167,7 @@ class InMemoryVectorStore:
         course_id: str | None = None,
         tenant_id: str | None = None,
     ) -> list[tuple[str, float, dict]]:
+        _require_tenant(tenant_id)
         from app.services.rag import embedder
 
         with self._lock:
@@ -166,6 +186,7 @@ class InMemoryVectorStore:
 
     async def delete(self, point_ids: list[str], tenant_id: str | None = None) -> int:
         """按点 id 删除，**同时受租户作用域约束**（越权 id 删不掉）。"""
+        _require_tenant(tenant_id)
         if not point_ids:
             return 0
         scope = resolve_scope(tenant_id, base_collection="memory")
@@ -185,6 +206,7 @@ class InMemoryVectorStore:
     async def scroll_chunks(
         self, tenant_id: str | None = None, limit: int = 2000
     ) -> list[tuple[str, dict]]:
+        _require_tenant(tenant_id)
         scope = resolve_scope(tenant_id, base_collection="memory")
         with self._lock:
             items = list(self._points.items())
@@ -217,15 +239,8 @@ class ScopedQdrantClient:
         return self._base_collection
 
     def _require(self, scope: TenantScope) -> None:
-        """失败关闭：多租户模式下拿不到租户就别查。
-
-        放宽成全库是"宁可泄漏也要可用"的取舍——对涉及考题与客户数据的系统，
-        这个方向是错的，宁可本次请求失败并报错。
-        """
-        if multi_tenant_enabled() and not scope.tenant_id:
-            raise TenantScopeRequired(
-                "多租户模式下访问向量库必须携带有效 tenant_id（失败关闭，不放宽为全库）"
-            )
+        """失败关闭：多租户模式下拿不到租户就别查（与内存库共用同一实现）。"""
+        _require_tenant(scope.tenant_id)
 
     def _conditions(self, scope: TenantScope, extra: dict[str, str] | None) -> list:
         from qdrant_client import models
@@ -466,10 +481,21 @@ def get_vector_store() -> VectorStore:
         return _store
     settings = get_settings()
     if settings.qdrant_url:
+        # 显式配置 = 明确意图。配了 QDRANT_URL 却装不上客户端属于**部署错误**，
+        # 必须硬失败让人看见：静默退回内存库会造出"看起来在跑 Qdrant"的假象——
+        # 多副本各存一份、重启即失，检索结果随副本漂移，且绕过了本模块的
+        # 租户作用域层。宁可起不来，也不能假装工作。
         try:
             _store = QdrantVectorStore(settings.qdrant_url, settings.qdrant_collection)
             return _store
-        except ImportError:
-            pass
+        except ImportError as exc:
+            raise RuntimeError(
+                "已配置 QDRANT_URL，但未安装 qdrant-client：拒绝降级为进程内内存库"
+                "（会导致多副本数据不一致、重启即失，并绕过租户作用域）。"
+                "请安装 `qdrant-client>=1.9`，或移除 QDRANT_URL 以显式选择单机模式。"
+            ) from exc
+    # 未配置 = 明确的单机/演示意图，此时内存库是合理的选择；仍要留痕，
+    # 免得有人在线上"以为自己在用 Qdrant"。
+    _logger.info("未配置 QDRANT_URL → 使用进程内内存向量库（重启即失，仅适合单机/演示）")
     _store = InMemoryVectorStore()
     return _store

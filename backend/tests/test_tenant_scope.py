@@ -345,6 +345,42 @@ class TestMemoryParity:
         rows = await store.scroll_chunks(tenant_id="org-a")
         assert [pid for pid, _p in rows] == ["p-a"]
 
+    @pytest.mark.asyncio
+    async def test_in_memory_fails_closed_when_tenant_missing(self, monkeypatch):
+        """内存兜底路径必须与 ScopedQdrantClient 完全同口径：租户缺失 = 拒绝访问。
+
+        为什么这条必须钉死：本机与 CI 都没装 `qdrant_client`，实际被执行的
+        **就是**内存库。而内存库原先只做 `scope.matches`——租户缺失时
+        `active=False` 会让 `matches` 恒为 True，等于静默查全库。于是"多租户
+        防御"在唯一真实运行的那条路径上形同虚设，绿灯里有一部分是纸面防御。
+        """
+        from app.db.vector_store import InMemoryVectorStore, TenantScopeRequired
+
+        monkeypatch.setenv("MULTI_TENANT_MODE", "1")
+        store = InMemoryVectorStore()
+
+        with pytest.raises(TenantScopeRequired):
+            await store.search([1.0, 0.0], top_k=5, tenant_id=None)
+        with pytest.raises(TenantScopeRequired):
+            await store.delete(["p-a"], tenant_id=None)
+        with pytest.raises(TenantScopeRequired):
+            await store.scroll_chunks(tenant_id=None)
+        # 写入侧同口径：payload 没有租户归属时不得落进"公共池"
+        with pytest.raises(TenantScopeRequired):
+            await store.upsert("p-x", [1.0, 0.0], {"course_id": "math"})
+
+    @pytest.mark.asyncio
+    async def test_in_memory_stays_transparent_in_single_tenant_mode(self, monkeypatch):
+        """反向契约：默认部署（单租户）不得因为补了失败关闭而拒绝访问。"""
+        from app.db.vector_store import InMemoryVectorStore
+
+        monkeypatch.delenv("MULTI_TENANT_MODE", raising=False)
+        store = InMemoryVectorStore()
+        await store.upsert("p-1", [1.0, 0.0], {"course_id": "math"})
+
+        assert [pid for pid, _, _ in await store.search([1.0, 0.0], top_k=5)] == ["p-1"]
+        assert await store.delete(["p-1"]) == 1
+
 
 # ------------------------------------------------- 删除路径的租户约束 ----
 class TestScopedDelete:
