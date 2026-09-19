@@ -252,6 +252,15 @@ _STAGE_HINTS = {
     "failed": "入库失败",
 }
 
+# SSE 进度流的存活上限（毫秒）。为什么必须是上限：僵尸任务（持有进程已死）
+# 永远不会有人把它推向终态，不封顶的话 SSE 连接会一直挂到网关超时。
+# 取 RANGES 上界 3600s 而不是随意写个数：它是"客户端愿意等"，而
+# task_zombie_timeout_s（默认 600s，可热调到上限 3600s）是"系统何时判死"。
+# 前者必须 ≥ 后者，否则任务尚未被判死、实时通道就先断了。
+# （07e8cb7 重构误删了这个常量的定义，留下 SSE 里的引用——上线即 NameError，
+#   由 tests/test_ingest_task_metrics.py::TestSSENameError 钉死。）
+_TASK_HEARTBEAT_TIMEOUT_MS = 60 * 60 * 1000
+
 
 def _task_store():
     """任务读写模块（repo）。抽出来是为了让测试能整体替换 storage 实现。"""
@@ -333,6 +342,24 @@ def _spawn_pipeline(**kwargs) -> None:
     task.add_done_callback(_BACKGROUND_TASKS.discard)
 
 
+# 直方图允许的 media_type 标签取值。为什么必须白名单：media_type 是客户端
+# 表单字段，直接拿它当标签值，等于把"生成几条时间序列"的控制权交给调用方——
+# 一次打错的请求就会永久新增一条序列，直到 _MAX_SERIES 封顶把别的指标挤出去。
+_KNOWN_MEDIA_TYPES = ("audio", "board", "text")
+
+
+def _observe_task_duration(media_type: str, outcome: str, seconds: float) -> None:
+    """记录一次任务的全栈耗时；遥测失败绝不能打断业务路径（同 circuit 的口径）。"""
+    try:
+        from app.core import metrics
+
+        label = media_type if media_type in _KNOWN_MEDIA_TYPES else "other"
+        metrics.observe("ingest_task_duration_seconds", seconds,
+                        {"media_type": label, "outcome": outcome})
+    except Exception:
+        _logger.debug("observe task duration failed", exc_info=True)
+
+
 async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_type: str,
                         file: UploadFile | None, lecture_date: str, text_content: str,
                         subject: str, course_id: str, chapter: str, raw: bytes) -> None:
@@ -343,6 +370,7 @@ async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_
     而不知道是 ASR 挂了还是参数错了。
     """
     store = _task_store()
+    started = time.perf_counter()
     await store.update_ingest_task(task_id, {"status": "running"})
     try:
         lease = await _acquire_slot(DEFAULT_ACQUIRE_TIMEOUT_S)
@@ -351,6 +379,9 @@ async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_
             "status": "failed", "error": "入库任务排队超时，请稍后重试",
             "finished_at": int(time.time() * 1000),
         })
+        # 排队等待也要计时：这段时间内不 touch updated_at，在收尸眼里与执行
+        # 时间同权——漏记它会低估 P99，校出来的阈值会误杀还在排队的健康任务。
+        _observe_task_duration(media_type, "queue_timeout", time.perf_counter() - started)
         return
     try:
         result = await _ingest_locked(
@@ -366,6 +397,9 @@ async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_
             "error": f"{type(exc).__name__}: {exc}",
             "finished_at": int(time.time() * 1000),
         })
+        # 失败样本必须计时：它们恰恰集中在逼近收尸阈值的长尾，排除掉等于按
+        # 最乐观的情况算 P99，阈值一定会偏紧。
+        _observe_task_duration(media_type, "failed", time.perf_counter() - started)
         return
     await _release_slot(lease)
     await store.update_ingest_task(task_id, {
@@ -373,6 +407,7 @@ async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_
         "result_json": json.dumps(result, ensure_ascii=False),
         "finished_at": int(time.time() * 1000),
     })
+    _observe_task_duration(media_type, "succeeded", time.perf_counter() - started)
 
 
 async def active_task_count() -> int:
@@ -504,6 +539,16 @@ async def reap_zombie_tasks(older_than_ms: int | None = None) -> int:
             "error": "任务执行进程中断（重启或被杀），请重新提交",
             "finished_at": now,
         })
+    if zombies:
+        # 幸存者偏差补偿：僵尸没有正常回调，永远进不了时长直方图。若不单独
+        # 计数，"这次收尸到底误杀了多少健康的慢任务"在线是完全失明的——而
+        # 这恰恰是调 `task_zombie_timeout_s` 时最需要回答的问题。
+        try:
+            from app.core import metrics
+
+            metrics.inc("ingest_tasks_zombie_total", value=float(len(zombies)))
+        except Exception:
+            _logger.debug("count zombie reap failed", exc_info=True)
     return len(zombies)
 
 

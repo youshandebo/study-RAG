@@ -79,6 +79,17 @@ async def metrics_endpoint():
     from app.core import metrics
     from app.api.v1 import ingest
 
+    # 收尸巡检搭在拉取动作上：Prometheus 的拉取节奏（15~60s）天然就是巡检
+    # 频率，不需要常驻线程——1C2G 没有这个预算，而"心跳停摆 10 分钟才算死"
+    # 对分钟级巡检来说绰绰有余。监控在，僵尸就被收。
+    #
+    # 失败必须收敛在端点内部：收尸是旁路动作，它一旦把 /metrics 打成 5xx，
+    # 整套黄金指标会连同收尸本身一起失明。
+    try:
+        await ingest.reap_zombie_tasks()
+    except Exception:  # pragma: no cover - 收尸失败不得影响可观测性
+        pass
+
     # 饱和度：入库积压。放这里实时算而不是后台定时采样——省一个常驻任务，
     # 且 /metrics 的拉取频率（通常 15~60s）本身就够用。
     metrics.set_gauge("ingest_tasks_active", float(await ingest.active_task_count()))
