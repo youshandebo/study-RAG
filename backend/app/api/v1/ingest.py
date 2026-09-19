@@ -258,7 +258,7 @@ _STAGE_HINTS = {
 # task_zombie_timeout_s（默认 600s，可热调到上限 3600s）是"系统何时判死"。
 # 前者必须 ≥ 后者，否则任务尚未被判死、实时通道就先断了。
 # （07e8cb7 重构误删了这个常量的定义，留下 SSE 里的引用——上线即 NameError，
-#   由 tests/test_ingest_task_metrics.py::TestSSENameError 钉死。）
+#   由 tests/test_ingest_task_metrics.py::TestSSEStreamRegression 钉死。）
 _TASK_HEARTBEAT_TIMEOUT_MS = 60 * 60 * 1000
 
 
@@ -371,9 +371,12 @@ async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_
     """
     store = _task_store()
     started = time.perf_counter()
+    # 钩子提前建好：排队阶段与流水线阶段必须由**同一个**心跳续命，否则中间的
+    # 交接又会出现一段无人刷新 updated_at 的窗口。
+    hook = _phase_hook(task_id)
     await store.update_ingest_task(task_id, {"status": "running"})
     try:
-        lease = await _acquire_slot(DEFAULT_ACQUIRE_TIMEOUT_S)
+        lease = await _acquire_slot(DEFAULT_ACQUIRE_TIMEOUT_S, heartbeat=hook)
     except GateTimeout:
         await store.update_ingest_task(task_id, {
             "status": "failed", "error": "入库任务排队超时，请稍后重试",
@@ -388,7 +391,7 @@ async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_
             user=user, session_id=session_id, media_type=media_type, file=file,
             lecture_date=lecture_date, text_content=text_content, subject=subject,
             course_id=course_id, chapter=chapter, raw=raw,
-            heartbeat=_phase_hook(task_id),
+            heartbeat=hook,
         )
     except Exception as exc:
         await _release_slot(lease)
@@ -437,24 +440,71 @@ def _phase_hook(task_id: str):
     return _touch
 
 
-async def _acquire_slot(timeout_s: float) -> str:
+def _queue_beat_interval_s() -> float:
+    """排队心跳间隔：`min(阶段超时 / 3, 30s)`。
+
+    为什么取阶段超时的 1/3：与 gate.py 里分布式租约按 ttl/3 续约同一口径——
+    留足 2/3 余量，一次心跳被抖动吃掉（DB 瞬时不可写）也远够下一拍补上，
+    不会擦着判死线走。30s 是上限：一次心跳就是一条 UPDATE，更密是用自己
+    的写入放大去压 1C2G 上本就紧张的 IO。
+    """
+    from app.core import task_policy
+
+    return min(float(task_policy.effective()["task_phase_timeout_s"]) / 3.0, 30.0)
+
+
+async def _queue_heartbeat_loop(heartbeat, interval_s: float) -> None:
+    """排队期间持续证明"我还活着"。
+
+    为什么必须是独立任务、而不是把 touch 塞进轮询循环：本机的排队等待其实
+    分散在两处——分布式租约的 `gate.acquire` 与本地并发计数的 spin 等待。
+    只有挂一个同生命周期的心跳任务，才能把这两段等待整体罩住；否则并发为 1
+    时（等待几乎全发生在 gate.acquire 里）排队任务照样会被判死。
+
+    心跳失败一律吞掉：它是"证明存活"的旁路努力，绝不能反过来把排队中的
+    正常准入流程打断。
+    """
+    try:
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                await heartbeat("queued")
+            except Exception:
+                _logger.debug("queue heartbeat touch failed", exc_info=True)
+    except asyncio.CancelledError:
+        return
+
+
+async def _acquire_slot(timeout_s: float, heartbeat=None) -> str:
     """准入：跨副本租约（Redis/进程内）+ 本进程当前并发计数，两者都过才放行。
 
     两道闸的分工：DistributedGate 管"多副本共享名额"，本地计数管"热调后的即时
     生效"。只用前者时，把并发从 4 降到 1 后，旧信号量仍有 4 个许可在路上，
     降级要到旧任务全部结束才真正起作用——内存保护等不起。
+
+    为什么 `heartbeat` 是这个函数的参数：等待期间任务不刷新 `updated_at`，而
+    收尸判的正是 `updated_at` 的陈旧度。eco 档排队极易耗光 600s 的判死配额，
+    一次再正常不过的 Scrape 就会把它误杀成 failed——紧接着终态不可逆让真实
+    跑完的流水线无法落账，客户端一重试就是重复切片。判据应该是"协程还活着吗"：
+    只要它还在事件循环里主动等待，就有权持续发出心跳。
     """
     from app.core import task_policy
 
     capacity = int(task_policy.effective()["ingest_max_concurrency"])
     gate = _ingest_gate()
-    lease = await gate.acquire(timeout_s=timeout_s)
+    beat = (asyncio.create_task(_queue_heartbeat_loop(heartbeat, _queue_beat_interval_s()))
+            if heartbeat is not None else None)
     global _INGEST_INFLIGHT
-    deadline = time.monotonic() + timeout_s
-    while _INGEST_INFLIGHT >= capacity and time.monotonic() < deadline:
-        await asyncio.sleep(0.25)
-    _INGEST_INFLIGHT += 1
-    return lease
+    try:
+        lease = await gate.acquire(timeout_s=timeout_s)
+        deadline = time.monotonic() + timeout_s
+        while _INGEST_INFLIGHT >= capacity and time.monotonic() < deadline:
+            await asyncio.sleep(0.25)
+        _INGEST_INFLIGHT += 1
+        return lease
+    finally:
+        if beat is not None:
+            beat.cancel()
 
 
 async def _release_slot(lease: str) -> None:

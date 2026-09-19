@@ -15,9 +15,10 @@
 3. `reap_zombie_tasks` 没有任何生产调用方：僵尸既不被收，也从直方图里消失
    （幸存者偏差），需要把它挂在 /metrics 拉取动作上并单独计数。
 
-观测窗口必须与收尸窗口同形：收尸判的是"running 多久没刷新 updated_at"，而该
-窗口**包含** `_acquire_slot` 的排队等待（排队期间不 touch updated_at）。计时只
-测流水线执行段会低估 P99，据此校准出的阈值会误杀仍在排队的健康任务。
+观测窗口必须与收尸窗口同形：收尸判的是"running 多久没刷新 updated_at"。该窗口
+**包含** `_acquire_slot` 的排队等待，所以计时从置 running 起算；而排队期间由
+`_queue_heartbeat_loop` 持续续命（见 tests/test_ingest_queue_heartbeat.py），健康
+排队不会被判死——链路两侧都得钉住，否则要么误杀、要么漏收。
 """
 from __future__ import annotations
 
@@ -173,10 +174,11 @@ class TestDurationIsObservedForEveryOutcome:
     async def test_queue_timeout_duration_is_observed(self, db_env, monkeypatch):
         """排队超时同样是一条终态出口，不得漏观测。
 
-        僵尸窗口包含 `_acquire_slot` 的排队等待（期间不 touch updated_at），
-        这段等待在收尸眼里与执行时间同权——漏记它会低估 P99。
+        僵尸窗口包含 `_acquire_slot` 的排队等待，这段等待在收尸眼里与执行时间
+        同权——漏记它会低估 P99。（排队期间现已按 min(阶段超时/3, 30s) 续心跳，
+        因此健康排队不会被判死，只由自己的 `GateTimeout` 结尾。）
         """
-        async def _queue_full(timeout_s):
+        async def _queue_full(timeout_s, heartbeat=None):
             raise ingest_api.GateTimeout("排队超时（测试注入）")
 
         monkeypatch.setattr(ingest_api, "_acquire_slot", _queue_full)
