@@ -288,7 +288,8 @@ class TestSharding:
     async def test_shard_key_passed_when_enabled(self, monkeypatch, fake_qdrant):
         store = self._store(monkeypatch, fake_qdrant)
         await store.search([0.1], top_k=3, tenant_id="org-a")
-        assert _last("search", _INSTANCES[-1])["shard_key"] == "org-a"
+        # 真实客户端的分片键参数名是 shard_key_selector（见 test_qdrant_api_contract.py）
+        assert _last("search", _INSTANCES[-1])["shard_key_selector"] == "org-a"
 
     @pytest.mark.asyncio
     async def test_degrades_to_payload_filter_when_unsupported(self, monkeypatch, fake_qdrant):

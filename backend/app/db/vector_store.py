@@ -267,13 +267,17 @@ class ScopedQdrantClient:
     async def _with_shard(self, call, scope: TenantScope, **kwargs):
         """带分片键调用，失败则永久降级回常规过滤。
 
-        分片要求集合**建的时候**就启用自定义分片；历史集合或旧客户端会直接
-        报错（服务端 400 或客户端 TypeError）。此时**不能让整个检索挂掉**，
-        降级为"单集合 + 租户过滤"——那本来就是当前的安全基线。
+        参数名必须是 `shard_key_selector`：qdrant-client 在 1.x 后期把分片键
+        参数由 `shard_key` 改名了，而伪造客户端的测试对这类改名完全免疫——
+        只有按真实签名校验（tests/test_qdrant_api_contract.py）才抓得到。
+
+        分片要求集合**建的时候**就启用自定义分片；历史集合或未预置分片键的
+        集合会被服务端拒绝。此时**不能让整个检索挂掉**，降级为"单集合 +
+        租户过滤"——那本来就是当前的安全基线。
         """
         if scope.shard_key and self._sharding_ok:
             try:
-                return await call(**kwargs, shard_key=scope.shard_key)
+                return await call(**kwargs, shard_key_selector=scope.shard_key)
             except Exception as exc:
                 self._sharding_ok = False
                 _logger.warning(
@@ -323,15 +327,41 @@ class ScopedQdrantClient:
 
         self._require(scope)
         must = self._conditions(scope, extra)
-        hits = await self._with_shard(
-            self._client.search,
-            scope,
-            collection_name=scope.collection,
-            query_vector=vector,
-            limit=top_k,
-            query_filter=models.Filter(must=must) if must else None,
-        )
+        call, kwargs = self._search_call(scope, vector, top_k, must)
+        raw = await self._with_shard(call, scope, **kwargs)
+        # 结果形状也要双写：query_points 返回 QueryResponse（.points），
+        # 旧版 search 直接返回列表。
+        hits = getattr(raw, "points", raw) or []
         return [(str(h.id), h.score, h.payload or {}) for h in hits]
+
+    def _search_call(self, scope: TenantScope, vector: list[float], top_k: int,
+                     must: list) -> tuple[object, dict]:
+        """检索调用面：优先 `query_points`，回退旧版 `search`。
+
+        为什么必须两套都留：`AsyncQdrantClient.search` 在 qdrant-client 的
+        1.x 后期被**删除**（改为统一的 `query_points`，返回 `QueryResponse`
+        而非列表）。只写任一种，都会在另一个版本上直接 `AttributeError`；
+        而删方法这件事发生在同一个大版本内部，锁 `<2.0` 也拦不住——
+        唯一可靠的是"运行时探测 + 契约测试"。
+        """
+        from qdrant_client import models
+
+        filt = models.Filter(must=must) if must else None
+        if hasattr(self._client, "query_points"):
+            return self._client.query_points, {
+                "collection_name": scope.collection,
+                "query": vector,
+                "limit": top_k,
+                "query_filter": filt,
+                "with_payload": True,
+                "with_vectors": False,
+            }
+        return self._client.search, {
+            "collection_name": scope.collection,
+            "query_vector": vector,
+            "limit": top_k,
+            "query_filter": filt,
+        }
 
     async def upsert(
         self, scope: TenantScope, points: list[tuple[str, list[float], dict]]
