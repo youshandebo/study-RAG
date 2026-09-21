@@ -360,6 +360,23 @@ def _observe_task_duration(media_type: str, outcome: str, seconds: float) -> Non
         _logger.debug("observe task duration failed", exc_info=True)
 
 
+def _observe_phase_duration(phase: str, seconds: float) -> None:
+    """记录单相位耗时（queue/pipeline）；遥测失败绝不能打断业务路径。
+
+    为什么与全栈耗时分开两条指标（单据3）：queue 长→并发槽不够（扩
+    `ingest_max_concurrency` 或升档就能压下来），pipeline 长→ASR/Embedding
+    慢（加槽位只会让更多任务同时挤占 CPU，方向完全相反）——两个旋钮的修法
+    互斥，混在全栈分布里 P99 涨了说不清该动哪个。拆开后各自 P99 才能独立
+    校准各自的预算。
+    """
+    try:
+        from app.core import metrics
+
+        metrics.observe("ingest_phase_duration_seconds", seconds, {"phase": phase})
+    except Exception:
+        _logger.debug("observe phase duration failed", exc_info=True)
+
+
 async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_type: str,
                         file: UploadFile | None, lecture_date: str, text_content: str,
                         subject: str, course_id: str, chapter: str, raw: bytes) -> None:
@@ -385,7 +402,17 @@ async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_
         # 排队等待也要计时：这段时间内不 touch updated_at，在收尸眼里与执行
         # 时间同权——漏记它会低估 P99，校出来的阈值会误杀还在排队的健康任务。
         _observe_task_duration(media_type, "queue_timeout", time.perf_counter() - started)
+        # 排队超时只有 queue 相位：从未进过流水线（单据3 的相位拆分）。
+        _observe_phase_duration("queue", time.perf_counter() - started)
         return
+    # 执行段贯穿心跳（单据1）：阶段边界的 `_beat` 只在推进时触发，阶段内部
+    # 阻塞多久由上游（ASR/Embedding）决定——单阶段卡得久的活任务与死任务在
+    # `updated_at` 上完全同形。排队段的心跳随 `_acquire_slot` 结束而撤岗，
+    # 执行窗口必须由一颗时间驱动的存活协程重新罩住，判据才是"协程活着吗"。
+    _observe_phase_duration("queue", time.perf_counter() - started)
+    pipeline_started = time.perf_counter()
+    beat = asyncio.create_task(
+        _liveness_heartbeat_loop(hook, _queue_beat_interval_s()))
     try:
         result = await _ingest_locked(
             user=user, session_id=session_id, media_type=media_type, file=file,
@@ -403,7 +430,15 @@ async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_
         # 失败样本必须计时：它们恰恰集中在逼近收尸阈值的长尾，排除掉等于按
         # 最乐观的情况算 P99，阈值一定会偏紧。
         _observe_task_duration(media_type, "failed", time.perf_counter() - started)
+        # 失败也消耗了完整的 pipeline 窗口——漏掉它相位分布只剩成功样本，
+        # 容量规划会系统性低估慢上游的真实成本。
+        _observe_phase_duration("pipeline", time.perf_counter() - pipeline_started)
         return
+    finally:
+        # fire-and-forget 取消，与 `_acquire_slot` 同一口径。⚠️ 绝不能
+        # `await beat`：await 已取消的 Task 抛 CancelledError（BaseException），
+        # `except Exception` 接不住，会把写终态前的流水线协程静默杀死。
+        beat.cancel()
     await _release_slot(lease)
     await store.update_ingest_task(task_id, {
         "status": "succeeded",
@@ -411,6 +446,7 @@ async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_
         "finished_at": int(time.time() * 1000),
     })
     _observe_task_duration(media_type, "succeeded", time.perf_counter() - started)
+    _observe_phase_duration("pipeline", time.perf_counter() - pipeline_started)
 
 
 async def active_task_count() -> int:
@@ -431,9 +467,42 @@ def _phase_hook(task_id: str):
     一个合法跑了 40 分钟的长录音，若中途从不刷新，就与"卡死 40 分钟"在数据上
     完全同形——收尸只能二选一地误杀或漏杀。阶段推进时 touch 之后，"慢"和"死"
     才第一次可区分。
+
+    附带阶段软预算检查（单据2）：每次推进检查**上一阶段**的耗时是否超过
+    `task_phase_timeout_s`。只记日志 + 计数，绝不打断——它是 Safety Deadline
+    （容量规划的归因信号），不是 Liveness（死亡判据属于收尸机制）；硬杀会与
+    存活心跳直接冲突（心跳证明活着、预算到点却杀，等于制造新误杀源）。
+    存活心跳（"heartbeat" 相位）不是阶段推进，跳过检查。
     """
 
+    last_phase: tuple[str, float] | None = None  # (阶段名, perf_counter 起点)
+
+    def _budget_check(phase: str) -> None:
+        nonlocal last_phase
+        if phase == "heartbeat":  # 存活心跳不是阶段推进
+            return
+        if last_phase is not None:
+            name, t0 = last_phase
+            from app.core import task_policy
+
+            budget = float(task_policy.effective()["task_phase_timeout_s"])
+            elapsed = time.perf_counter() - t0
+            if elapsed > budget:
+                _logger.warning(
+                    "ingest task %s: phase %s took %.1fs, over soft budget %.0fs",
+                    task_id, name, elapsed, budget,
+                )
+                try:
+                    from app.core import metrics
+
+                    metrics.inc("ingest_phase_budget_exceeded_total",
+                                labels={"phase": name})
+                except Exception:
+                    _logger.debug("budget counter inc failed", exc_info=True)
+        last_phase = (phase, time.perf_counter())
+
     async def _touch(phase: str) -> None:
+        _budget_check(phase)
         await repo.update_ingest_task(task_id, {"updated_at": int(time.time() * 1000)})
         _logger.debug("ingest task %s -> phase %s", task_id, phase)
 
@@ -453,24 +522,30 @@ def _queue_beat_interval_s() -> float:
     return min(float(task_policy.effective()["task_phase_timeout_s"]) / 3.0, 30.0)
 
 
-async def _queue_heartbeat_loop(heartbeat, interval_s: float) -> None:
-    """排队期间持续证明"我还活着"。
+async def _liveness_heartbeat_loop(heartbeat, interval_s: float) -> None:
+    """周期性证明"我还活着"——生命周期由调用方圈定。
 
-    为什么必须是独立任务、而不是把 touch 塞进轮询循环：本机的排队等待其实
-    分散在两处——分布式租约的 `gate.acquire` 与本地并发计数的 spin 等待。
-    只有挂一个同生命周期的心跳任务，才能把这两段等待整体罩住；否则并发为 1
-    时（等待几乎全发生在 gate.acquire 里）排队任务照样会被判死。
+    为什么必须是独立任务、而不是把 touch 塞进轮询循环：等待分散在两处——
+    分布式租约的 `gate.acquire` 与本地并发计数的 spin 等待。只有挂一个同
+    生命周期的协程，才能把整段等待罩住；否则并发为 1 时（等待几乎全发生
+    在 gate.acquire 里）排队任务照样会被判死。
 
-    心跳失败一律吞掉：它是"证明存活"的旁路努力，绝不能反过来把排队中的
-    正常准入流程打断。
+    排队段由 `_acquire_slot` 持有，执行段由 `_run_pipeline` 持有——判据在
+    两段上是同一个："协程还在事件循环里主动等待，它就是活的"（单据1：阶段
+    边界的 `_beat` 只在推进时触发，阶段内部阻塞多久由上游说了算，卡得久的
+    活任务与死任务在 `updated_at` 上同形，必须有时间驱动的心跳兜底）。
+
+    心跳失败一律吞掉：它是"证明存活"的旁路努力，绝不能反过来打断正常流程。
     """
+    if heartbeat is None:
+        return
     try:
         while True:
             await asyncio.sleep(interval_s)
             try:
-                await heartbeat("queued")
+                await heartbeat("heartbeat")
             except Exception:
-                _logger.debug("queue heartbeat touch failed", exc_info=True)
+                _logger.debug("liveness heartbeat touch failed", exc_info=True)
     except asyncio.CancelledError:
         return
 
@@ -492,7 +567,7 @@ async def _acquire_slot(timeout_s: float, heartbeat=None) -> str:
 
     capacity = int(task_policy.effective()["ingest_max_concurrency"])
     gate = _ingest_gate()
-    beat = (asyncio.create_task(_queue_heartbeat_loop(heartbeat, _queue_beat_interval_s()))
+    beat = (asyncio.create_task(_liveness_heartbeat_loop(heartbeat, _queue_beat_interval_s()))
             if heartbeat is not None else None)
     global _INGEST_INFLIGHT
     try:
@@ -504,6 +579,10 @@ async def _acquire_slot(timeout_s: float, heartbeat=None) -> str:
         return lease
     finally:
         if beat is not None:
+            # fire-and-forget 取消：beat 几乎总在 sleep 里，cancel 立刻生效。
+            # ⚠️ 绝不能在这里 `await beat`：await 一个已取消的 Task 会抛
+            # CancelledError（BaseException），`except Exception` 接不住，
+            # 反而把整个准入/流水线协程静默杀死——状态永远停在 running。
             beat.cancel()
 
 
@@ -593,10 +672,16 @@ async def reap_zombie_tasks(older_than_ms: int | None = None) -> int:
         # 幸存者偏差补偿：僵尸没有正常回调，永远进不了时长直方图。若不单独
         # 计数，"这次收尸到底误杀了多少健康的慢任务"在线是完全失明的——而
         # 这恰恰是调 `task_zombie_timeout_s` 时最需要回答的问题。
+        # 标签走 media_type 白名单（单据4）：无标签时无法归因"哪种素材在
+        # 被收尸"——长录音被误杀与板书图被误杀，修法完全不同。白名单归一
+        # 与直方图同一口径，基数上界 = 白名单长度。
         try:
             from app.core import metrics
 
-            metrics.inc("ingest_tasks_zombie_total", value=float(len(zombies)))
+            for task in zombies:
+                label = (task.get("media_type")
+                         if task.get("media_type") in _KNOWN_MEDIA_TYPES else "other")
+                metrics.inc("ingest_tasks_zombie_total", labels={"media_type": label})
         except Exception:
             _logger.debug("count zombie reap failed", exc_info=True)
     return len(zombies)

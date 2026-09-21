@@ -26,7 +26,8 @@
 - `llm_provider_latency_seconds{provider,model,kind}`  上游依赖延迟
 - `circuit_breaker_tripped_total{service}`             错误/熔断
 - `ingest_task_duration_seconds{media_type,outcome}`  任务耗时（其 P99 用于校准收尸阈值）
-- `ingest_tasks_zombie_total`                         被收尸的僵尸任务数（幸存者偏差补偿）
+- `ingest_phase_duration_seconds{phase}`               分相位耗时（queue/pipeline，容量规划拆分旋钮）
+- `ingest_tasks_zombie_total{media_type}`              被收尸的僵尸任务数（按素材归因）
 """
 from __future__ import annotations
 
@@ -51,6 +52,10 @@ TASK_DURATION_BUCKETS: tuple[float, ...] = (
 # 直方图 → 桶集合。缺省回落 DURATION_BUCKETS：新增直方图不必假设同一量级。
 _HISTOGRAM_BUCKETS: dict[str, tuple[float, ...]] = {
     "ingest_task_duration_seconds": TASK_DURATION_BUCKETS,
+    # 两相位与全栈同量级域（秒到小时级）：分桶边界一致才可横向对比。
+    # queue 长→扩槽位；pipeline 长→ASR/Embedding 慢——修法互斥，混在
+    # 全栈分布里说不清该动哪个旋钮（单据3）。
+    "ingest_phase_duration_seconds": TASK_DURATION_BUCKETS,
 }
 
 
@@ -78,11 +83,13 @@ _MAX_SERIES = 2000
 # 在 /metrics 上完全同形——这正是可观测性最怕的静默失效。
 DECLARED_COUNTERS: tuple[str, ...] = (
     "http_requests_total", "circuit_breaker_tripped_total", "ingest_tasks_zombie_total",
+    "ingest_phase_budget_exceeded_total",
 )
 DECLARED_HISTOGRAMS: tuple[str, ...] = (
     "http_request_duration_seconds",
     "llm_provider_latency_seconds",
     "ingest_task_duration_seconds",
+    "ingest_phase_duration_seconds",
 )
 DECLARED_GAUGES: tuple[str, ...] = ("ingest_tasks_active",)
 
@@ -93,7 +100,9 @@ _METRIC_HELP = {
     "llm_provider_latency_seconds": "上游大模型/Embedding 调用延迟（秒）",
     "circuit_breaker_tripped_total": "断路器跳闸次数",
     "ingest_task_duration_seconds": "入库任务全栈耗时（从置 running 到终态，含排队等待）",
+    "ingest_phase_duration_seconds": "入库任务分相位耗时：queue=排队抢槽，pipeline=流水线执行（容量规划拆分旋钮）",
     "ingest_tasks_zombie_total": "被判定为僵尸并收尸的入库任务总数",
+    "ingest_phase_budget_exceeded_total": "入库阶段耗时超过软预算的次数（按阶段归因，不硬杀）",
 }
 
 

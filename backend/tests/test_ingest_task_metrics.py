@@ -264,9 +264,32 @@ class TestReapHookOnMetricsPull:
             "僵尸任务必须在 /metrics 被拉取时收尸，否则永远停在 running")
         assert "进程中断" in (record.get("error") or "")
 
-        assert _counter_value("ingest_tasks_zombie_total") == 1.0, (
+        # 单据4：计数器带 media_type 标签（注入任务 media_type="audio"）。
+        assert metrics._counters.get("ingest_tasks_zombie_total", {}).get(
+            metrics._labels({"media_type": "audio"})) == 1.0, (
             "收尸数必须计入计数器，纠正幸存者偏差")
         assert "ingest_tasks_zombie_total" in body
+
+    @pytest.mark.asyncio
+    async def test_zombie_counter_carries_media_type_label(self, db_env):
+        """收尸计数必须带 media_type 标签（单据4）。
+
+        无标签时"哪种素材在被收尸"在线完全失明：是长录音(audio)在被误杀，
+        还是板书图片(board)在被误杀，修法完全不同。标签值走 `_KNOWN_MEDIA_TYPES`
+        白名单归一——僵尸记录的 media_type 来自提交时落库的受控枚举，
+        但防御口径必须与直方图一致，基数上界 = 白名单长度。
+        """
+        await _inject_task("task-zb-a", status="running", stale_ms=1_800_000)
+
+        with TestClient(app) as client:
+            assert client.get("/metrics").status_code == 200
+
+        series = metrics._counters.get("ingest_tasks_zombie_total", {})
+        assert series.get(metrics._labels({"media_type": "audio"})) == 1.0, (
+            "被收尸的 audio 任务必须计入 media_type=\"audio\" 序列，"
+            "否则无法定位是哪类素材在触发收尸")
+        assert 'ingest_tasks_zombie_total{media_type="audio"} 1' in metrics.render(), (
+            "渲染输出必须带标签，面板/告警才能按素材类型拆分收尸归因")
 
     @pytest.mark.asyncio
     async def test_healthy_running_task_survives_scrape(self, db_env):
