@@ -42,5 +42,10 @@ data/eval_golden*.json
 # ---- 标定用的本地模型权重与隔离环境 ----
 # ONNX 权重 40~100MB 且随所选模型而异，不进仓库；
 # .venv-rerank 是仅用于标定的隔离环境（onnxruntime + transformers）。
-models/
+#
+# ⚠️ 必须写 /models/ 而不是 models/：不带前导斜杠的目录模式在 gitignore 里是
+# "任意层级匹配"，会连 backend/app/models（SQLAlchemy 源码包）一起忽略——
+# 后果是往那里新增源文件会被 git add 静默跳过，代码永远进不了仓库，
+# 而既有已跟踪文件不受影响，所以这个坑可以潜伏很久。
+/models/
 .venv-rerank/
