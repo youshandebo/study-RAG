@@ -40,6 +40,11 @@ def db_env(tmp_path, monkeypatch):
     saved = (repo._engine, repo._sessionmaker, repo._tables_ready, repo._pg_broken)
     repo._engine, repo._sessionmaker, repo._tables_ready, repo._pg_broken = None, None, False, False
     yield
+    # 兜底：任何残留后台任务都在这里取消。带着周期存活心跳活过用例边界会在
+    # 后续用例里造成跨循环连接争用（详见 _drain_background_tasks 的说明），
+    # 这条兜底保证即使某个用例忘了收尾，污染也不会溢出本文件。
+    for _task in list(ingest_api._BACKGROUND_TASKS):
+        _task.cancel()
     try:
         if repo._engine is not None:
             loop = asyncio.new_event_loop()
@@ -79,20 +84,53 @@ def _patch_slow_pipeline(monkeypatch, result: dict | None = None):
     return started, release
 
 
+async def _drain_background_tasks(timeout_s: float = 5.0) -> None:
+    """排空入库后台任务：残留任务会带着周期存活心跳越过用例边界活下去。
+
+    为什么必须显式排空（单据1 之后的新约束）：贯穿式心跳让"仍在运行的后台
+    任务"从"静默"变成"每 min(task_phase_timeout_s/3, 30s) 周期性写库"。本文件
+    第一条用例刻意不放行流水线（它只验证"提交不阻塞"），于是那个后台任务会
+    永久存活并持续 touch 数据库——它越过了用例与事件循环的边界，在后续用例
+    （尤其是走 TestClient 独立事件循环的 /metrics 抓取）里造成跨循环的连接
+    争用，表现为全量套件在 54% 附近的**间歇性挂起**：单跑本文件不复现，
+    只在全量上下文触发，因此极易被误判成"套件随机挂死"或"工具限流"。
+
+    排空而不是任其自然结束：残留任务的生命周期不受本用例控制，唯一确定的
+    收尾是显式取消 + 等待。
+    """
+    tasks = list(ingest_api._BACKGROUND_TASKS)
+    for task in tasks:
+        task.cancel()
+    if not tasks:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
+    except Exception:
+        pass
+
+
 class TestSubmitReturnsImmediately:
     @pytest.mark.asyncio
     async def test_submit_does_not_block_on_pipeline(self, db_env, monkeypatch):
         """核心红灯：提交必须立刻回来，不能陪流水线一起耗到网关超时。"""
-        _started, _release = _patch_slow_pipeline(monkeypatch, result={"chunks_added": 3})
+        _started, release = _patch_slow_pipeline(monkeypatch, result={"chunks_added": 3})
 
-        out = await ingest_api.submit_ingest_task(
-            request="unit-test", user=_user(), session_id="s-async", media_type="audio",
-            file=_SlowFile(), lecture_date="", text_content="", subject="数学",
-            course_id="default", chapter="", idempotency_key="idem-1",
-        )
+        try:
+            out = await ingest_api.submit_ingest_task(
+                request="unit-test", user=_user(), session_id="s-async", media_type="audio",
+                file=_SlowFile(), lecture_date="", text_content="", subject="数学",
+                course_id="default", chapter="", idempotency_key="idem-1",
+            )
 
-        assert out["task_id"], "必须返回可查询的任务句柄"
-        assert out["status"] in ("queued", "running"), "提交瞬间任务尚未完成"
+            assert out["task_id"], "必须返回可查询的任务句柄"
+            assert out["status"] in ("queued", "running"), "提交瞬间任务尚未完成"
+        finally:
+            # 契约只到"提交立即返回"，但残留的后台任务必须收尾：先放行让流水线
+            # 自然跑完（贯穿心跳随之在它自己的 finally 里被取消），再兜底排空，
+            # 避免它带着周期心跳活过用例边界污染后续用例。
+            release.set()
+            await _drain_background_tasks()
 
     @pytest.mark.asyncio
     async def test_result_is_queryable_after_completion(self, db_env, monkeypatch):
