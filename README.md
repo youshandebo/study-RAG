@@ -66,6 +66,12 @@ docker compose -f docker-compose.prod.yml up -d
   runtime_config 与 JWT 密钥（勿删，否则已签发登录态失效）
 - GHCR 包默认私有：仓库 Settings → Packages 可改 Public，或在服务器
   `docker login ghcr.io` 后再 pull
+- **监控端点只应内网可达**：`/metrics` 挂在后端**根路径**（不在 `/api/v1` 前缀下），
+  按设计无鉴权，后端本身也只绑 127.0.0.1 回环。前端 `/api/proxy` 是全路径转发，
+  已加闸拒绝 `..` 穿越并显式拒绝 `/metrics`、`/docs`、`/redoc`、`/openapi.json`
+  等运维路径（由 `backend/tests/test_proxy_guard.py` 钉住，删掉会红）。
+  若你在前面又加了一层 Nginx/Caddy 反向代理，请同样只放行 `/api/` 业务路径，
+  **不要把后端 8000 端口直接对外暴露**；Prometheus 抓取建议走内网或 SSH 隧道
 - `NEXT_PUBLIC_API_BASE` 已在云端构建时固定为 `/api/proxy`，无需配置
 
 ## 模型接入
