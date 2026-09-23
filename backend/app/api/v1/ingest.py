@@ -395,15 +395,19 @@ async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_
     try:
         lease = await _acquire_slot(DEFAULT_ACQUIRE_TIMEOUT_S, heartbeat=hook)
     except GateTimeout:
+        # 先观测后写终态（顺序契约）：任务表是运维与客户端的事实源，
+        # "终态已可见"必须蕴含"样本已入直方图"——否则抓取落在两步之间
+        # 时样本永久失踪，用相位分布标定收尸阈值会系统性低估排队超时的
+        # 真实耗时（它们恰恰集中在阈值边界）。
+        _observe_task_duration(media_type, "queue_timeout", time.perf_counter() - started)
+        _observe_phase_duration("queue", time.perf_counter() - started)
         await store.update_ingest_task(task_id, {
             "status": "failed", "error": "入库任务排队超时，请稍后重试",
             "finished_at": int(time.time() * 1000),
         })
         # 排队等待也要计时：这段时间内不 touch updated_at，在收尸眼里与执行
         # 时间同权——漏记它会低估 P99，校出来的阈值会误杀还在排队的健康任务。
-        _observe_task_duration(media_type, "queue_timeout", time.perf_counter() - started)
         # 排队超时只有 queue 相位：从未进过流水线（单据3 的相位拆分）。
-        _observe_phase_duration("queue", time.perf_counter() - started)
         return
     # 执行段贯穿心跳（单据1）：阶段边界的 `_beat` 只在推进时触发，阶段内部
     # 阻塞多久由上游（ASR/Embedding）决定——单阶段卡得久的活任务与死任务在
@@ -421,32 +425,43 @@ async def _run_pipeline(*, task_id: str, user: AuthUser, session_id: str, media_
             heartbeat=hook,
         )
     except Exception as exc:
-        await _release_slot(lease)
+        # 先观测后写终态（顺序契约，同排队超时出口）：失败样本恰恰集中在
+        # 逼近收尸阈值的长尾，观测若晚于终态写入，抓取落在两步之间时样本
+        # 永久失踪——分布只会更乐观，标定只会更紧。
+        _observe_task_duration(media_type, "failed", time.perf_counter() - started)
+        # 失败也消耗了完整的 pipeline 窗口——漏掉它相位分布只剩成功样本，
+        # 容量规划会系统性低估慢上游的真实成本。
+        _observe_phase_duration("pipeline", time.perf_counter() - pipeline_started)
         await store.update_ingest_task(task_id, {
             "status": "failed",
             "error": f"{type(exc).__name__}: {exc}",
             "finished_at": int(time.time() * 1000),
         })
-        # 失败样本必须计时：它们恰恰集中在逼近收尸阈值的长尾，排除掉等于按
-        # 最乐观的情况算 P99，阈值一定会偏紧。
-        _observe_task_duration(media_type, "failed", time.perf_counter() - started)
-        # 失败也消耗了完整的 pipeline 窗口——漏掉它相位分布只剩成功样本，
-        # 容量规划会系统性低估慢上游的真实成本。
-        _observe_phase_duration("pipeline", time.perf_counter() - pipeline_started)
         return
     finally:
         # fire-and-forget 取消，与 `_acquire_slot` 同一口径。⚠️ 绝不能
         # `await beat`：await 已取消的 Task 抛 CancelledError（BaseException），
         # `except Exception` 接不住，会把写终态前的流水线协程静默杀死。
         beat.cancel()
-    await _release_slot(lease)
+        # 名额归还必须罩住**所有**退出路径（取消泄漏 P0 修复）：取消抛出的
+        # CancelledError 同样是 BaseException，上面的 `except Exception` 接不
+        # 住它——这句若留在 try/finally 之外（修复前的位置），一次取消就
+        # 永久泄漏一个名额：进程内信号量没有 Redis 租约那种 TTL 自愈，
+        # `_INGEST_INFLIGHT` 只增不减，eco 档容量 1 时一次泄漏即入库彻底
+        # 停摆（新任务全部排队到 600s 超时）。finally 中的 await 在协程
+        # 被单次取消时照常执行（asyncio 标准语义）；事件循环正在关闭时的
+        # 二次取消才可能打断它——进程关停场景由 Redis 租约 TTL 兜底自愈，
+        # 进程内单副本随进程消亡、无跨进程残留。
+        await _release_slot(lease)
+    # 先观测后写终态（顺序契约）：终态一旦可查，相位样本必须已在直方图里，
+    # "轮询终态后断言计数"的测试与"抓取后算 P99"的运维口径才都可靠。
+    _observe_task_duration(media_type, "succeeded", time.perf_counter() - started)
+    _observe_phase_duration("pipeline", time.perf_counter() - pipeline_started)
     await store.update_ingest_task(task_id, {
         "status": "succeeded",
         "result_json": json.dumps(result, ensure_ascii=False),
         "finished_at": int(time.time() * 1000),
     })
-    _observe_task_duration(media_type, "succeeded", time.perf_counter() - started)
-    _observe_phase_duration("pipeline", time.perf_counter() - pipeline_started)
 
 
 async def active_task_count() -> int:

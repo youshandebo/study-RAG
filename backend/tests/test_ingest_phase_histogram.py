@@ -148,3 +148,45 @@ class TestBothPhasesObservedOnce:
 
         assert _phase_count("queue") == 1.0, "排队超时必须记录 queue 相位"
         assert _phase_count("pipeline") == 0.0, "从未进过流水线，pipeline 不得有样本"
+
+
+class TestObservationPrecedesTerminal:
+    """相位观测必须先于终态落库（顺序契约，红灯先行）。
+
+    为什么顺序是契约而不是实现细节：任务表是客户端与运维看板的事实源，
+    "终态已可见"必须蕴含"相位样本已入直方图"。否则 /metrics 抓取恰好
+    落在终态写入与观测执行之间时，任务已结束而样本永久丢失——用相位
+    分布标定收尸阈值会系统性低估最后一段的耗时。同理，测试里"轮询到
+    终态后立即断言计数"的模式只有在观测先行时才可靠。
+    """
+
+    @pytest.mark.asyncio
+    async def test_phase_observed_before_terminal_visible(self, db_env, monkeypatch):
+        """写 succeeded 终态的时刻，pipeline 相位观测必须已完成。"""
+        real_update = repo.update_ingest_task
+        observed: dict[str, float] = {}
+
+        async def _spy_update(task_id, patch):
+            if patch.get("status") == "succeeded":
+                observed["pipeline_at_write"] = _phase_count("pipeline")
+            return await real_update(task_id, patch)
+
+        monkeypatch.setattr(repo, "update_ingest_task", _spy_update)
+
+        async def _ok(*, heartbeat=None, **kwargs):
+            await asyncio.sleep(0.05)
+            return {"chunks_added": 2}
+
+        monkeypatch.setattr(ingest_api, "_ingest_locked", _ok)
+
+        out = await ingest_api.submit_ingest_task(
+            request="unit-test", user=_user(), session_id="s-order", media_type="audio",
+            file=_SlowFile(), lecture_date="", text_content="", subject="数学",
+            course_id="default", chapter="", idempotency_key="phase-order",
+        )
+        assert await _await_terminal(out["task_id"], "succeeded") is not None
+
+        assert observed.get("pipeline_at_write") == 1.0, (
+            "写终态时相位观测必须已完成：终态可见 ⇒ 样本已在。"
+            "观测晚于终态写入的话，抓取落在两步之间的任务会从相位分布里永久失踪，"
+            "且任何'轮询终态后断言计数'的测试都带调度竞态")

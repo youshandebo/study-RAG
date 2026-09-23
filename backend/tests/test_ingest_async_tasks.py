@@ -95,17 +95,26 @@ async def _drain_background_tasks(timeout_s: float = 5.0) -> None:
     争用，表现为全量套件在 54% 附近的**间歇性挂起**：单跑本文件不复现，
     只在全量上下文触发，因此极易被误判成"套件随机挂死"或"工具限流"。
 
-    排空而不是任其自然结束：残留任务的生命周期不受本用例控制，唯一确定的
-    收尾是显式取消 + 等待。
+    为什么"先等自然完成、超时才取消"：`release.set()` 之后立刻
+    `task.cancel()`，CancelledError 仍会在 `release.wait()` 处注入——
+    `Event.set()` 先把 waiter future 置 done，`cancel()` 随即置
+    `_must_cancel`，协程恢复时照样抛取消（asyncio 的 Task.cancel 语义），
+    "放行流水线自然跑完"的意图从未生效过。先 gather 等待，放行后的流水线
+    在正常路径里收尾（观测、归还名额、写终态）；取消只作为超时兜底。
     """
-    tasks = list(ingest_api._BACKGROUND_TASKS)
-    for task in tasks:
-        task.cancel()
+    tasks = [t for t in ingest_api._BACKGROUND_TASKS if not t.done()]
     if not tasks:
         return
     try:
         await asyncio.wait_for(
             asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
+        return
+    except Exception:
+        pass
+    for task in tasks:
+        task.cancel()
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
     except Exception:
         pass
 
@@ -211,3 +220,44 @@ class TestFailureVisibility:
 
         assert record is not None and record["status"] == "failed", "失败必须落到终态"
         assert "ASR 服务不可用" in (record.get("error") or ""), "失败原因必须可查证"
+
+
+class TestSlotReleaseOnUnwind:
+    """退出路径的并发名额归还契约（P0 生产缺陷，红灯先行）。
+
+    为什么单独立类：泄漏不在正常路径上，`except Exception` 与成功路径都
+    覆盖不到它——只有取消（排空 / 进程关停 / 运维 kill）才走这条路。
+    `CancelledError` 自 Python 3.8 起继承 `BaseException`，绕过了以
+    `except Exception` 为中心的收尾假设。
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_pipeline_releases_slot(self, db_env, monkeypatch):
+        """取消流水线不得泄漏并发名额——泄漏即永久。
+
+        红灯复现路径：取消注入点在 `await _ingest_locked` 内部，
+        CancelledError 是 BaseException，`except Exception` 接不住；
+        而 `_release_slot` 写在 try/finally 之外，于是 `_INGEST_INFLIGHT`
+        只增不减、闸门许可不还。生产后果：进程内信号量没有租约 TTL 的
+        自愈兜底，泄漏 N 次就永久损失 N 个名额——eco 档容量 1，一次
+        泄漏即入库彻底停摆（所有新任务排队到 600s 超时）。
+        """
+        started, _release = _patch_slow_pipeline(monkeypatch)
+
+        before = ingest_api._INGEST_INFLIGHT
+        await ingest_api.submit_ingest_task(
+            request="unit-test", user=_user(), session_id="s-cancel", media_type="audio",
+            file=_SlowFile(), lecture_date="", text_content="", subject="数学",
+            course_id="default", chapter="", idempotency_key="idem-cancel",
+        )
+        # 已通过准入、进入流水线（此时名额已被占用）
+        await asyncio.wait_for(started.wait(), timeout=5)
+
+        tasks = list(ingest_api._BACKGROUND_TASKS)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        assert ingest_api._INGEST_INFLIGHT == before, (
+            "取消路径必须归还并发名额：泄漏的计数让闸门可用容量永久缩水，"
+            "eco 档（容量 1）一次泄漏即入库停摆")
