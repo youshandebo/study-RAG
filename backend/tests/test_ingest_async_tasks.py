@@ -31,6 +31,7 @@ import pytest
 import app.db.relational as repo
 from app.api.v1 import ingest as ingest_api
 from app.api.v1.auth import AuthUser
+from app.core import task_policy
 
 
 @pytest.fixture
@@ -43,8 +44,21 @@ def db_env(tmp_path, monkeypatch):
     # 兜底：任何残留后台任务都在这里取消。带着周期存活心跳活过用例边界会在
     # 后续用例里造成跨循环连接争用（详见 _drain_background_tasks 的说明），
     # 这条兜底保证即使某个用例忘了收尾，污染也不会溢出本文件。
-    for _task in list(ingest_api._BACKGROUND_TASKS):
+    #
+    # ⚠️ 取消之后必须**收尸**（等任务真正跑完）：只 cancel 不 await 的话，
+    # 被取消的协程根本没有机会执行它的 finally——名额归还、终态落库这些
+    # 清理动作全都跳过，等于泄漏。若事件循环此刻已经关闭（用例已结束），
+    # 收不了也只能作罢，所以整段包在 try/except 里。
+    _leftover = list(ingest_api._BACKGROUND_TASKS)
+    for _task in _leftover:
         _task.cancel()
+    if _leftover:
+        try:
+            _loop = asyncio.get_event_loop_policy().get_event_loop()
+            if not _loop.is_closed():
+                _loop.run_until_complete(asyncio.gather(*_leftover, return_exceptions=True))
+        except Exception:
+            pass
     try:
         if repo._engine is not None:
             loop = asyncio.new_event_loop()
@@ -261,3 +275,33 @@ class TestSlotReleaseOnUnwind:
         assert ingest_api._INGEST_INFLIGHT == before, (
             "取消路径必须归还并发名额：泄漏的计数让闸门可用容量永久缩水，"
             "eco 档（容量 1）一次泄漏即入库停摆")
+
+
+class TestLocalCapacityQueueTimeout:
+    """本地并发额度排队超时必须失败，不能放行（生产语义 + 套件挂死根因）。"""
+
+    @pytest.mark.asyncio
+    async def test_saturated_capacity_raises_gate_timeout(self, db_env, monkeypatch):
+        """额度占满且等待超时 → GateTimeout，而不是自增计数后放行。
+
+        红灯复现：`_acquire_slot` 的本地 spin 等待在 deadline 耗尽后仍执行
+        `_INGEST_INFLIGHT += 1` 并放行——它自己要空转满 600s 才拿到执行权，
+        后面的任务继续排队，整条队列以 600s 为单位空转。全量套件 53% 附近的
+        间歇性挂死正是这个形状（每个提交任务的用例陪跑 600s）。同时 gate
+        租约也无人归还，名额双重泄漏。`_run_pipeline` 明明已经写好了
+        GateTimeout 出口分支，说明设计意图就是"排队超时即失败"。
+        """
+        real = task_policy.effective()
+        monkeypatch.setattr(
+            task_policy, "effective",
+            lambda: {**real, "ingest_max_concurrency": 1},
+        )
+        # 额度已被占满（模拟上一个任务还在跑）
+        monkeypatch.setattr(ingest_api, "_INGEST_INFLIGHT", 1)
+
+        with pytest.raises(ingest_api.GateTimeout):
+            # 短超时：用例不该陪跑生产默认的 600s
+            await ingest_api._acquire_slot(0.5)
+
+        assert ingest_api._INGEST_INFLIGHT == 1, (
+            "排队超时不得占用名额：放行会让已经饱和的额度继续膨胀")

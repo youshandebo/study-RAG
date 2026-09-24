@@ -51,16 +51,25 @@ export default function WorkspacePage() {
       setMe(null);
       return;
     }
-    void fetchMe().then((m) => {
-      if (m && !m.anonymous) {
-        setMe(m);
-        void refreshDue(); // 登录后拉一次待复习角标
-      } else {
-        setSassToken(null);
-        setSassUser(null);
-        setMe(null);
-      }
-    });
+    void fetchMe()
+      .then((m) => {
+        if (m && !m.anonymous) {
+          setMe(m);
+          void refreshDue(); // 登录后拉一次待复习角标
+        } else {
+          setSassToken(null);
+          setSassUser(null);
+          setMe(null);
+        }
+      })
+      .catch(() => {
+        // 网络层失败（后端未启动 / 502 抖动）**不等于**登录态失效：绝不能
+        // 顺手清掉 token，否则一次抖动就把已登录用户登出——把可观测性问题
+        // 变成账号问题。原实现没有 catch：后端没起时这里是一个未捕获的
+        // Promise rejection，会员区静默停在"登录/注册"，用户无从判断是
+        // 自己没登录还是服务没起来。改为保留会员态、交给健康探测条提示。
+        setBackendOk(false);
+      });
   }, [refreshDue]);
 
   // 启动初始化：加载/创建会话

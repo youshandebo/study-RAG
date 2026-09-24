@@ -252,15 +252,12 @@ export default function OmniChatInput() {
         requestId,
       },
       {
-        onMeta: (meta) => useSessionStore.setState((s) => ({
-          messagesBySession: {
-            ...s.messagesBySession,
-            [activeSessionId]: (s.messagesBySession[activeSessionId] ?? []).map((m) =>
-              m.id === pendingId ? { ...m, id: meta.messageId } : m,
-            ),
-          },
-          streamingMessageId: meta.messageId,
-        })),
+        // 不接 onMeta 改名（详见 onCard 处的契约说明）：流中途一旦把占位
+        // 消息的 id 换成服务端 message_id，后续 delta / 证据 / 分屏轨道
+        // 全都按 pendingId 写，而 appendDelta 只按 id 精确匹配——整条流式
+        // 链路会静默落空（打字机效果消失、多模型轨道全空白、[N] 证据角标
+        // 点不开），只剩 onCard 一次性补上完整内容，把这个断链掩盖成
+        // "只是没有打字机效果"。改名推迟到 onCard 统一落定。
         onDelta: (piece) => useSessionStore.getState().appendDelta(activeSessionId, pendingId, piece),
         onEvidence: (list) =>
           // 证据列表挂到消息顶层：普通回答的 [N] 角标据此联动证据抽屉
@@ -270,17 +267,20 @@ export default function OmniChatInput() {
         onTrackDone: (index) => useSessionStore.getState().finishTrack(activeSessionId, pendingId, index),
         onCard: (card) => {
           const store = useSessionStore.getState();
-          // 用最终卡片替换占位（若 id 已因 meta 改名则按位置兜底）；legacyId 同步清理 IndexedDB 旧占位行
+          // 用最终卡片替换占位，并在此刻把 id 落定为服务端 message_id：
+          // 流式期间一直沿用 pendingId（改名会打断 delta 写入，见上方说明），
+          // legacyId 让 patchMessage 同时匹配占位行、并把 IndexedDB 里的
+          // 占位旧行删掉，避免刷新后空占位复活。
           const list = store.messagesBySession[activeSessionId] ?? [];
-          const targetId = list.some((m) => m.id === card.id) ? card.id : pendingId;
           // 保留流式期间已由 evidence 事件挂载的证据列表：卡片到达时不得抹掉
           const keepEvidence =
-            list.find((m) => m.id === targetId || m.id === pendingId)?.evidenceList
+            list.find((m) => m.id === pendingId)?.evidenceList
             ?? card.solvePayload?.evidenceList;
           store.patchMessage(
             activeSessionId,
-            targetId,
+            card.id,
             {
+              id: card.id,
               type: card.type,
               content: card.content,
               solvePayload: card.solvePayload,
@@ -295,7 +295,11 @@ export default function OmniChatInput() {
             pendingId,
           );
         },
-        onDone: () => setStreamingId(null),
+        onDone: () => {
+          // 归属校验：切会话时旧流被 abort，它迟到的 onDone 不得把新会话
+          // 的流式状态清掉（"停止"按钮消失、输入框放行导致重复发送叠加）
+          if (useSessionStore.getState().activeSessionId === activeSessionId) setStreamingId(null);
+        },
         onStreamError: (message) =>
           // 流中途的服务端错误：连接还在、但回答不完整——用柔性提示说明，
           // 不往气泡里编内容（服务端同样不再补演示文案）
@@ -321,7 +325,8 @@ export default function OmniChatInput() {
               content: '⚠️ 连接助教失败，请确认后端服务已启动（默认 http://localhost:8000）。',
             });
           }
-          setStreamingId(null);
+          // 同 onDone 的归属校验
+          if (useSessionStore.getState().activeSessionId === activeSessionId) setStreamingId(null);
         },
       },
       controller.signal,

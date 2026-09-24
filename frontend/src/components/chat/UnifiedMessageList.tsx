@@ -3,7 +3,7 @@
 
 
 /** 消息流容器：虚拟长列表优化（窗口化渲染）+ 自动滚动 + 空状态 */
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { BookOpen, Camera, GitCompareArrows, Lightbulb, Zap } from 'lucide-react';
 import MessageCardRenderer from './MessageCardRenderer';
 import { useSessionStore } from '@/stores/useSessionStore';
@@ -21,11 +21,21 @@ export default function UnifiedMessageList() {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const nearBottom = useRef(true);
+  const [expanded, setExpanded] = useState(false);
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
     nearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
   };
+
+  // 切会话必须重置"贴底"判定与展开态：在 A 会话上滑看历史后切到 B，
+  // nearBottom 仍是 false，新会话会停在半空看不到最新消息（更看不到
+  // 正在流式的回答）。这里用瞬时跳转而非平滑滚动——切会话不是滚动动画场景。
+  useEffect(() => {
+    nearBottom.current = true;
+    setExpanded(false);
+    bottomRef.current?.scrollIntoView({ block: 'end' });
+  }, [activeSessionId]);
 
   useEffect(() => {
     if (nearBottom.current) {
@@ -33,7 +43,7 @@ export default function UnifiedMessageList() {
     }
   }, [messages, streamingMessageId]);
 
-  const visible = messages.slice(-WINDOW_SIZE);
+  const visible = expanded ? messages : messages.slice(-WINDOW_SIZE);
   const collapsed = messages.length - visible.length;
 
   return (
@@ -48,10 +58,26 @@ export default function UnifiedMessageList() {
         </div>
       ) : (
         <div className="mx-auto max-w-3xl space-y-5">
+          {/* 折叠提示必须是可点的真入口：原文案写着"滚动到顶部自动加载完整历史"，
+              但压根没有加载逻辑——超过窗口的更早消息永久不可见，用户被文案骗着
+              反复上滑。这里改为显式展开/收起。 */}
           {collapsed > 0 && (
-            <div className="text-center text-[11.5px] text-ink-faint">
-              ↑ 已折叠更早的 {collapsed} 条消息（滚动到顶部自动加载完整历史）
-            </div>
+            <button
+              type="button"
+              onClick={() => setExpanded(true)}
+              className="mx-auto block rounded-full border border-rule/60 px-3 py-1 text-center text-[11.5px] text-ink-faint transition hover:border-chalk/50 hover:text-chalk"
+            >
+              ↑ 展开更早的 {collapsed} 条消息
+            </button>
+          )}
+          {expanded && messages.length > WINDOW_SIZE && (
+            <button
+              type="button"
+              onClick={() => setExpanded(false)}
+              className="mx-auto block rounded-full border border-rule/60 px-3 py-1 text-center text-[11.5px] text-ink-faint transition hover:border-chalk/50 hover:text-chalk"
+            >
+              ↓ 仅显示最近 {WINDOW_SIZE} 条
+            </button>
           )}
           {visible.map((m) => (
             <MessageCardRenderer key={m.id} message={m} streaming={m.id === streamingMessageId} />

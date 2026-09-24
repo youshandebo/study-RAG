@@ -104,16 +104,21 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   updateSessionMeta(id, patch: Partial<SessionMeta>) {
     set((s) => ({ sessions: s.sessions.map((m) => (m.id === id ? { ...m, ...patch } : m)) }));
     void db.sessions.update(id, patch);
+    // 只发**变更过的**字段：后端是 model_dump(exclude_none=False) 全量覆盖，
+    // 把未变更字段也以 null 发过去会把服务端的课程绑定/检索模式一并清空
+    // ——改个章节就丢了课程作用域（前端侧栏还显示着旧绑定，两边不一致，
+    // 检索强隔离随之失效）。显式传 null 仍然表示"解除绑定"，语义完整。
+    const body: Record<string, unknown> = {};
+    if ('subject' in patch) body.subject = patch.subject ?? null;
+    if ('courseId' in patch) body.course_id = patch.courseId ?? null;
+    if ('chapter' in patch) body.chapter = patch.chapter ?? null;
+    if ('retrievalMode' in patch) body.retrieval_mode = patch.retrievalMode ?? null;
+    if ('timeAlphaOverride' in patch) body.time_alpha_override = patch.timeAlphaOverride ?? null;
+    if (Object.keys(body).length === 0) return;
     void fetch(`${(process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000/api/v1')}/sessions/${id}/meta`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        subject: patch.subject ?? null,
-        course_id: patch.courseId ?? null,
-        chapter: patch.chapter ?? null,
-        retrieval_mode: patch.retrievalMode ?? null,
-        time_alpha_override: patch.timeAlphaOverride ?? null,
-      }),
+      body: JSON.stringify(body),
     }).catch(() => undefined);
   },
 

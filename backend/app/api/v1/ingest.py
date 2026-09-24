@@ -590,6 +590,19 @@ async def _acquire_slot(timeout_s: float, heartbeat=None) -> str:
         deadline = time.monotonic() + timeout_s
         while _INGEST_INFLIGHT >= capacity and time.monotonic() < deadline:
             await asyncio.sleep(0.25)
+        if _INGEST_INFLIGHT >= capacity:
+            # 本地额度也没等到：必须回 GateTimeout 走"排队超时"出口。
+            # 放行意味着把一个已经空等了 timeout_s 的任务塞进饱和额度里——
+            # 它自己要等满 600s 才拿到执行权，后面的任务继续排队，整条队列
+            # 以 600s 为单位空转（全量套件 53% 附近的间歇性挂死就是这个形状：
+            # 每个提交任务的用例都在陪跑 600s）。
+            # gate 租约必须先还：inflight 没加过，不能走 _release_slot
+            # （那会把别人正在用的额度减掉）。
+            try:
+                await gate.release(lease)
+            except Exception:  # 归还失败不能掩盖真正的排队超时结论
+                _logger.debug("release gate lease on queue timeout failed", exc_info=True)
+            raise GateTimeout(f"等待入库名额超过 {timeout_s:.0f} 秒")
         _INGEST_INFLIGHT += 1
         return lease
     finally:

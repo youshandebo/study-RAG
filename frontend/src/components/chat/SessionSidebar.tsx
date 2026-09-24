@@ -22,6 +22,10 @@ export default function SessionSidebar({ onSelectSession }: { onSelectSession?: 
   const [draftTitle, setDraftTitle] = useState('');
   const [query, setQuery] = useState('');
   const [showCoursePicker, setShowCoursePicker] = useState(false);
+  // 删除的二次确认：一次误点会清掉该会话的全部历史（本地 IndexedDB 记录），
+  // 不可撤销——用两阶段点击代替浏览器 confirm，既不打断侧栏视觉节奏，
+  // 也让触屏用户有明确的"再点一次才真删"的反馈。
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   // 新建时选中的课程
   const [pendingCourse, setPendingCourse] = useState(COURSES[0]);
@@ -185,14 +189,28 @@ export default function SessionSidebar({ onSelectSession }: { onSelectSession?: 
                       </span>
                     )}
                     <button
-                      aria-label={`删除会话 ${s.title}`}
-                      className="hidden shrink-0 rounded px-1 text-paper/40 transition hover:text-red-400 group-hover:block"
+                      aria-label={
+                        confirmDeleteId === s.id ? `确认删除会话 ${s.title}` : `删除会话 ${s.title}`
+                      }
+                      // 常驻显示（原为 hidden + group-hover:block）：触屏没有 hover，
+                      // 移动端根本点不到删除入口；触摸目标一并放大到 24px 级。
+                      className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] transition ${
+                        confirmDeleteId === s.id
+                          ? 'bg-red-500/15 text-red-400'
+                          : 'text-paper/40 hover:text-red-400'
+                      }`}
                       onClick={(e) => {
                         e.stopPropagation();
-                        void removeSession(s.id);
+                        if (confirmDeleteId === s.id) {
+                          void removeSession(s.id);
+                          setConfirmDeleteId(null);
+                        } else {
+                          setConfirmDeleteId(s.id);
+                        }
                       }}
+                      onBlur={() => confirmDeleteId === s.id && setConfirmDeleteId(null)}
                     >
-                      ✕
+                      {confirmDeleteId === s.id ? '确认删除' : '✕'}
                     </button>
                   </div>
                 );
