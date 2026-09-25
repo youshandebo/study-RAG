@@ -316,8 +316,8 @@ MULTI_TENANT_MODE=1
 | 苏格拉底伴学 | 「教我 / 没懂」或操作条 | 分步设问状态机 + 渐进提示 + 作答评估 + 掌握度累计 |
 | 靶向自测 | 「考我」或操作条 | 调取易错陷阱生成变式题，内嵌选项即时批改与归因 |
 | 多模型分屏比对 | 「对比」或操作条 | 原地 2~4 栏并发流式渲染各模型解法 |
-| 会话隔离 | 左侧栏切换 | sessionId 严格隔离，IndexedDB 持久化 |
-| 多模态入库 | 右抽屉「入库」页签 | 录音/板书/文字粘贴上传 → ASR/VLM/切片 → 洞察提炼 → 向量入库 |
+| 会话隔离 | 左侧栏切换 | sessionId 严格隔离 + **本地 IndexedDB 按账号分区**（owner 索引；登出/登录态失效自动重置本地视图，共享设备上账号间互不可见），持久化 |
+| 多模态入库 | 右抽屉「入库」页签 | 录音/板书/文字粘贴上传 → ASR/VLM/切片 → 洞察提炼 → 向量入库；**任务化执行**（提交即返句柄、真实阶段进度、幂等去重、进程重启自动判死不悬挂） |
 | 管理员后台 | `/admin` 或顶栏 ⚙️ | 四类模型在线配置（热生效）+ 连通性测试 + 口令管理 + 知识库统计 |
 | 全局 RAG 问答 | 直接向 AI 提问 | 普通提问自动检索知识库，命中切片注入上下文并挂载证据链 |
 
@@ -330,6 +330,9 @@ event: meta         { message_id, intent }
 event: evidence     { list: EvidenceRef[] }
 event: delta        { text }                       # 主叙述流式增量
 event: track_delta  { index, model_name, text }    # 多模型分轨增量
+event: track_done   { index, model_name }          # 分屏单轨完成（比对路径）
+event: usage        { usage: UsageInfo }           # 每轮用量（tokens/耗时/上下文占比）
+event: error        { message }                   # 流中途服务端错误（连接未断、回答不完整）
 event: card         PolymorphicMessage             # 最终多态卡片
 event: done         {}
 ```
@@ -394,6 +397,9 @@ alembic stamp head      # schema 已一致，直接记录为最新版本
 ## 兜底策略一览
 
 - 无 LLM Key → 内置课堂剧本演示引擎（流式 token 化输出）
+- 无嵌入 Key → 哈希兜底向量（降级模式：**写路径跳过向量入库、读路径跳过
+  dense 通道**，判据是嵌入器自报的 degraded 状态而非向量维度——主检索空间
+  永不被不同源向量污染，服务恢复后自动回到正常双路召回）
 - 无 Qdrant → 进程内余弦向量索引
 - 无 Postgres → 内存仓储
 - 无 Whisper → 内置带毫秒时间戳的演示转录
