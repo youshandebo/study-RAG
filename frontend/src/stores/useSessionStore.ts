@@ -3,11 +3,25 @@
 import { create } from 'zustand';
 import type { PolymorphicMessage } from '@/types/message';
 import { db } from '@/db';
+import { getSassUser } from '@/lib/api';
+
+/**
+ * 本地数据归属键：Dexie 会话分区的过滤依据。
+ * 登录用户用邮箱（挂载时凭据已在 localStorage，同步可得、无竞态）；
+ * 未登录统一归 'anonymous' 桶——匿名模式本来就没有账号边界。
+ */
+function ownerKey(): string {
+  return getSassUser()?.email ?? 'anonymous';
+}
 
 export interface SessionMeta {
   id: string;
   title: string;
   createdAt: number;
+  /** 客户端分区字段：本地 Dexie 按 owner 隔离的依据（P0 隐私修复）。
+   *  仅存在于客户端——updateSessionMeta 只发变更字段，owner 永不进
+   *  服务端 PATCH，不构成对后端契约面的搭车变更。 */
+  owner?: string;
   /** 课程作用域：检索强隔离 + 侧栏分组 + 顶栏标签 */
   subject?: string;   // 学科：数学 / 物理 / …
   courseId?: string;  // 课程唯一标识（空=全库检索）
@@ -40,6 +54,11 @@ interface SessionState {
   activeAbort: AbortController | null;
   registerAbort: (controller: AbortController | null) => void;
   abortActive: () => void;
+
+  /** 登出/token 失效时重置本地视图并按当前 owner 重新加载。
+   *  这是 P0 隐私修复的出口端：只清凭据不清视图的话，A 的全部会话
+   *  在登出后的屏幕上原样留着，以匿名身份继续可读。 */
+  resetLocalView: () => void;
 
   init: () => Promise<void>;
   createSession: (title?: string) => Promise<string>;
@@ -84,13 +103,31 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
   },
 
+  resetLocalView() {
+    // 先中断在途流（abortActive 同时清 streamingMessageId），再清空内存
+    // 视图，最后按**当前** owner 重新加载——清凭据的调用方保证此函数
+    // 执行时 ownerKey() 已经指向新的身份（anonymous 或刚登录者）。
+    get().abortActive();
+    set({
+      sessions: [],
+      messagesBySession: {},
+      activeSessionId: '',
+      streamingMessageId: null,
+    });
+    void get().init();
+  },
+
   async init() {
-    let sessions = await db.sessions.toArray();
+    // 按当前账号分区加载——绝不能 toArray() 全量读：共享设备上本地库里
+    // 存着所有用过这台浏览器的人的会话，不过滤等于把别人的数据摆上台面。
+    const owner = ownerKey();
+    let sessions = await db.sessions.where('owner').equals(owner).toArray();
     if (sessions.length === 0) {
       const meta: SessionMeta = {
         id: crypto.randomUUID().slice(0, 12),
         title: '高数 · 反常积分专题',
         createdAt: Date.now(),
+        owner,
       };
       await db.sessions.add(meta);
       sessions = [meta];
@@ -102,7 +139,14 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   async createSession(title = '新对话') {
-    const meta: SessionMeta = { id: crypto.randomUUID().slice(0, 12), title, createdAt: Date.now() };
+    // 新会话必须盖 owner 章：漏盖的行不进任何分区，刷新即丢
+    // （且下一次 schema 升级的回填会把它归到匿名桶）。
+    const meta: SessionMeta = {
+      id: crypto.randomUUID().slice(0, 12),
+      title,
+      createdAt: Date.now(),
+      owner: ownerKey(),
+    };
     await db.sessions.add(meta);
     set((s) => ({
       sessions: [meta, ...s.sessions],

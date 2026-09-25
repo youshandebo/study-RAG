@@ -33,6 +33,8 @@ MSG_LIST = FRONTEND_SRC / "components" / "chat" / "UnifiedMessageList.tsx"
 INGEST_PANEL = FRONTEND_SRC / "components" / "drawer" / "QuickIngestPanel.tsx"
 API_TS = FRONTEND_SRC / "lib" / "api.ts"
 SESSION_STORE = FRONTEND_SRC / "stores" / "useSessionStore.ts"
+DB_TS = FRONTEND_SRC / "db" / "index.ts"
+PAGE_TSX = FRONTEND_SRC / "app" / "(workspace)" / "page.tsx"
 
 
 def _read(path: Path) -> str:
@@ -233,6 +235,55 @@ class TestNoDemoResidue:
         assert "已预置" not in src, (
             "生产 UI 不得保留「已预置 N 条切片」演示文案——"
             "真实部署没有预置数据，文案会误导用户以为素材已入库")
+
+
+class TestLocalDataOwnerScoping:
+    """本地 IndexedDB 必须按账号分区，登出必须重置本地视图（P0 隐私泄漏）。
+
+    服务端 TenantScope/ScopedQdrantClient 那层多租户隔离做得再扎实，这个
+    漏洞也完全绕开它——不需要碰后端，物理上坐到别人用过的电脑前就够：
+    sessions 表无 owner 字段、init() 用 toArray() 全量加载、登出只清
+    token——A 退出登录后 B 在同一浏览器登录，侧边栏照样列出 A 的全部
+    会话，点进去聊天记录、拍的题目照片全可见。目标场景（学校机房共享
+    设备）恰好是这个泄漏最容易被撞见的场景。
+    """
+
+    def test_sessions_table_has_owner_index(self) -> None:
+        src = _read(DB_TS)
+        assert re.search(r"sessions:\s*'id,\s*createdAt,\s*owner'", src), (
+            "Dexie sessions 表必须有 owner 索引——这是按账号分区查询的"
+            "物理前提；没有它 init() 只能全量加载，分区无从谈起")
+
+    def test_legacy_rows_backfilled_on_upgrade(self) -> None:
+        src = _read(DB_TS)
+        assert "upgrade" in src, (
+            "schema 升级必须带 upgrade 钩子处理存量行——预修复的无 owner "
+            "数据需要一次性回填，否则分区过滤后老用户本地会话凭空消失")
+        # 回填写法不限形态（对象字面量或赋值式），判定语义：无主行归 anonymous 桶
+        assert re.search(r"owner\s*(?::|=)\s*'anonymous'", src), (
+            "存量无 owner 行必须回填到 'anonymous' 桶（非破坏性迁移）："
+            "无法归因的数据宁可归匿名桶，也不得默认归到登录用户名下")
+
+    def test_init_filters_by_owner(self) -> None:
+        src = _read(SESSION_STORE)
+        assert re.search(r"where\(['\"]owner['\"]\)", src), (
+            "init() 必须按当前 owner 过滤加载会话，不得把本地库整表读进侧栏")
+        assert re.search(r"db\.sessions\.toArray\(\)", src) is None, (
+            "init() 不得 db.sessions.toArray() 全量加载——这正是泄漏点："
+            "本地库里所有账号的会话不加过滤地进 UI 状态")
+
+    def test_create_session_stamps_owner(self) -> None:
+        src = _read(SESSION_STORE)
+        assert re.search(r"owner:\s*ownerKey\(\)", src), (
+            "新建会话必须盖当前 owner 章——漏盖的行永远进不了任何账号的"
+            "分区，用户自己刷新后也会丢会话")
+
+    def test_logout_resets_local_view(self) -> None:
+        src = _read(PAGE_TSX)
+        assert "resetLocalView" in src, (
+            "登出（含 token 失效分支）必须调用 store 的 resetLocalView 重置"
+            "本地视图——只清 token 不清内存/本地视图，A 的会话在登出后的"
+            "屏幕上原样留着，以匿名身份继续可读")
 
 
 if __name__ == "__main__":  # pragma: no cover

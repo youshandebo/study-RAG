@@ -57,9 +57,12 @@ export default function WorkspacePage() {
           setMe(m);
           void refreshDue(); // 登录后拉一次待复习角标
         } else {
+          // token 失效（服务端判定匿名）：与手动登出同路径处理——凭据清掉
+          // 的瞬间必须重置本地视图，否则 A 的会话在掉线后的屏幕上原样留着。
           setSassToken(null);
           setSassUser(null);
           setMe(null);
+          useSessionStore.getState().resetLocalView();
         }
       })
       .catch(() => {
@@ -175,9 +178,14 @@ export default function WorkspacePage() {
                 </span>
                 <button
                   onClick={() => {
+                    // 顺序有讲究：先清凭据（ownerKey 变 anonymous），再重置
+                    // 本地视图并按匿名桶重新加载——只清 token 的话，A 的全部
+                    // 会话/聊天记录/题目照片仍留在屏幕与本地库的当前视图里，
+                    // 共享设备上下一个使用者直接可见（P0 隐私修复出口端）。
                     setSassToken(null);
                     setSassUser(null);
                     setMe(null);
+                    useSessionStore.getState().resetLocalView();
                   }}
                   aria-label="退出登录"
                   title="退出登录"
