@@ -3,11 +3,12 @@
 
 /** 会话隔离列表：新建（可绑定课程）/ 搜索 / 按学科分组 / 切换 / 重命名 / 删除 */
 import { useMemo, useState } from 'react';
-import { BookMarked, FileText, Plus, Search, X } from 'lucide-react';
+import { BookMarked, FileText, Pencil, Plus, Search, X } from 'lucide-react';
 import { useSessionStore } from '@/stores/useSessionStore';
 import AboutDialog from './AboutDialog';
 
-// 内置课程目录（生产环境改为接口拉取）
+// 可绑定课程目录：**部署期静态配置**（课程集不随会话变化，当前无后端目录
+// 端点；若未来课程需要动态管理，再立项 /courses 端点并改为接口拉取+兜底）。
 const COURSES = [
   { courseId: 'math-calculus-101', subject: '数学', name: '高等数学 · 反常积分专题' },
   { courseId: 'math-linear-102', subject: '数学', name: '线性代数 · 矩阵与行列式' },
@@ -187,6 +188,24 @@ export default function SessionSidebar({ onSelectSession }: { onSelectSession?: 
                           <span className="mt-0.5 block truncate text-[10px] text-paper/35">{s.chapter || s.courseId}</span>
                         )}
                       </span>
+                    )}
+                    {/* 显式重命名按钮：旧实现只靠 onDoubleClick——触屏双击
+                        不可靠、桌面端也无从得知双击可改名（零发现性）。
+                        与删除按钮同一触控标准：常驻显示、stopPropagation
+                        防误触切会话；编辑态下让位给输入框。 */}
+                    {editingId !== s.id && (
+                      <button
+                        aria-label={`重命名会话 ${s.title}`}
+                        title="重命名会话"
+                        className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-paper/40 transition hover:text-blue-300"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setEditingId(s.id);
+                          setDraftTitle(s.title);
+                        }}
+                      >
+                        <Pencil size={12} strokeWidth={1.5} />
+                      </button>
                     )}
                     <button
                       aria-label={

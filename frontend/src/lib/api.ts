@@ -542,19 +542,41 @@ export async function fetchEvidence(chunkUrl: string): Promise<EvidenceBundle | 
 // ----------------------------------------------------------------- ingest --
 export type IngestMediaType = 'audio' | 'board' | 'text';
 
-export async function uploadAsset(
+export interface IngestTaskHandle {
+  taskId: string;
+  status: string;
+  stage: string;
+}
+
+export interface IngestTaskRecord {
+  taskId: string;
+  status: string;
+  stage: string;
+  error: string | null;
+  asset: IngestAsset | null;
+}
+
+/**
+ * 提交任务化入库：登记后**立即返回句柄**，流水线转后台执行。
+ *
+ * 为什么必须任务化（而不是挂在一次 HTTP 上等结果）：压缩 → ASR/VLM →
+ * 切片 → 向量化耗时数十秒到数分钟，同步等待有网关超时、断连丢结果、
+ * 重传不去重三个无解后果——这正是后端 `submit_ingest_task` 的立项理由。
+ * `idempotencyKey` 由"同一次上传"持有（上传前生成、网络重试复用），
+ * 后端据此对重传复用同一任务、不重复入库。
+ */
+export async function submitIngestTask(
   sessionId: string,
   mediaType: IngestMediaType,
   file: File,
-  textContent = '',
-): Promise<IngestAsset> {
+  idempotencyKey = crypto.randomUUID(),
+): Promise<IngestTaskHandle> {
   const form = new FormData();
   form.append('session_id', sessionId);
   form.append('media_type', mediaType);
-  if (file) form.append('file', file);
-  // 表单字段有 ~1MB 限制：大文本以 .txt 文件通道入库（后端 media_type=text 支持文件解码）
-  if (textContent && textContent.length <= 512 * 1024) form.append('text_content', textContent);
-  const resp = await fetch(`${API_BASE}/ingest`, authInit({ method: 'POST', body: form }));
+  form.append('file', file);
+  form.append('idempotency_key', idempotencyKey);
+  const resp = await fetch(`${API_BASE}/ingest/tasks`, authInit({ method: 'POST', body: form }));
   if (!resp.ok) {
     let detail = `${resp.status}`;
     try {
@@ -564,21 +586,63 @@ export async function uploadAsset(
     throw new Error(`入库失败 ${detail}`);
   }
   const d = await resp.json();
-  return {
-    id: d.asset.id,
-    kind: mediaType,
-    uri: d.asset.uri,
-    filename: d.asset.filename || file?.name || '',
-    lectureDate: d.asset.lecture_date || '',
-    chunkCount: d.chunks_added,
-    pitfalls: d.pitfalls_extracted ?? [],
-    createdAt: Date.now(),
-  };
+  return { taskId: String(d.task_id ?? ''), status: String(d.status ?? ''), stage: String(d.stage ?? '') };
 }
 
-/** 纯文字素材入库：粘贴的课堂笔记/讲义经切片与向量化进入检索库 */
-export async function uploadTextAsset(sessionId: string, text: string, title = '文字笔记'): Promise<IngestAsset> {
-  return uploadAsset(sessionId, 'text', new File([new Blob([text], { type: 'text/plain' })], `${title}.txt`), text);
+/**
+ * 轮询任务状态直至终态（succeeded/failed）。
+ *
+ * 进度条显示的是后端 `_STAGE_HINTS` 的**真实阶段**（排队/处理中/完成），
+ * 取代旧版"setInterval 按时间演五档"的假进度——那与流水线完全解耦：
+ * 长 ASR 卡在 95% 干等，快任务反而要演完动画才返回。轮询节奏 1s 与后端
+ * SSE 端点一致；不用 SSE 是因为轮询断线重连只是"下一拍"，订阅断了要
+ * 处理重连与消息丢失。僵尸任务由后端 `reap_zombie_tasks` 判死，客户端
+ * 不会无限等待。
+ */
+export async function pollIngestTask(
+  taskId: string,
+  onProgress?: (status: string, stage: string) => void,
+  intervalMs = 1000,
+): Promise<IngestTaskRecord> {
+  for (;;) {
+    const resp = await fetch(`${API_BASE}/ingest/tasks/${taskId}`, authInit());
+    if (!resp.ok) throw new Error(`查询入库任务失败 ${resp.status}`);
+    const t = await resp.json();
+    const status = String(t.status ?? '');
+    const stage = String(t.stage ?? '');
+    onProgress?.(status, stage);
+    if (status === 'succeeded') {
+      const r = JSON.parse(t.result_json || '{}') as {
+        asset?: { id?: string; uri?: string; filename?: string; lecture_date?: string };
+        chunks_added?: number;
+        pitfalls_extracted?: string[];
+      };
+      const a = r.asset ?? {};
+      const kind = (t.media_type === 'audio' || t.media_type === 'board' || t.media_type === 'text'
+        ? t.media_type
+        : 'text') as IngestMediaType;
+      return {
+        taskId,
+        status,
+        stage,
+        error: null,
+        asset: {
+          id: String(a.id ?? taskId),
+          kind,
+          uri: String(a.uri ?? ''),
+          filename: String(a.filename ?? ''),
+          lectureDate: String(a.lecture_date ?? ''),
+          chunkCount: Number(r.chunks_added ?? 0),
+          pitfalls: (r.pitfalls_extracted ?? []) as string[],
+          createdAt: Date.now(),
+        },
+      };
+    }
+    if (status === 'failed') {
+      return { taskId, status, stage, error: String(t.error ?? '入库失败'), asset: null };
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
 }
 
 // ------------------------------------------------------------------ admin --

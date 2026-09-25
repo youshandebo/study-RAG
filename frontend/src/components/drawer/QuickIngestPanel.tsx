@@ -2,14 +2,21 @@
 // Copyright (C) 2026 fennengxiong. AGPL-3.0-or-Commercial. Commercial: fennengxiong@qq.com
 
 
-/** 对话内快速上传录音/板书/文字素材：悬浮进度 + 完成后更新考点库 */
+/** 对话内快速上传录音/板书/文字素材：任务化入库 + 真实阶段进度 + 完成后更新考点库 */
 import { useRef, useState } from 'react';
 import { FileText, Image as ImageIcon, Mic } from 'lucide-react';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useEvidenceStore } from '@/stores/useEvidenceStore';
-import { uploadAsset, uploadTextAsset } from '@/lib/api';
+import { submitIngestTask, pollIngestTask, type IngestMediaType } from '@/lib/api';
 
-const STAGES = ['上传素材…', 'ASR 转录 / VLM 识别 / 切片…', '时空对齐…', '教学洞察提炼…', '向量入库…'];
+/** 任务状态 → 进度条百分比：进度反映的是后端真实阶段（排队/处理/完成），
+ * 不是旧版按时间轴演出来的假进度（长 ASR 卡 95% 干等、快任务演完五档）。 */
+function statusPercent(status: string): number {
+  if (status === 'succeeded') return 100;
+  if (status === 'running') return 55;
+  if (status === 'queued') return 10;
+  return 0;
+}
 
 export default function QuickIngestPanel() {
   const audioRef = useRef<HTMLInputElement>(null);
@@ -21,41 +28,46 @@ export default function QuickIngestPanel() {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const { assets, ingestProgress, setIngestProgress, registerAsset, setTab } = useEvidenceStore();
 
-  const handleUpload = async (kind: 'audio' | 'board', file: File) => {
+  const handleUpload = async (kind: IngestMediaType, file: File) => {
     setError('');
-    // 模拟分阶段进度（演示模式流水线为同步快速完成）
-    let stageIdx = 0;
-    const timer = window.setInterval(() => {
-      stageIdx = Math.min(stageIdx + 1, STAGES.length - 1);
-      setIngestProgress({ filename: file.name, percent: Math.min(95, 18 + stageIdx * 19), stage: STAGES[stageIdx] });
-    }, 320);
-    setIngestProgress({ filename: file.name, percent: 10, stage: STAGES[0] });
-
+    setIngestProgress({ filename: file.name, percent: 5, stage: '已提交，等待受理…' });
     try {
-      const asset = await uploadAsset(activeSessionId, kind, file);
-      registerAsset(asset);
-      setIngestProgress({ filename: file.name, percent: 100, stage: `完成 · 新增 ${asset.chunkCount} 个考点切片` });
+      // 任务化入库：提交立即返回句柄（毫秒级），随后轮询真实状态。
+      // 阶段文案来自后端 _STAGE_HINTS，长任务显示"排队/处理中"是真实
+      // 事实而非演出来的动画；僵尸任务由后端收尸，客户端不会无限等待。
+      const handle = await submitIngestTask(activeSessionId, kind, file);
+      const done = await pollIngestTask(handle.taskId, (status, stage) => {
+        setIngestProgress({ filename: file.name, percent: statusPercent(status), stage: stage || status });
+      });
+      if (!done.asset) throw new Error(done.error || '入库失败');
+      registerAsset(done.asset);
+      setIngestProgress({ filename: file.name, percent: 100, stage: `完成 · 新增 ${done.asset.chunkCount} 个考点切片` });
       window.dispatchEvent(new CustomEvent('outline:refresh')); // 大纲树实时反映新切片
       window.setTimeout(() => setIngestProgress(null), 2600);
     } catch (e) {
       setError(`入库失败：${(e as Error).message}（请确认后端已启动）`);
       setIngestProgress(null);
-    } finally {
-      window.clearInterval(timer);
     }
   };
 
   const handleTextSubmit = async () => {
     if (!noteText.trim()) return;
     setError('');
-    setIngestProgress({ filename: noteTitle || '文字笔记', percent: 35, stage: '切片与向量化…' });
+    const f = new File([noteText.trim()], `${noteTitle.trim() || '文字笔记'}.txt`, { type: 'text/plain' });
+    setIngestProgress({ filename: f.name, percent: 10, stage: '已提交，等待受理…' });
     try {
-      const asset = await uploadTextAsset(activeSessionId, noteText.trim(), noteTitle.trim() || undefined);
-      registerAsset(asset);
+      // 文字走同一任务通道（media_type=text 由后端从 .txt 文件解码），
+      // 与录音/板书保持同一进度语义。
+      const handle = await submitIngestTask(activeSessionId, 'text', f);
+      const done = await pollIngestTask(handle.taskId, (status, stage) => {
+        setIngestProgress({ filename: f.name, percent: statusPercent(status), stage: stage || status });
+      });
+      if (!done.asset) throw new Error(done.error || '入库失败');
+      registerAsset(done.asset);
       setNoteText('');
       setNoteTitle('');
       setShowTextBox(false);
-      setIngestProgress({ filename: asset.filename, percent: 100, stage: `完成 · 新增 ${asset.chunkCount} 个知识切片` });
+      setIngestProgress({ filename: done.asset.filename || f.name, percent: 100, stage: `完成 · 新增 ${done.asset.chunkCount} 个知识切片` });
       window.dispatchEvent(new CustomEvent('outline:refresh'));
       window.setTimeout(() => setIngestProgress(null), 2600);
     } catch (e) {
@@ -181,7 +193,7 @@ export default function QuickIngestPanel() {
         <div className="mb-2 font-display text-[12.5px] font-bold text-ink">📚 已入库资产</div>
         {assets.length === 0 ? (
           <div className="rounded-lg border border-rule bg-paper-deep/40 px-4 py-3 text-[12px] text-ink-faint">
-            暂无新入库资产；系统已预置「10月15日 · 反常积分」课堂切片 4 条。
+            暂无新入库资产；上传录音 / 板书 / 文字笔记后，入库结果会显示在这里。
           </div>
         ) : (
           <ul className="space-y-2">

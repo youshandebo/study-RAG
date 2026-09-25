@@ -4,11 +4,11 @@
 
 /** 对话内嵌入式交互操作条：苏格拉底 / 靶向自测 / 分屏比对 */
 import { useSessionStore } from '@/stores/useSessionStore';
-import { streamChat } from '@/lib/api';
+import { ApiError, streamChat } from '@/lib/api';
 import type { PolymorphicMessage } from '@/types/message';
 
 export default function ActionBar({ sourceMessage }: { sourceMessage: PolymorphicMessage }) {
-  const { activeSessionId, appendMessage, patchMessage, appendDelta, setStreamingId, registerAbort } =
+  const { activeSessionId, appendMessage, patchMessage, appendDelta, setStreamingId, registerAbort, removeMessage, setSoftNotice } =
     useSessionStore();
   const busy = useSessionStore((s) => s.streamingMessageId !== null);
 
@@ -16,8 +16,7 @@ export default function ActionBar({ sourceMessage }: { sourceMessage: Polymorphi
     if (busy) return;
     const question =
       sourceMessage.solvePayload?.examPoint ??
-      sourceMessage.content.slice(0, 60) ??
-      '反常积分敛散性';
+      sourceMessage.content.slice(0, 60);
     const userMsg: PolymorphicMessage = {
       id: crypto.randomUUID(),
       sessionId: activeSessionId,
@@ -83,9 +82,22 @@ export default function ActionBar({ sourceMessage }: { sourceMessage: Polymorphi
           if (useSessionStore.getState().activeSessionId === activeSessionId) setStreamingId(null);
         },
         onError: (err) => {
-          patchMessage(activeSessionId, pendingId, {
-            content: `⚠️ ${err.message || '请求失败，请稍后重试'}`,
-          });
+          // 与输入框同一反馈路径：429/402 意味着请求压根没开始，占位气泡
+          // 不是对话内容——移除气泡，改在输入框下方显示柔性提示（store 共享，
+          // 限流附 Retry-After 倒计时）。旧实现一律写 ⚠️ 进气泡，用户既看
+          // 不到"何时能再问"，气泡里还留着一条误导性的"对话记录"。
+          if (err instanceof ApiError && (err.isRateLimit || err.isQuotaExceeded)) {
+            removeMessage(activeSessionId, pendingId);
+            setSoftNotice(
+              err.isRateLimit
+                ? { kind: 'rate', message: err.message, countdown: err.retryAfter ?? 15 }
+                : { kind: 'quota', message: err.message },
+            );
+          } else {
+            patchMessage(activeSessionId, pendingId, {
+              content: `⚠️ ${err.message || '请求失败，请稍后重试'}`,
+            });
+          }
           if (useSessionStore.getState().activeSessionId === activeSessionId) setStreamingId(null);
         },
       },

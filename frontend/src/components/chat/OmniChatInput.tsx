@@ -18,15 +18,6 @@ import type { PolymorphicMessage, UsageInfo } from '@/types/message';
 import ContextMeter from './ContextMeter';
 import ExamUpload from './ExamUpload';
 
-/** 柔性提示卡片（限流/额度）：显示在输入框下方，不打断、不弹 Toast */
-interface SoftNotice {
-  /** rate=限流 429 / quota=额度 402 / upstream=模型上游不可用（流中途的服务端错误事件） */
-  kind: 'rate' | 'quota' | 'upstream';
-  message: string;
-  /** 限流时的倒计时秒数（来自后端 Retry-After），到 0 自动清除 */
-  countdown?: number;
-}
-
 const QUICK_CMDS = [
   { label: '拍照解题', icon: Camera, text: '', action: 'upload' as const },
   { label: '教我', icon: Lightbulb, text: '教我', intent: 'socratic' as const },
@@ -46,11 +37,17 @@ const SLASH_COMMANDS = [
 /** 深度推导开关：开启后注入 system 级提示，要求完整证明步骤 */
 const DEEP_REASONING_SUFFIX = '\n\n（请展示完整推导：每一步给出依据，关键步骤不要跳过。）';
 
-/** 场景模式预设（Chip 快捷切换；explore 切换前弹确认防误触） */
-const SCENE_PRESETS = [
-  { key: 'lecture' as const, label: '随堂模式', desc: '优先近期板书与讲解，跟得上当前进度', icon: Zap },
-  { key: 'review' as const, label: '期末复习', desc: '全局检索不偏科，早期重点一视同仁', icon: BookOpen },
-  { key: 'explore' as const, label: '更多解法', desc: '解除"老师原法"限制，综合知识库多思路', icon: Compass },
+/** 场景模式预设（Chip 快捷切换；explore 切换前弹确认防误触）。
+ * 值集与头部 cycleMode 共用后端 canonical 四值（lecture/review_narrow/
+ * review_broad/explore）——此前这里用裸 'review'、头部用 narrow/broad，
+ * 两套值各切各的，Chip 还把 narrow/broad 显示成同一个"期末复习"。 */
+type SceneKey = 'lecture' | 'review_narrow' | 'review_broad' | 'explore';
+
+const SCENE_PRESETS: { key: SceneKey; label: string; desc: string; icon: typeof Zap }[] = [
+  { key: 'lecture', label: '随堂模式', desc: '优先近期板书与讲解，跟得上当前进度', icon: Zap },
+  { key: 'review_narrow', label: '周测复习', desc: '窄范围复习：近期内容仍强相关（α 默认 0.20）', icon: BookOpen },
+  { key: 'review_broad', label: '期末复习', desc: '全局检索不偏科，早期重点一视同仁（α 默认 0.05）', icon: BookOpen },
+  { key: 'explore', label: '更多解法', desc: '解除"老师原法"限制，综合知识库多思路', icon: Compass },
 ];
 
 /** 提取已闭合的最后一个公式（$..$ 或 $$..$$）做实时预览 */
@@ -67,7 +64,6 @@ export default function OmniChatInput() {
   const [image, setImage] = useState<{ dataUrl: string; b64: string; name: string } | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
-  const abortRef = useRef<AbortController | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [deepReasoning, setDeepReasoning] = useState(false);   // 深度推导开关
   const [slashOpen, setSlashOpen] = useState(false);           // 斜杠指令弹层
@@ -81,10 +77,19 @@ export default function OmniChatInput() {
   const { sessions, activeSessionId, updateSessionMeta, appendMessage, setStreamingId, streamingMessageId, registerAbort } = useSessionStore();
   const removeMessage = useSessionStore((s) => s.removeMessage);
   const activeSession = sessions.find((x) => x.id === activeSessionId);
-  const exploreMode = activeSession?.retrievalMode === 'explore';
-  const scene: 'lecture' | 'review' | 'explore' = exploreMode
+  // 检索模式单一事实源：直接取会话的 canonical 值（头部 cycleMode 与这里共用
+  // 同一值集）。历史会话可能存着裸 'review'——归一到 review_broad，否则该
+  // 档位匹配不到任何预设，Chip 回退显示随堂模式，造成"切了但没反应"的错觉。
+  const rawMode = activeSession?.retrievalMode;
+  const scene: SceneKey = rawMode === 'explore'
     ? 'explore'
-    : activeSession?.retrievalMode?.startsWith('review') ? 'review' : 'lecture';
+    : rawMode === 'review'
+      ? 'review_broad'
+      : rawMode === 'review_narrow'
+        ? 'review_narrow'
+        : rawMode === 'review_broad'
+          ? 'review_broad'
+          : 'lecture';
   const activeChapter = activeSession?.chapter ?? '';
   // 切到"更多解法"时强制阅读弹窗（5s + 红色确认），防误触
   const [pendingExplore, setPendingExplore] = useState(false);
@@ -100,8 +105,12 @@ export default function OmniChatInput() {
       textareaRef.current?.focus();
     }
   }, [pendingPrompt, setPendingPrompt]);
-  // 限流/额度柔性提示（429/402）：不打断对话，倒计时结束后自动消散
-  const [softNotice, setSoftNotice] = useState<SoftNotice | null>(null);
+  // 限流/额度柔性提示（429/402）：不打断对话，倒计时结束后自动消散。
+  // 状态放在 store——ActionBar 快捷操作碰上 429/402 时写入的是同一条
+  // 提示通道，由这里统一渲染在输入框下方（旧实现放组件局部 state，
+  // ActionBar 写入的提示无处显示，只能退化成把限流错误写进气泡）。
+  const softNotice = useSessionStore((s) => s.softNotice);
+  const setSoftNotice = useSessionStore((s) => s.setSoftNotice);
   // 当前会话每轮用量（供右下角上下文容量面板聚合展示）
   const messagesMap = useSessionStore((s) => s.messagesBySession);
   const sessionUsages = (messagesMap[activeSessionId] ?? [])
@@ -112,11 +121,10 @@ export default function OmniChatInput() {
   useEffect(() => {
     if (!softNotice?.countdown) return;
     const timer = window.setInterval(() => {
-      setSoftNotice((prev) => {
-        if (!prev?.countdown) return prev;
-        const next = prev.countdown - 1;
-        return next <= 0 ? null : { ...prev, countdown: next };
-      });
+      const prev = useSessionStore.getState().softNotice;
+      if (!prev?.countdown) return;
+      const next = prev.countdown - 1;
+      useSessionStore.getState().setSoftNotice(next <= 0 ? null : { ...prev, countdown: next });
     }, 1000);
     return () => window.clearInterval(timer);
   }, [softNotice?.countdown]);
@@ -196,7 +204,7 @@ export default function OmniChatInput() {
     setChapterOpen(false);
   };
 
-  const switchScene = (key: 'lecture' | 'review' | 'explore') => {
+  const switchScene = (key: SceneKey) => {
     if (!activeSession || key === scene) { setSceneOpen(false); return; }
     if (key === 'explore') { setPendingExplore(true); setSceneOpen(false); return; } // 切换前强制阅读
     updateSessionMeta(activeSessionId, { retrievalMode: key });
@@ -236,7 +244,6 @@ export default function OmniChatInput() {
     setStreamingId(pendingId);
 
     const controller = new AbortController();
-    abortRef.current = controller;
     registerAbort(controller);
 
     void streamChat(
@@ -337,9 +344,12 @@ export default function OmniChatInput() {
   };
 
   const stop = () => {
-    abortRef.current?.abort();
-    registerAbort(null);
-    setStreamingId(null);
+    // 统一中断入口（P1 修复）：跨组件发起的流（ActionBar 快捷操作）只把
+    // 控制器注册在 store——旧实现 abort 本地 ref 拿不到它是空操作，随后
+    // 还把 store 里的活控制器置 null（丢弃而非中断）、清掉 busy：回答
+    // 继续打字、输入框却被解锁到可以并发第二条流。abortActive 一次完成
+    // abort + 清 activeAbort + 清 streamingMessageId。
+    useSessionStore.getState().abortActive();
   };
 
   const popoverOpen = chapterOpen || sceneOpen;

@@ -18,6 +18,19 @@ export interface SessionMeta {
   timeAlphaOverride?: number | null;
 }
 
+/** 限流/额度柔性提示（原 OmniChatInput 局部状态提升到 store）：
+ * 输入框与 ActionBar 快捷操作共用同一条反馈通道——429/402 意味着请求
+ * 压根没开始，占位气泡不是对话内容要移除，提示统一显示在输入框下方
+ * （限流附 Retry-After 倒计时）。放组件局部 state 时 ActionBar 写入的
+ * 提示渲染不到，会退化成"把限流错误写进气泡"的旧路径。 */
+export interface SoftNotice {
+  /** rate=限流 429 / quota=额度 402 / upstream=模型上游不可用（流中途的服务端错误事件） */
+  kind: 'rate' | 'quota' | 'upstream';
+  message: string;
+  /** 限流时的倒计时秒数（来自后端 Retry-After），到 0 自动清除 */
+  countdown?: number;
+}
+
 interface SessionState {
   sessions: SessionMeta[];
   activeSessionId: string;
@@ -46,6 +59,10 @@ interface SessionState {
   /** 大纲树点考点 → 注入输入框的待填提问（OmniChatInput 消费后清空） */
   pendingPrompt: string | null;
   setPendingPrompt: (text: string | null) => void;
+
+  /** 限流/额度柔性提示：跨组件共享（见 SoftNotice 注释） */
+  softNotice: SoftNotice | null;
+  setSoftNotice: (notice: SoftNotice | null) => void;
 }
 
 export const useSessionStore = create<SessionState>((set, get) => ({
@@ -226,5 +243,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   pendingPrompt: null,
   setPendingPrompt(text) {
     set({ pendingPrompt: text });
+  },
+
+  softNotice: null,
+  setSoftNotice(notice) {
+    set({ softNotice: notice });
   },
 }));

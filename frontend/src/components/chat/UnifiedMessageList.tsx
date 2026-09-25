@@ -8,7 +8,8 @@ import { BookOpen, Camera, GitCompareArrows, Lightbulb, Zap } from 'lucide-react
 import MessageCardRenderer from './MessageCardRenderer';
 import { useSessionStore } from '@/stores/useSessionStore';
 
-const WINDOW_SIZE = 60; // 保留最近 N 条在 DOM 中，更早的消息折叠
+const WINDOW_SIZE = 60;  // 初始窗口：保留最近 N 条在 DOM 中，更早的消息折叠
+const EXPAND_STEP = 300; // 每次展开递进的条数上限
 const EMPTY: never[] = [];
 
 export default function UnifiedMessageList() {
@@ -21,19 +22,21 @@ export default function UnifiedMessageList() {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const nearBottom = useRef(true);
-  const [expanded, setExpanded] = useState(false);
+  // 可见窗口按需递进（每次 +EXPAND_STEP），而不是"一点开就全量渲染"——
+  // 千条会话全量进 DOM 会把页面直接拖死。任何时刻渲染量都有上界。
+  const [renderCount, setRenderCount] = useState(WINDOW_SIZE);
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
     nearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
   };
 
-  // 切会话必须重置"贴底"判定与展开态：在 A 会话上滑看历史后切到 B，
+  // 切会话必须重置"贴底"判定与展开窗口：在 A 会话上滑看历史后切到 B，
   // nearBottom 仍是 false，新会话会停在半空看不到最新消息（更看不到
   // 正在流式的回答）。这里用瞬时跳转而非平滑滚动——切会话不是滚动动画场景。
   useEffect(() => {
     nearBottom.current = true;
-    setExpanded(false);
+    setRenderCount(WINDOW_SIZE);
     bottomRef.current?.scrollIntoView({ block: 'end' });
   }, [activeSessionId]);
 
@@ -43,7 +46,7 @@ export default function UnifiedMessageList() {
     }
   }, [messages, streamingMessageId]);
 
-  const visible = expanded ? messages : messages.slice(-WINDOW_SIZE);
+  const visible = messages.slice(-renderCount);
   const collapsed = messages.length - visible.length;
 
   return (
@@ -60,20 +63,20 @@ export default function UnifiedMessageList() {
         <div className="mx-auto max-w-3xl space-y-5">
           {/* 折叠提示必须是可点的真入口：原文案写着"滚动到顶部自动加载完整历史"，
               但压根没有加载逻辑——超过窗口的更早消息永久不可见，用户被文案骗着
-              反复上滑。这里改为显式展开/收起。 */}
+              反复上滑。这里改为按 EXPAND_STEP 递进展开（封顶防 DOM 爆炸）。 */}
           {collapsed > 0 && (
             <button
               type="button"
-              onClick={() => setExpanded(true)}
+              onClick={() => setRenderCount((c) => c + EXPAND_STEP)}
               className="mx-auto block rounded-full border border-rule/60 px-3 py-1 text-center text-[11.5px] text-ink-faint transition hover:border-chalk/50 hover:text-chalk"
             >
-              ↑ 展开更早的 {collapsed} 条消息
+              ↑ 展开更早的 {collapsed} 条消息（每次 {EXPAND_STEP} 条）
             </button>
           )}
-          {expanded && messages.length > WINDOW_SIZE && (
+          {renderCount > WINDOW_SIZE && (
             <button
               type="button"
-              onClick={() => setExpanded(false)}
+              onClick={() => setRenderCount(WINDOW_SIZE)}
               className="mx-auto block rounded-full border border-rule/60 px-3 py-1 text-center text-[11.5px] text-ink-faint transition hover:border-chalk/50 hover:text-chalk"
             >
               ↓ 仅显示最近 {WINDOW_SIZE} 条

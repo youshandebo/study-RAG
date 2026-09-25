@@ -28,6 +28,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 FRONTEND_SRC = REPO_ROOT / "frontend" / "src"
 OMNI = FRONTEND_SRC / "components" / "chat" / "OmniChatInput.tsx"
 ACTION_BAR = FRONTEND_SRC / "components" / "chat" / "ActionBar.tsx"
+SIDEBAR = FRONTEND_SRC / "components" / "chat" / "SessionSidebar.tsx"
+MSG_LIST = FRONTEND_SRC / "components" / "chat" / "UnifiedMessageList.tsx"
+INGEST_PANEL = FRONTEND_SRC / "components" / "drawer" / "QuickIngestPanel.tsx"
+API_TS = FRONTEND_SRC / "lib" / "api.ts"
+SESSION_STORE = FRONTEND_SRC / "stores" / "useSessionStore.ts"
 
 
 def _read(path: Path) -> str:
@@ -80,6 +85,154 @@ class TestActionBarConsumesResponse:
         assert "registerAbort(" in src and "controller.signal" in src, (
             "快捷操作必须注册 abort 控制器：否则无法停止生成、"
             "切会话时旧请求也中断不掉")
+
+
+class TestStopMustAbortViaStore:
+    """「停止」必须走 store 的统一中断入口（P1：ActionBar 流停不掉）。
+
+    ActionBar 发起的流只把控制器注册在 useSessionStore（activeAbort），
+    发起组件 OmniChatInput 的本地 ref 拿不到它——旧实现 stop() 先 abort
+    本地空引用（空操作）、再把 store 里的活控制器置 null（丢弃而非中断）、
+    清掉 busy：回答继续打字、输入框却被解锁到可以并发第二条流。
+    """
+
+    def test_stop_uses_store_abort(self) -> None:
+        src = _read(OMNI)
+        assert "abortRef" not in src, (
+            "stop() 不得依赖组件本地 abortRef：跨组件发起的流（ActionBar）"
+            "只把控制器注册在 store，本地 abort 是空操作——busy 被清、回答"
+            "却继续打字。统一中断入口是 useSessionStore.abortActive()")
+        assert re.search(r"abortActive\(\)", src), (
+            "stop() 必须调用 store 的 abortActive()（abort + 清引用 + 清 busy 一次完成）")
+
+
+class TestSceneModesSingleSource:
+    """检索模式必须单一值集（P2-1：头部与 Chip 双入口两套值集）。
+
+    头部 cycleMode 轮换 lecture/review_narrow/review_broad，而输入框
+    SCENE_PRESETS 用的是裸 'review'——同一个概念两套值，Chip 的推导
+    `startsWith('review')` 让 narrow/broad 都显示「期末复习」，用户从
+    头部切档后 Chip 纹丝不动，无法得知当前实际档位。
+    """
+
+    def test_scene_presets_use_canonical_modes(self) -> None:
+        src = _read(OMNI)
+        assert "review_narrow" in src and "review_broad" in src, (
+            "SCENE_PRESETS 必须使用后端 canonical 值集（review_narrow / "
+            "review_broad），与头部 cycleMode 共用同一套值")
+        bare = re.search(r"key:\s*'review'\s*as const", src)
+        assert bare is None, (
+            "SCENE_PRESETS 不得保留裸 'review' 预设——与 narrow/broad 并存"
+            "会让双入口各自为政，Chip 无法区分周测/期末")
+
+    def test_legacy_review_mode_normalized(self) -> None:
+        src = _read(OMNI)
+        assert re.search(r"'review'\s*\?\s*'review_broad'", src), (
+            "历史会话可能存着裸 'review'：渲染前必须归一到 review_broad，"
+            "否则该档位匹配不到任何预设，Chip 回退显示随堂模式造成"
+            "「切了但没反应」的错觉")
+
+
+class TestActionBarQuotaNoticeConsistency:
+    """429/402 反馈必须同路径（P2-2：ActionBar 与输入框不一致）。
+
+    输入框路径：移除占位气泡 + 输入框下方柔性提示（含 Retry-After 倒计时）。
+    ActionBar 旧路径：一律写 ⚠️ 进气泡——限流时用户看不到何时能再问。
+    前提是 softNotice 提升到 store，ActionBar 写、输入框渲染。
+    """
+
+    def test_action_bar_shares_soft_notice_path(self) -> None:
+        src = _read(ACTION_BAR)
+        assert "isRateLimit" in src and "isQuotaExceeded" in src, (
+            "快捷操作的 429/402 必须识别并走统一反馈：请求未开始时占位"
+            "气泡要移除，不得把限流错误写进气泡")
+        assert "setSoftNotice" in src and "removeMessage" in src, (
+            "快捷操作必须通过 store 的 setSoftNotice + removeMessage 走与"
+            "输入框完全相同的反馈路径")
+
+    def test_soft_notice_lives_in_store(self) -> None:
+        store_src = _read(SESSION_STORE)
+        assert "softNotice" in store_src, (
+            "softNotice 必须提升到 useSessionStore：ActionBar 与输入框共用"
+            "同一条反馈通道，ActionBar 写入的提示才能出现在输入框下方")
+        omni_src = _read(OMNI)
+        assert re.search(r"useSessionStore\(\(s\) => s\.softNotice\)", omni_src), (
+            "输入框必须从 store 渲染 softNotice（组件局部 state 收不到"
+            "ActionBar 写入的限流/额度提示）")
+
+
+class TestSidebarRenameAffordance:
+    """重命名必须有显式按钮（P2-3：触屏无入口、桌面无发现性）。
+
+    旧实现仅 onDoubleClick——移动端双击不可靠，桌面端用户无从知道
+    双击可改名。按钮须常驻（非 hover 依赖），与删除按钮同一触控标准。
+    """
+
+    def test_rename_has_visible_button(self) -> None:
+        src = _read(SIDEBAR)
+        assert "重命名会话" in src, (
+            "重命名必须有带 aria-label 的显式按钮，不得只靠 onDoubleClick"
+            "（触屏双击不可靠、桌面无发现性）")
+        assert "Pencil" in src, "重命名按钮用铅笔图标（lucide-react Pencil）"
+        assert "onDoubleClick" in src, "保留双击路径作为桌面端快捷方式"
+
+
+class TestIngestProgressIsReal:
+    """入库进度必须反映真实任务状态（P2-4：假进度条）。
+
+    旧实现用 setInterval 每 320ms 推一档直到 95%——与后端流水线完全
+    解耦：长 ASR 卡在 95% 干等，快任务演完五档才结束。后端已有完整
+    任务化接口（POST /ingest/tasks 立即返回句柄 + GET 状态轮询/SSE，
+    `_STAGE_HINTS` 就是给前端的阶段文案），前端必须接上。
+    """
+
+    def test_panel_uses_task_api(self) -> None:
+        src = _read(INGEST_PANEL)
+        assert "submitIngestTask" in src, (
+            "上传必须走任务化入库接口：提交立即返回句柄，再按真实状态"
+            "刷新进度，不得再演出假进度")
+        assert re.search(r"window\.setInterval", src) is None, (
+            "入库进度不得用 setInterval 按时间轴模拟——那与真实流水线"
+            "完全解耦（长任务卡 95%，快任务演完五档）")
+
+    def test_api_provides_task_client(self) -> None:
+        src = _read(API_TS)
+        assert "submitIngestTask" in src and "pollIngestTask" in src, (
+            "api.ts 必须提供任务化入库客户端（POST /ingest/tasks 提交 + "
+            "GET /ingest/tasks/{id} 轮询到终态）")
+
+
+class TestExpandedRenderCap:
+    """「展开更早消息」必须递进封顶（P3：expanded 全量渲染无上限）。
+
+    旧实现 expanded ? messages : slice(-60)：一次点开千条会话全量进
+    DOM。改为 renderCount 窗口递进（每次 +300），展开入口仍在、
+    但任何时刻的渲染量都有上界。
+    """
+
+    def test_expand_caps_dom(self) -> None:
+        src = _read(MSG_LIST)
+        assert re.search(r"slice\(-renderCount\)", src), (
+            "可见消息必须按 renderCount 窗口截取（展开递进），"
+            "保证任何时刻 DOM 渲染量有上界")
+        assert re.search(r"expanded \? messages", src) is None, (
+            "不得保留「expanded 即全量渲染」的旧模式")
+
+
+class TestNoDemoResidue:
+    """演示期残留清理（P3）：死分支兜底与预置文案不得留在生产 UI。"""
+
+    def test_no_demo_fallback_in_action_bar(self) -> None:
+        src = _read(ACTION_BAR)
+        assert "反常积分敛散性" not in src, (
+            "ActionBar 不得保留演示期兜底文案——content.slice 永不为 null，"
+            "该分支是死代码，且把演示内容混进生产路径")
+
+    def test_no_preset_demo_copy(self) -> None:
+        src = _read(INGEST_PANEL)
+        assert "已预置" not in src, (
+            "生产 UI 不得保留「已预置 N 条切片」演示文案——"
+            "真实部署没有预置数据，文案会误导用户以为素材已入库")
 
 
 if __name__ == "__main__":  # pragma: no cover
